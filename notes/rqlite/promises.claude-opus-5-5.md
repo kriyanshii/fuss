@@ -1,0 +1,578 @@
+# rqlite promises Fuss could test (claude-opus-5-5)
+
+Candidates only. Check every quote against the spec and write the rules yourself.
+
+## rqlite.io-api-queued-writes.md
+
+- **Every queued-write response on a given node carries a sequence number strictly greater than any earlier one from that node.** (clock-skew, high)
+  - Quote: > Each response includes a monotonically increasing `sequence_number`, which allows you to track when this request is actually persisted to the Raft log.
+  - Inject: Between two queued writes, step the host wall clock backwards by several seconds or minutes. Repeat the check across a kill -9 and restart of the node.
+  - Observe: Record every sequence_number Fuss receives from the node, in send order, in Fuss's own history file. Any value less than or equal to an earlier value from the same node breaks the promise.
+  - Workload: Loop: POST /db/execute?queue with one INSERT, then log sequence_number. Mid-loop, set the clock back 10 minutes. Continue. Then kill -9 rqlited, restart it with the same flags and data dir, and continue the loop.
+  - Guess: Guess: the example values look like nanosecond wall-clock timestamps. If the counter is seeded from wall time, a backwards clock step or a restart after a step could produce smaller numbers.
+- **Once /status reports a sequence number at least as large as a request's sequence number, that request is in the Raft log and survives a crash.** (process-kill, medium)
+  - Quote: > The `/status` [diagnostics](/docs/guides/monitoring-rqlite) endpoint includes the sequence number of the latest request successfully written to Raft.
+  - Inject: Immediately after /status first reports a persisted sequence number greater than or equal to a given write's sequence_number.
+  - Observe: After restart, run a strong-consistency query for the rows of every write whose sequence number /status had reported as persisted before the kill. Each such row must be present.
+  - Workload: Start rqlited with a large -write-queue-capacity/batch size and a timeout of a few seconds. POST /db/execute?queue with uniquely tagged INSERTs. Poll GET /status until the queue's reported sequence number is at least the write's number. Kill -9. Restart. GET /db/query?level=strong SELECT tags.
+  - Guess: Guess: the status counter might be updated when the batch is handed to Raft rather than after the commit is durable, so a kill in that window loses data the counter claimed was written.
+- **A queued write sent with `wait` that returns success means it, and every request queued before it, has been persisted.** (process-kill, high)
+  - Quote: > You can explicitly tell the request to wait until the queue has persisted all pending requests.
+  - Inject: Right after a successful response to a `?queue&wait` request is received.
+  - Observe: After restart, all rows from that request and from every earlier acknowledged queued request on the same node must be present.
+  - Workload: POST several ?queue INSERTs (no wait), then POST ?queue&wait&timeout=10s with one INSERT. On 200, kill -9 immediately. Restart. SELECT with level=strong and check every row is present.
+  - Guess: Guess: `wait` might only cover the batch containing this request, not all earlier pending batches, or it might return before the fsync.
+- **If the queue cannot be flushed in time, a `wait` request returns an error rather than success, and the default limit is 30 seconds.** (disk-full, medium)
+  - Quote: > If the queue has not emptied after this time, the request will return with an error. If not set, the timeout is 30 seconds.
+  - Inject: Fill the data directory's filesystem before sending the `?queue&wait` request. In a cluster variant, kill the leader instead.
+  - Observe: The response must be an error, not 200, and must arrive at about the given timeout (or about 30 seconds when no timeout is set). It must never be success without the data being readable later.
+  - Workload: Fill the disk with a loop-mounted small filesystem. POST /db/execute?queue&wait&timeout=3s INSERT and time the response. Repeat without the timeout parameter and expect about 30 seconds.
+  - Guess: Guess: a write error inside the background flush might be swallowed. That could empty the queue (counted as done) and report success, or hang past the timeout.
+- **Queued statements are applied in the order they were queued, just as if they had been sent as one bulk request.** (concurrent-calls, medium)
+  - Quote: > The net result is as if the client wrote a single Bulk request containing all the queued statements.
+  - Inject: During heavy sequential queuing from one client, while other clients also queue writes. Optionally add a restart between batches.
+  - Observe: Use statements whose result depends on order, for example UPDATE x SET v=v*2 and UPDATE x SET v=v+1. Also use INSERTs into an AUTOINCREMENT table. Compare the final state and rowid order with the order in Fuss's own send log, which follows sequence_number order.
+  - Workload: Client A sends a serial chain of ?queue requests, each awaiting its response before the next: INSERT tag=i. Clients B and C run concurrently. After a final ?queue&wait, SELECT id,tag ORDER BY id and check that A's tags increase.
+  - Guess: Guess: retries or batch merging under load could reorder a retried batch after a later one.
+- **A crash can lose only queued data that was not yet persisted. Shrinking the batch size and timeout shrinks the set of writes at risk.** (process-kill, high)
+  - Quote: > there is a small risk of data loss in the event the node crashes before queued data is persisted. You can make this window arbitrarily small by adjusting the queuing parameters, at the cost of write performance.
+  - Inject: At random moments during a steady stream of queued writes, run once with a small batch size and timeout and once with large settings.
+  - Observe: After restart, the lost writes must be a suffix of the acknowledged writes: all with sequence numbers above the last persisted value. The count lost should be bounded by about the batch size or the writes sent within one timeout. No earlier write should be missing (no gaps).
+  - Workload: rqlited -write-queue-capacity/-write-queue-batch-size=1 -write-queue-timeout=10ms. Stream ?queue INSERTs. Kill -9 at a random time. Restart. Diff the acknowledged rows against the stored rows. Repeat with batch size 1000 and timeout 5s.
+  - Guess: Guess: if batches are flushed concurrently, a later batch could commit while an earlier one is lost, leaving a gap rather than a lost suffix.
+- **With -write-queue-retry=0, each queued write is applied at most once. With the default, it is retried at most once, so it can appear at most twice.** (process-kill, medium)
+  - Quote: > By default, a node will retry a Queued Write once if the Leader is not reachable. This does mean that if a Queued Write appeared to fail, but was actually successful (the response from the Leader may be dropped by the network), data may be duplicated. You can eliminate this risk by setting `-write-queue-retry` to zero.
+  - Inject: In a 3-node cluster, send queued writes to a follower and kill -9 or SIGSTOP the leader while the follower is forwarding a batch.
+  - Observe: Use uniquely tagged INSERTs into a table without a UNIQUE constraint and count each tag. With retry=0, any tag count above 1 breaks the promise. With the default, any count above 2 breaks it.
+  - Workload: Start 3 nodes with -write-queue-retry=0. POST follower:/db/execute?queue INSERT tag=uuid in a loop. Kill or pause the leader repeatedly. After the cluster recovers, run SELECT tag,count(*) GROUP BY tag HAVING count(*)>1.
+  - Guess: Guess: the forwarding client or the Raft layer might retry independently of the -write-queue-retry setting, causing duplicates even at zero.
+- **With -write-queue-tx, each queued batch is applied atomically, all or nothing. Without it, statements are applied independently.** (other, medium)
+  - Quote: > By default, writes from the queue are not performed within a transaction. If you wish to change this, it must be set at launch time via the command-line option `-write-queue-tx`.
+  - Inject: Queue a batch that contains one statement that will fail (a constraint violation) among valid ones. Optionally also kill -9 during the flush.
+  - Observe: With -write-queue-tx, the batch must apply all of its rows or none, and none if one statement fails. Without it, valid rows appear even though one statement failed. After a kill, there must never be a partial batch under -write-queue-tx.
+  - Workload: Start rqlited -write-queue-tx with a large batch size. Within one timeout window, POST ?queue INSERT a, ?queue INSERT duplicate-primary-key, ?queue INSERT b, then ?queue&wait. SELECT and check that a and b are both absent or both present, consistent with the transaction. Repeat without -write-queue-tx.
+  - Guess: Guess: the transaction might wrap each original request instead of the merged batch, making atomicity per request rather than per batch.
+- **A partly filled queue is still flushed once the configured timeout expires, even if the batch size is never reached.** (clock-skew, medium)
+  - Quote: > rqlite merges queued requests when the configured batch size is reached or a configurable timeout expires. It then executes them as a single request.
+  - Inject: Right after queuing a single request with a huge batch size, step the wall clock forward or backward.
+  - Observe: The row becomes visible to a strong read, and /status's persisted sequence number advances, within about the configured timeout. It is neither delayed indefinitely nor flushed early because of the clock jump.
+  - Workload: Start rqlited with batch size 100000 and -write-queue-timeout=2s. POST one ?queue INSERT. Set the clock back 1 hour. Poll GET /db/query?level=strong until the row appears, and measure elapsed time with Fuss's own monotonic clock.
+  - Guess: Guess: if the flush timer relies on wall-clock deadlines instead of a monotonic timer, a backwards step could stall the flush.
+
+## rqlite.io-api-read-consistency.md
+
+- **A read with level=linearizable must reflect every write that was acknowledged before the read started, so the read history is linearizable.** (process-kill, high)
+  - Quote: > This type of read is, as the name suggests, linearizable: such reads reflect a state of the system at some point after the read was initiated, and each read will at least return the results of the latest committed write[^1].
+  - Inject: Repeatedly SIGKILL the current Leader (found via /status) while concurrent writes and linearizable reads are in flight, then restart it with the same flags.
+  - Observe: Fuss logs the invoke and complete times of each operation and the value returned. A linearizability checker (Porcupine-style) on a register or counter model must accept the history. A read that completes successfully but misses a write acknowledged before the read started is a violation. Errors and timeouts are treated as indeterminate.
+  - Workload: Start a 3-node cluster. CREATE TABLE r(id INTEGER PRIMARY KEY, v INTEGER). Run N clients. Each client randomly either POSTs /db/execute 'UPDATE r SET v=? WHERE id=1' with unique values, or GETs /db/query?level=linearizable 'SELECT v FROM r WHERE id=1', sending requests to random nodes. Kill and restart the Leader every few seconds.
+  - Guess: Guess: a deposed Leader could record the commit index or pass the heartbeat quorum check before learning it was deposed. Or it could read before the entry at the recorded commit index is applied to SQLite after a restart replay.
+- **A linearizable read must never return data older than the commit index that existed when the read arrived, even right after a restart or leader change.** (restart, high)
+  - Quote: > Finally -- and this is critical -- the Leader waits until the write request at the previously recorded commit index has been applied to the SQLite database. Once this happens it then performs the read.
+  - Inject: Restart a node, or kill the Leader so another node takes over. Then immediately issue linearizable reads while the new Leader is still replaying its log into SQLite.
+  - Observe: Every successful read returns a value at least as new as the last write acknowledged before the read was sent. The value is identified by a monotonic sequence number that Fuss writes.
+  - Workload: Write seq=1..K with acknowledgements. Kill the Leader. As soon as /status shows a new Leader, loop GET /db/query?level=linearizable 'SELECT max(seq) FROM t' and check that the result is >= K.
+  - Guess: Guess: after a leader change, the applied index on the new Leader may lag its commit index, and the wait-for-apply step could race with log replay.
+- **Reads with level=strong are linearizable and reflect all committed writes.** (process-kill, high)
+  - Quote: > _Strong_ reads accomplish this by sending the query through the actual Raft log. This will, of course, involve the Leader contacting at least a quorum of nodes, some disk I/O, and will therefore increase query response times. _Strong_ reads are linearizable.
+  - Inject: During concurrent writes and strong reads, kill the Leader or a quorum-member follower, then restart it.
+  - Observe: A linearizability checker over Fuss's recorded history accepts all successful strong reads. No successful strong read misses a previously acknowledged write.
+  - Workload: Same register workload as the linearizable test, but use GET /db/query?level=strong. Send some reads to followers to exercise forwarding.
+  - Guess: Guess: a strong read entry committed just as leadership changes could be answered from a node whose SQLite is not yet caught up.
+- **A successful strong read sees every write committed before it.** (disk-full, medium)
+  - Quote: > Specifically when you use _Strong_ all currently committed entries in the Raft log have also been applied to the SQLite database at the time the read request is executed.
+  - Inject: Fill the Leader's data-directory filesystem while strong reads and writes are running. Strong reads write to the Raft log.
+  - Observe: Strong reads either return an error or return data that includes all acknowledged writes. A success that misses an acknowledged write is a violation.
+  - Workload: Ack writes seq=1..K. Fill the Leader's disk. Loop GET /db/query?level=strong 'SELECT max(seq) FROM t'. Free the disk and repeat.
+  - Guess: Guess: if the log append for the read fails on ENOSPC, an error path might fall back to a local read instead of returning an error.
+- **A weak read sent to a follower returns the Leader's data, not the follower's local data.** (process-kill, medium)
+  - Quote: > If the node determines it is not the Leader, the node will transparently forward the request to the Leader, which will in turn perform a _Weak_ read of its database. In that case the node waits for the response from the Leader, and then returns that response to the client.
+  - Inject: Kill and restart followers, but not the Leader, so that a restarted follower's local SQLite lags behind. Then read from that follower.
+  - Observe: While the Leader is stable, a weak read sent to the lagging follower returns the latest acknowledged value from the Leader. Fuss can confirm the follower is lagging with level=none on the same follower.
+  - Workload: Kill follower F. Write seq=1..K via the Leader. Restart F. Immediately GET F:/db/query?level=weak and F:/db/query?level=none. The weak read should show K even when the none read shows less.
+  - Guess: Guess: a freshly restarted follower might briefly think it is Leader, or might serve locally before it learns who the Leader is.
+- **Stale weak reads can only happen within less than about one second after a leader is deposed.** (process-kill, low)
+  - Quote: > However there is a small window of time (less than a second by default) during which a node may think it's the Leader, but has actually been deposed, a new Leader elected, and other writes have taken place on the cluster.
+  - Inject: Pause or kill-restart the Leader in ways that cause a leader change while writes keep going to the new Leader.
+  - Observe: Fuss checks every stale weak read. A stale read is one that misses a write acknowledged more than about 1s, plus timing slack, before the read was invoked. A stale read outside that window is a violation.
+  - Workload: Run the register workload with weak reads sent to all nodes. Use SIGSTOP/SIGCONT on the Leader for a few seconds to force deposition, then let it resume and keep serving. Measure how old each stale read is.
+  - Guess: Guess: a node resumed after a long pause may still believe it is Leader until its own lease or heartbeat timer fires, which could exceed one second.
+- **A query with no level, or an unknown level, behaves exactly like level=weak.** (process-kill, medium)
+  - Quote: > _Weak_ consistency is used if you don't specify any level, or if an unrecognized level is specified
+  - Inject: Kill a quorum so that no Leader exists, and also test with a stable Leader.
+  - Observe: With a stable Leader, level=bogus sent to a follower returns the Leader's data, just like weak. With no Leader, it errors like weak and does not silently serve local data like none.
+  - Workload: Send GET /db/query?level=bogus and GET /db/query with no level to a lagging follower and compare against level=weak and level=none. Then kill 2 of 3 nodes and repeat on the survivor.
+  - Guess: Guess: parameter parsing could map unknown values to a zero value that corresponds to none.
+- **A restarted node that cannot reach a Leader serves level=none from local data and returns errors for every other level.** (restart, high)
+  - Quote: > _None_ consistency is required if a node restarts and, for whatever reason, can't contact the cluster Leader. Using _None_ will instruct the node to query the database as it finds it after restarting. If you select any other consistency level the node will return an error.
+  - Inject: Kill all nodes, then restart only one node of a 3-node cluster so it cannot reach a Leader.
+  - Observe: level=none succeeds. Its data contains only values that some client actually wrote, and it reflects a prefix of the acknowledged history. weak, linearizable, strong, and auto (on a voter) return errors rather than results.
+  - Workload: Ack writes seq=1..K. Kill all nodes. Start one node with its original flags. Query level=none, weak, linearizable, strong, and auto.
+  - Guess: Guess: the restarted node might hang on non-none levels instead of returning an error, or might serve weak locally if it has stale Leader state persisted.
+- **level=none with freshness=D must return an error once the follower has been out of contact with the Leader for longer than D.** (process-kill, high)
+  - Quote: > If a read request sets the query parameter `freshness` to a [Go duration string](https://golang.org/pkg/time/#Duration), the node serving the read will check that less time has passed since it was last in contact with the Leader, than that specified via freshness. If more time has passed the node will return an error.
+  - Inject: Kill the Leader and enough nodes that no new Leader can be elected. Then wait longer than D before querying the surviving follower.
+  - Observe: Fuss knows the kill time. Reads with freshness=1s issued more than 1s plus slack after the kill must error. Reads issued well before that may succeed.
+  - Workload: Start a 3-node cluster. Kill 2 nodes including the Leader. Poll the survivor with GET /db/query?level=none&freshness=1s every 100ms for 5s and record which reads succeed and which error.
+  - Guess: Guess: last-contact time might be updated by events other than Leader contact, such as a failed vote request, so the node keeps appearing fresh.
+- **The freshness check should not be fooled by wall-clock jumps on the follower.** (clock-skew, low)
+  - Quote: > If a read request sets the query parameter `freshness` to a [Go duration string](https://golang.org/pkg/time/#Duration), the node serving the read will check that less time has passed since it was last in contact with the Leader, than that specified via freshness.
+  - Inject: After isolating a follower (Leader killed, no quorum), step the follower's wall clock backward by several seconds.
+  - Observe: Reads with freshness=1s must still error once real elapsed time exceeds 1s. Success after a backward clock step would show reliance on wall time.
+  - Workload: Kill 2 of 3 nodes. Step the survivor's clock back by 10s. Poll GET /db/query?level=none&freshness=1s for 5s.
+  - Guess: Guess: last-contact may be compared using wall-clock time.Now without monotonic readings if the timestamp is serialized or reconstructed.
+- **freshness never causes an error on the Leader, at levels other than none, or when set to zero.** (restart, high)
+  - Quote: > **The `freshness` parameter is always ignored if the node serving the query is the Leader**. Any read, when served by the Leader, is always going to be within any possible freshness bound. `freshness` is also ignored for all consistency levels except `none`, and is also ignored if set to zero.
+  - Inject: Right after a Leader restarts and is re-elected. Also on an isolated follower when testing freshness=0.
+  - Observe: GET on the Leader with level=none&freshness=1ns succeeds. Weak or linearizable reads with a tiny freshness behave as if freshness were absent. level=none&freshness=0s on an isolated follower succeeds even after a long disconnection.
+  - Workload: Query the Leader with level=none&freshness=1ns. Query a follower with level=weak&freshness=1ns. Kill 2 of 3 nodes, wait 5s, and query the survivor with level=none&freshness=0s.
+  - Guess: Guess: a newly elected Leader may not have initialized its last-contact field and could apply the freshness check to itself.
+- **With freshness_strict, a follower errors unless its last applied entry was appended by the Leader within the freshness interval.** (restart, medium)
+  - Quote: > If you also want the node to check that the data it last **applied** to the database is not out-of-date by (at most) the `freshness` interval, you should also add the `freshness_strict` flag as a query parameter.
+  - Inject: Restart a follower while writes continue on the Leader, so the follower is in contact but behind on applying entries.
+  - Observe: Fuss compares results with and without freshness_strict. A strict read that succeeds must not miss writes acknowledged more than the freshness interval, plus slack, before the read. Fuss assumes clocks are synchronized for this test.
+  - Workload: Write timestamped rows continuously at about 10/s. Kill a follower, wait 5s, and restart it. Immediately poll it with level=none&freshness=1s&freshness_strict and with level=none&freshness=1s. Compare max(ts) in each result with Fuss's write log.
+  - Guess: Guess: after restart, the follower might use the timestamp of an older replayed entry or of a heartbeat rather than of the last applied data entry.
+- **freshness_strict correctness depends on clock sync, so skew changes results in a predictable direction.** (clock-skew, low)
+  - Quote: > **Note that this check works by comparing timestamps generated by the Leader to those generated by the node receiving the read request**. Any clock skew between the nodes may therefore affect the correctness of the data returned by the node.
+  - Inject: Skew the follower's clock behind the Leader's by more than the freshness interval while the follower is lagging.
+  - Observe: Fuss documents that a follower clock behind the Leader lets stale strict reads succeed and a follower clock ahead causes spurious errors. This characterizes the documented risk rather than a hard violation.
+  - Workload: Pause a follower with SIGSTOP to make it lag. Set its clock -5s, resume it, and query level=none&freshness=1s&freshness_strict. Repeat with +5s.
+  - Guess: Guess: this is documented as user responsibility, so failures here are expected. Fuss is only checking that the direction matches the doc.
+- **level=auto acts as none (honoring freshness) on read replicas and as weak (ignoring freshness) on voting nodes.** (process-kill, medium)
+  - Quote: > In the case of a read replica _None_ is chosen as the level. In all other cases _Weak_ is chosen as the level.
+  - Inject: Kill all voting nodes so neither the replica nor any voter can reach a Leader.
+  - Observe: On a replica started with -raft-non-voter=true, auto&freshness=1s succeeds shortly after the kill and errors after more than 1s. On a voter with no Leader, auto errors regardless of freshness, matching weak.
+  - Workload: Start 3 voters and 1 non-voter replica. Write data. Kill the voters. Poll the replica with GET /db/query?level=auto&freshness=1s over time. Restart one voter alone and query it with level=auto&freshness=1h.
+  - Guess: Guess: a replica's role detection could depend on cluster state that is unavailable when the Leader is gone, causing auto to fall back to weak.
+- **A read replica forwards non-none reads to the Leader and returns the Leader's data.** (restart, medium)
+  - Quote: > If you set a read consistency level other than _None_ when querying a read replica then the replica will simply forward the request to the Leader (which negates the read-scaling benefits of the replica).
+  - Inject: Restart the replica so that it is lagging, while writes continue.
+  - Observe: level=weak on the lagging replica returns the latest acknowledged write, while level=none on the same replica may return older data.
+  - Workload: Kill the replica. Write seq=1..K. Restart the replica and immediately query it with level=weak and level=none for max(seq).
+  - Guess: Guess: a replica that has not yet learned the Leader address after restart may error or serve locally.
+- **With linearizable_timeout=1s, a linearizable read that cannot complete returns an error within about 1 second instead of hanging or returning stale data.** (process-kill, high)
+  - Quote: > If a linearizable read is not available within 1 second of receiving the read request, an error will be returned.
+  - Inject: Kill all followers so the Leader cannot obtain a heartbeat quorum, then issue the read.
+  - Observe: Fuss measures latency. The response is an error that arrives within 1s plus slack. A successful result, or a hang well beyond the timeout, is a violation.
+  - Workload: Start a 3-node cluster. Kill both followers. GET Leader:/db/query?level=linearizable&linearizable_timeout=1s 'SELECT 1' and time it.
+  - Guess: Guess: the timeout may cover only the heartbeat wait and not the wait-for-apply phase, or it may not start until after the forwarding hop.
+- **A linearizable or strong read must not succeed if the serving node lost leadership mid-read.** (process-kill, medium)
+  - Quote: > The read request will be served by the node if it is the Leader, and if it remained the Leader throughout the processing of the read.
+  - Inject: Kill the followers, or SIGSTOP the Leader and resume it after a new election, while linearizable reads are in flight on the old Leader.
+  - Observe: No successful read from the old Leader returns data missing writes that the new Leader acknowledged before the read completed. Fuss checks this with the linearizability checker.
+  - Workload: Issue a stream of linearizable reads to Leader L. SIGSTOP L for 3s while writes go to the new Leader, then SIGCONT L. Check the reads that L completed after resuming.
+  - Guess: Guess: the quorum heartbeat responses may have been collected before the pause and still be counted after it.
+
+## rqlite.io-clustering-general-guidelines.md
+
+- **A crashed node can be restarted with no special steps, and it catches up on all writes the cluster committed while it was down.** (process-kill, high)
+  - Quote: > If an rqlite process crashes, it is safe to simply restart it. The node will pick up any changes that happened on the cluster while the node was offline.
+  - Inject: SIGKILL a follower (and in other runs, the leader) in the middle of a steady stream of acknowledged writes. Keep writing to the surviving quorum, then restart the killed node with its original flags and data dir.
+  - Observe: After restart, run a level=none read on the restarted node itself (e.g. SELECT count(*), max(id)). Poll until it converges. Every write the cluster acknowledged, including those made while the node was down, must appear. No row may be missing or duplicated, and the restarted node must match the leader's strong read.
+  - Workload: Start a 3-node cluster. Loop POST /db/execute INSERT INTO t(id,v) VALUES(?,?) with unique ids, logging acks to the Fuss history file. kill -9 node2. Continue inserts for N seconds. Restart node2 with the same -node-id, -raft-addr and data dir. Poll GET /db/query?level=none on node2 and compare with GET /db/query?level=strong on the leader.
+  - Guess: Guess: a kill during snapshotting or WAL checkpointing could leave a partially written snapshot or SQLite file. Restart might then fail, or replay could skip or duplicate log entries.
+- **A 3-node cluster keeps accepting writes and reads after any one node, including the leader, is killed.** (process-kill, high)
+  - Quote: > You've now got a fault-tolerant, distributed, relational database. It can tolerate the failure of any node, even the Leader, and remain operational.
+  - Inject: Kill the current leader (found via GET /status or /nodes) while writes are in flight.
+  - Observe: After a bounded election window, writes sent to the surviving nodes succeed again. Every write acknowledged before the kill is still readable with level=strong. Writes that errored or timed out are recorded as indeterminate and are not counted as losses.
+  - Workload: Start a 3-node cluster. Run concurrent clients doing INSERT with unique ids against all nodes. Find the leader via GET /nodes and kill -9 it. Keep writing to the remaining 2 nodes. After the run, do a strong SELECT and check that all acked ids are present.
+  - Guess: Guess: writes acknowledged by the old leader just before the kill might not have been committed by a quorum. That would be lost-ack data loss.
+- **A cluster stays writable as long as a majority of voting nodes are up: 2 of 3, 3 of 5.** (process-kill, high)
+  - Quote: > For a cluster of `N` nodes in size to remain operational, at least `(N/2)+1` nodes must be up and running, and be in contact with each other.
+  - Inject: Kill exactly floor(N/2) voters, one at a time, during a write workload. In a 5-node cluster, kill 2 nodes, including the leader.
+  - Observe: With a majority still alive, writes continue to succeed after re-election. Acked data stays readable with level=strong on the survivors.
+  - Workload: Start a 5-node cluster. Continuous INSERTs. kill -9 two voters, one of them the leader. Confirm POST /db/execute succeeds on a survivor within a timeout. Restart the killed nodes and verify convergence.
+  - Guess: Guess: two quick kills might land during an in-progress election. The survivors might then stay leaderless longer than expected or fail to converge.
+- **A write must never be reported successful unless a majority of voters agreed to it, so writes cannot succeed when quorum is lost.** (process-kill, high)
+  - Quote: > A majority, or _Quorum_, of nodes within the cluster must concur on a given change for this operation to be successful.
+  - Inject: Kill 2 of 3 voters (or 2 of 4) and keep sending writes to the lone survivor.
+  - Observe: Every write sent while quorum is absent must return an error or time out, never success. After the killed nodes return, none of the errored writes may have silently appeared as acked. Errored writes that later appear are allowed as indeterminate but must be flagged.
+  - Workload: Start a 3-node cluster. kill -9 node2 and node3. Send POST /db/execute INSERT id=X to node1 and record the response. Restart node2 and node3. Do a strong SELECT for X. A 200 response with no error on the INSERT while quorum was down is a violation.
+  - Guess: Guess: a stale leader that has not yet noticed it lost followers might still answer, especially a level=none read or a queued write. It is unclear whether it could ever return success for a write.
+- **A 4-node cluster tolerates only 1 failure, like a 3-node cluster, and a 2-node cluster tolerates 0.** (process-kill, high)
+  - Quote: > Below is a table summarizing the quorum and fault tolerance for different cluster sizes:
+  - Inject: In a 4-node cluster, kill 1 node (expect writes to continue), then a second (expect writes to stop). In a 2-node cluster, kill 1 (expect writes to stop).
+  - Observe: Write success or failure matches the table at each step. No write is acknowledged once the failure count exceeds the tolerance.
+  - Workload: For each N in {2,3,4,5}: form the cluster, then loop {kill one more voter; attempt INSERT with a timeout; record ok/err}. Compare the results against the quorum table.
+  - Guess: Guess: with even N, a leader might keep serving briefly after losing quorum until its lease or heartbeat times out.
+- **Read replicas do not affect quorum: killing them never stops writes, and adding them never lets writes survive the loss of a voter majority.** (process-kill, high)
+  - Quote: > When it comes to the Raft protocol, these nodes do not count towards `N`, since they do not [vote](https://raft.github.io/).
+  - Inject: Run 3 voters plus 3 read replicas (-raft-non-voter=true). Kill all replicas, then separately kill 2 voters while the replicas stay alive.
+  - Observe: Killing the replicas causes no write errors. Killing 2 voters makes writes fail even though 4 processes are still up. /nodes shows voter=false for replicas.
+  - Workload: Start the voters, then join the replicas with -raft-non-voter=true -join. Continuous INSERTs. kill -9 all replicas and check the writes. Restart the replicas, then kill -9 two voters and check that writes now fail.
+  - Guess: Guess: a misconfigured or misregistered replica might be counted as a voter in the configuration.
+- **A node can join by contacting any member, and if some listed join addresses are dead, it tries the others until it succeeds.** (process-kill, high)
+  - Quote: > If a node receives a join request, and that node is not actually the Leader of the cluster, the receiving node will automatically redirect the requesting node to the Leader node. As a result a node can actually join a cluster by contacting any node in the cluster. You can also specify multiple join addresses, and the node will try each address until joining is successful.
+  - Inject: Before starting the joining node, kill the node listed first in -join, or kill the leader so the join target is a follower.
+  - Observe: The new node eventually appears in GET /nodes on the leader. It can serve level=none reads containing the existing data.
+  - Workload: Start a 3-node cluster with some rows. kill -9 node1. Start node4 with -join host1:4002,host2:4002,host3:4002. Poll GET /nodes on node2 for node4. Query node4 with level=none.
+  - Guess: Guess: the retry logic might give up after the first dead address or loop forever, or a redirect might point at a just-killed leader.
+- **Repeating a join with the same ID and Raft address is a no-op, so joins are idempotent.** (restart, high)
+  - Quote: > However, if a node does attempt to join a cluster it is already a member of, and neither its node ID nor its Raft network address has changed, then the cluster Leader will ignore the join request as there is nothing to do -- the joining node is already a fully configured member of the cluster.
+  - Inject: Repeatedly kill and restart a member node, always passing -join, including restarts timed while the leader is changing.
+  - Observe: GET /nodes never shows duplicate entries for the node, cluster size stays constant, and writes are unaffected. The data on the rejoining node is preserved.
+  - Workload: Start a 3-node cluster. Loop 20 times: kill -9 node3, then restart it with the same -node-id 3, -raft-addr and -join host1:4002. After each loop, GET /nodes and assert exactly 3 entries. Run an INSERT/SELECT.
+  - Guess: Guess: a join racing with a leader change might be treated as new and cause a remove-then-add, briefly dropping quorum.
+- **Restarting a node with a new Raft address plus -join replaces its old record with the new address, without duplicating the node or losing data.** (restart, medium)
+  - Quote: > It is possible to change a node's Raft address between restarts. Simply pass the new address on the command line. **You must also, however, explicitly tell the node to join the cluster again, by passing `-join` to the node**. In this case what the Leader actually does is remove the previous record of the node, before adding a new record of the node.
+  - Inject: Stop a follower, then restart it on a different -raft-addr port with -join while writes continue. In a harder variant, kill the leader right after the rejoin.
+  - Observe: GET /nodes shows the node ID once, with the new address. Cluster size is unchanged. The node catches up on all acked writes.
+  - Workload: Start a 3-node cluster with continuous INSERTs. kill node3. Restart with -node-id 3 -raft-addr host3:5002 -join host1:4002 using the same data dir. Poll GET /nodes. Do a level=none SELECT on node3 and compare with the leader.
+  - Guess: Guess: if the leader crashes between the remove and the add, the node might end up removed from the configuration entirely.
+- **Restarting a node on a new HTTP address without -join keeps it in the cluster, and it serves requests at the new address.** (restart, medium)
+  - Quote: > You can also change the HTTP API address of a node between restarts, but an explicit re-join is not required if just the HTTP API address changes.
+  - Inject: Stop a follower and restart it with a different -http-addr and no -join.
+  - Observe: The node answers on the new HTTP address. GET /nodes on the leader reports the updated API address eventually. Redirects or forwarded queries via that node work.
+  - Workload: Start a 3-node cluster. kill node2. Restart it with -http-addr host2:5001 and the same raft-addr and data dir. GET /status on host2:5001. GET /nodes on the leader. Send an INSERT to node2 and verify it is forwarded and committed.
+  - Guess: Guess: the leader might cache the old HTTP address, so redirects or forwarding from other nodes go to a dead address.
+- **A newly joined node eventually holds exactly the same database as the others.** (process-kill, high)
+  - Quote: > The new node will automatically pick up all changes that have occurred on the cluster since the cluster first started. In other words, after joining successfully, the new node will have a full copy of the SQLite database, just like every other node in the cluster.
+  - Inject: Join a new node while writes are running, and kill the leader during the join or initial snapshot transfer.
+  - Observe: After convergence, a level=none read on the new node returns all acked rows, with no extras beyond indeterminate writes, matching a strong read on the leader.
+  - Workload: Start a 3-node cluster and insert 100k rows (enough to trigger snapshots). Start node4 with -join while INSERTs continue. kill -9 the leader mid-join. Wait. Compare SELECT count(*), checksum-style aggregates on node4 at level=none against level=strong.
+  - Guess: Guess: an interrupted snapshot install might leave the new node with a partial database that is later treated as complete.
+- **Promote and demote change a node's voter status while it stays a member with its data intact.** (process-kill, medium)
+  - Quote: > rqlite supports changing a node's role without removing it from the cluster. You can _promote_ a _[read replica](/docs/clustering/read-replicas/)_ to become a _voting_ node, and you can _demote_ a _voting_ node so that it becomes a _read replica_.
+  - Inject: Kill the leader right after sending POST /promote or /demote, or kill the target node during the call.
+  - Observe: GET /nodes shows the node still present, with a voter flag that is either fully old or fully new, never missing. Quorum behavior matches the reported role: after a demote in a 3-voter cluster, killing 1 other voter stops writes.
+  - Workload: Start 3 voters plus 1 replica. POST /promote {"id":"4"} and immediately kill -9 the leader. After re-election, GET /nodes. Then POST /demote {"id":"4"} and verify the quorum math by killing voters.
+  - Guess: Guess: a role-change configuration entry not yet committed when the leader dies might be lost while the client got a success response.
+- **Removing a node succeeds only when there is a leader. Without quorum, a remove request must fail and must not change the membership.** (process-kill, high)
+  - Quote: > **Note that the cluster must be functional -- there must still be an operational Leader -- for this removal to be successful**. If, after a node failure, a given cluster does not have a quorum of nodes still running, you must bring back the failed node. Any attempt to remove it will fail as there will be no Leader to respond to the node-removal request.
+  - Inject: Kill 2 of 3 voters, then send DELETE /remove for one of them to the survivor.
+  - Observe: DELETE /remove returns an error. After the failed nodes are restarted, GET /nodes still lists all 3 nodes. With quorum present, a remove succeeds and the node disappears from /nodes.
+  - Workload: Start a 3-node cluster. kill -9 node2 and node3. curl -XDELETE node1/remove -d '{"id":"3"}' and record the result. Restart node2 and node3. GET /nodes. Then, with quorum, kill node3 and remove it, and assert it is gone.
+  - Guess: Guess: a remove sent to a stale leader might be appended locally and later committed, or the call might hang instead of failing.
+- **With -raft-cluster-remove-shutdown=true, SIGTERM removes the node from the cluster before exit and shrinks the quorum.** (other, high)
+  - Quote: > If the node is shut down **gracefully** (it receives `SIGTERM` for example) it will first contact the Leader and remove itself from the cluster, and then the rqlite process will terminate. As a result the Leader will not continue to contact the node after it shuts down. This removal operation also reduces the cluster quorum size.
+  - Inject: Send SIGTERM (graceful) to a node started with the flag, during writes. Compare with SIGKILL, which should leave the record in place.
+  - Observe: After SIGTERM, GET /nodes no longer lists the node. In a 3-node cluster that becomes 2 nodes, one further SIGTERM'd removal still leaves a writable single node, showing the quorum shrank. After SIGKILL, the node is still listed.
+  - Workload: Start 3 nodes with -raft-cluster-remove-shutdown=true. Run INSERTs. kill -TERM node3 and wait for exit. GET /nodes and assert 2 entries. kill -TERM node2. Assert writes still succeed on node1. Repeat with kill -9 and assert the entry remains.
+  - Guess: Guess: if the node is the leader when it receives SIGTERM, self-removal might race with leadership transfer and the process might exit before the removal commits.
+- **Nodes unreachable longer than the configured timeout are automatically removed, with voters and read replicas on separate timeouts.** (clock-skew, medium)
+  - Quote: > To enable reaping of voting nodes set `-raft-reap-node-timeout` to a non-zero time interval. Likewise, to enable reaping of read replicas set `-raft-reap-read-only-node-timeout`.
+  - Inject: Kill a replica and a voter (in a 5-node cluster) with short timeouts, e.g. 30s for replicas and 2m for voters. Step the clock of the leader's host forward or backward during the wait.
+  - Observe: The replica disappears from GET /nodes after about 30s, and the voter after about 2m, not before. Clock jumps should not cause premature reaping or indefinite delay. Reachable nodes are never reaped.
+  - Workload: Start 5 voters plus 1 replica, all voters with -raft-reap-node-timeout=2m -raft-reap-read-only-node-timeout=30s. kill -9 the replica and one voter. Poll GET /nodes every 5s, recording removal times. In variants, skew the leader host's clock by +1h mid-wait.
+  - Guess: Guess: if the timeout uses wall-clock instead of monotonic time, a forward clock jump could reap healthy or briefly unreachable nodes immediately.
+- **A leader election restarts the reap countdown, so a node is never reaped based on time counted by a previous leader.** (process-kill, medium)
+  - Quote: > Note that the timeout clock is reset if a cluster elects a new Leader.
+  - Inject: Kill a node, wait about 80% of the reap timeout, then kill the leader to force an election.
+  - Observe: The dead node is not removed until a full timeout has elapsed after the new leader was elected, as seen from GET /nodes polling timestamps in the Fuss history.
+  - Workload: Start 5 voters with -raft-reap-node-timeout=60s. kill -9 node5 at t0. At t0+50s, kill -9 the leader. Note the election time tE via GET /status. Poll GET /nodes and assert node5 is still present until at least tE+60s.
+  - Guess: Guess: the new leader might inherit or derive last-contact times from replicated state rather than resetting them, reaping early.
+- **Reaping happens only when the current leader has the flags, and flags on read replicas have no effect.** (process-kill, medium)
+  - Quote: > For reaping to work consistently you **must** set these flags on **every** voting node in the cluster -- in other words, every node that could potentially become the Leader. You can also set the flags on read replicas, but they will simply be silently ignored.
+  - Inject: Configure the reap flags only on read replicas, or only on some voters, then kill a node and force leadership onto a voter without the flags.
+  - Observe: With flags only on replicas, no node is ever reaped. A node is reaped only while a flag-carrying voter is leader.
+  - Workload: Start 3 voters without the flags plus 1 replica with -raft-reap-node-timeout=20s. kill -9 one voter. Wait 2 minutes and assert it is still in GET /nodes. In a second run, put the flag on node1 only, and kill leaders until node1 leads. Observe that reaping then occurs.
+  - Guess: Guess: a replica might wrongly act on its flag, for example by issuing remove requests.
+
+## rqlite.io-design.md
+
+- **Every acknowledged write is recorded in the Raft log, so it survives a crash.** (process-kill, high)
+  - Quote: > This log stores the set of committed SQLite commands, in the order in which they were executed. This log is the authoritative record of every change that has happened to the system.
+  - Inject: SIGKILL all nodes, or the leader alone, while a stream of POST /db/execute requests is in flight. Repeat at random offsets, including immediately after a 200 response.
+  - Observe: Fuss's own history file lists every write that received a 200 response with no error in the results. After restart and /readyz returning OK, read with GET /db/query?level=strong. Every acknowledged row must be present. Unacknowledged rows may be either present or absent.
+  - Workload: Run POST /db/execute ["CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)"]. Then loop POST /db/execute [["INSERT INTO t(id,v) VALUES(?,?)", n, uuid]], logging the response for each n. Kill -9 and restart rqlited with the same -node-id and data dir. Run GET /db/query?level=strong&q=SELECT id,v FROM t. Diff the result against the acknowledged set.
+  - Guess: Guess: a response might be sent after commit but before the log entry is fsync'd on a majority, or a full-cluster kill might lose a tail that was acknowledged.
+- **Committed writes are applied in the same order they were committed, including across leader failover.** (process-kill, high)
+  - Quote: > This log stores the set of committed SQLite commands, in the order in which they were executed.
+  - Inject: Kill the leader between two sequential, acknowledged, order-dependent writes, then keep writing to the new leader.
+  - Observe: One client issues serial updates and waits for each acknowledgement. The final value and the append-only log table must match the client's acknowledgement order. Fuss checks that no later-acknowledged write is overwritten by an earlier one and that the sequence column is monotonic in id order.
+  - Workload: Single client loop: POST /db/execute [["UPDATE c SET v=? WHERE k=1", i], ["INSERT INTO log(seq) VALUES(?)", i]] with i increasing. Kill the leader mid-run and follow redirects to the new leader. At the end, SELECT v FROM c must equal the last acknowledged i, and SELECT seq FROM log ORDER BY rowid must be increasing.
+  - Guess: Guess: a request the client retries after a timeout during failover might be applied twice or out of order, because the HTTP API has no idempotency key.
+- **After faults settle, every node's SQLite contents are identical.** (process-kill, high)
+  - Quote: > Since every node in an rqlite cluster applies the log entries in exactly the same way, this guarantees that the SQLite database is the same on every node.
+  - Inject: Randomly kill and restart followers and leaders during a mixed write workload. Then stop the faults and wait for all nodes to report the same applied index in /status.
+  - Observe: Query each node directly with GET /db/query?level=none. Run SELECT * ORDER BY id and a checksum aggregate. Results must be byte-identical across nodes. Fuss can also copy each node's SQLite file read-only and compare query results offline.
+  - Workload: Start 3 nodes. Run concurrent INSERT/UPDATE/DELETE through POST /db/execute while a fault loop kill -9's a random node every few seconds and restarts it. Quiesce, poll /status until the raft applied_index values are equal, then compare SELECT count(*), sum(id), group_concat(v) on each node with level=none.
+  - Guess: Guess: non-deterministic SQL such as random() or datetime('now') under clock skew could make nodes diverge if it is evaluated per node rather than rewritten before logging.
+- **A crash at any point, including during the periodic fsync, does not leave the node with a corrupt database.** (process-kill, high)
+  - Quote: > However, this configuration risks database corruption in the event of a crash. To address this risk, rqlite periodically switches SQLite to `SYNCHRONOUS=FULL` mode, thereby fsync'ing the entire SQLite database to disk.
+  - Inject: SIGKILL repeatedly at random moments under heavy write load, so that some kills land during the periodic SYNCHRONOUS=FULL fsync or a snapshot.
+  - Observe: After restart the node becomes ready via /readyz. PRAGMA integrity_check, run through /db/query, returns 'ok'. The data matches the acknowledged history. A node that refuses to start or returns SQLite errors is a failure.
+  - Workload: High-rate POST /db/execute inserts with large blobs. Kill -9 at random intervals, restart, and wait for /readyz. Run GET /db/query?level=strong&q=PRAGMA integrity_check and diff the rows against acknowledged writes. Repeat hundreds of times.
+  - Guess: Guess: a kill landing exactly while the mode is switched to FULL or back to OFF might leave a WAL/DB pair that looks valid but is torn.
+- **After restart, the database contains every committed change, whether it was recovered from the last fsync'd copy or rebuilt from the Raft log.** (restart, high)
+  - Quote: > When rqlite restarts, it starts from the last known fsync'ed version of the SQLite database. In the event that no such copy is available (or if there is any question about its correctness) the SQLite database is completely rebuilt using the information stored in the Raft log.
+  - Inject: Kill -9 at three points: just after a burst of writes and before the next periodic fsync, during an fsync, and while the data directory is near-full. Restart each time.
+  - Observe: After restart, every acknowledged write is visible and no unacknowledged-then-rejected write appears. Fuss can observe the restart path by reading file timestamps in the data dir and comparing startup duration. Correctness is checked purely via query results.
+  - Workload: Write N rows, then kill -9 immediately after the last 200 response. Restart and run SELECT count(*), max(id) with level=strong. Compare against Fuss's history. Variant: kill during the restart itself, while the rebuild is in progress, then restart again and re-check.
+  - Guess: Guess: the 'any question about its correctness' check might miss a stale but structurally valid SQLite file. The node would then start from it and skip the Raft entries after it.
+- **Running out of disk during writes or fsync must not lead to acknowledged data loss or a corrupt database after space is restored and the node restarts.** (disk-full, medium)
+  - Quote: > When rqlite restarts, it starts from the last known fsync'ed version of the SQLite database. In the event that no such copy is available (or if there is any question about its correctness) the SQLite database is completely rebuilt using the information stored in the Raft log.
+  - Inject: Fill the filesystem holding -data-dir, using a small loopback or tmpfs mount, while writes and periodic fsync/snapshot are occurring.
+  - Observe: Writes either fail with an error or succeed. Anything that got a 200 response must be present after freeing space and restarting. PRAGMA integrity_check returns ok, and /readyz recovers.
+  - Workload: Mount a small filesystem as the data dir and start rqlited. Insert large rows until the API returns errors, logging every response. Free space, then kill -9 and restart. Query with level=strong and run integrity_check. Diff against acknowledged rows.
+  - Guess: Guess: ENOSPC during the SQLite fsync or snapshot write might be logged but not surfaced, leaving a partial snapshot that is trusted on restart.
+- **Raft log disk usage stays bounded through snapshots and truncation, and crashing during this does not lose data.** (process-kill, medium)
+  - Quote: > rqlite automatically performs log compaction, so that disk usage due to the log remains bounded. After a configurable number of changes, rqlite snapshots the SQLite database and truncates the Raft log.
+  - Inject: Set a low -raft-snap threshold so snapshots happen frequently. Kill -9 at random times so some kills land mid-snapshot or mid-truncation.
+  - Observe: Fuss reads file sizes in the data dir (raft log file and snapshot directory) and checks they plateau rather than grow linearly with the number of writes. After each kill and restart, every acknowledged row is present and integrity_check is ok.
+  - Workload: Start rqlited with -raft-snap=100. Run a long loop of small UPDATEs on a fixed-size table, sampling data dir file sizes every second. Inject kill -9 periodically and restart. Assert sizes are bounded and the data is correct.
+  - Guess: Guess: a crash after log truncation but before the snapshot is fully persisted could leave neither source with the truncated entries.
+- **With automatic bootstrapping, exactly one cluster forms with exactly one bootstrapping node, and all others join as followers.** (concurrent-calls, high)
+  - Quote: > Only one node can bootstrap a cluster, so any other node that attempts to do so later will fail, and instead become a _Follower_ in the new cluster.
+  - Inject: Start all N nodes with -bootstrap-expect at the same instant. In variants, kill and restart one node during the bootstrap window, or delay starts by random amounts.
+  - Observe: GET /nodes and /status on every node show the same single leader and the same membership set. There are never two disjoint clusters and never two leaders in the same term. A write to one node is readable at level=strong from every node.
+  - Workload: Start 3 rqlited processes concurrently, each with -bootstrap-expect 3 -join a,b,c. Poll /nodes on each until stable, then check that the membership and leader agree. POST a write and read it back from all nodes. Repeat many times with random start jitter and kills.
+  - Guess: Guess: two nodes might each reach the -bootstrap-expect contact count at nearly the same moment and both bootstrap, producing a split cluster.
+- **With Consul or etcd discovery, only one node wins the leader key and all others join it.** (concurrent-calls, medium)
+  - Quote: > Each node attempts to atomically set a special key (the node writes its HTTP and Raft network addresses as the value for the key). Only one node will succeed in doing this and will then declare itself Leader, and other nodes will then join with it.
+  - Inject: Start all nodes simultaneously against a fresh Consul/etcd instance that Fuss runs itself. Variant: kill the winning node right after it sets the key, then restart it.
+  - Observe: Fuss reads the key in Consul/etcd and /nodes on each rqlite node. Exactly one cluster forms, and its leader matches the address stored in the key at formation time.
+  - Workload: Run etcd locally. Start 3 rqlited with -disco-mode etcd-kv and the matching -disco-config at the same time. Read the etcd key and poll /nodes on each node. Assert a single cluster and a write visible on all nodes.
+  - Guess: Guess: if the key-setter crashes before its Raft layer bootstraps, other nodes may keep trying to join a dead address, or a stale key may be reused after restart.
+- **Concurrent updates to the Consul/etcd leader key never overwrite one another, because each update is check-and-set.** (concurrent-calls, low)
+  - Quote: > To prevent multiple nodes updating the Leader key at once, nodes use a check-and-set operation, only updating the special key if its value has not changed since it was last read by the node.
+  - Inject: Force leader changes, by killing the leader repeatedly, while several nodes are alive and racing to update the key.
+  - Observe: Fuss watches the key's revision history in etcd/Consul. Each update must be based on the previous revision, and the final key value must match the leader reported by /status on the nodes.
+  - Workload: Run a 3-node cluster with -disco-mode etcd-kv. Loop: kill the current leader (found via /status), wait for a new leader, then compare the etcd key history (watch with revisions) with /status. Restart the killed node and repeat.
+  - Guess: Guess: a node waking from a pause, for example under clock skew or SIGSTOP, might write a stale leader address if it re-reads the key before the CAS.
+
+## rqlite.io-faq.md
+
+- **No two nodes ever end up with conflicting committed data, even across crashes and leader changes.** (process-kill, high)
+  - Quote: > By using Raft, rqlite prevents divergent copies of the data, and ensures there is one authoritative, consistent copy of that data at all times.
+  - Inject: Repeatedly SIGKILL the current Leader (found via GET /status or /nodes) while a stream of writes is in flight. Then restart it. Optionally combine with clock skew on one node.
+  - Observe: After the cluster quiesces, query every node with level=none. Each node must return exactly the same table contents in the same order of applied writes. Every acknowledged write must appear on every node. No node may hold a row that another node's committed history contradicts.
+  - Workload: Start 3 rqlited nodes (-node-id, -http-addr, -raft-addr, -bootstrap-expect 3 / -join). POST /db/execute CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT). Loop: POST /db/execute INSERT INTO t(id,v) VALUES(n,'x'), recording each ack or error in Fuss's history file. Kill the leader every few seconds, then restart it with the same -node-id and data dir. Finally GET /db/query?q=SELECT * FROM t ORDER BY id&level=none on each node and diff the results.
+  - Guess: Guess: a node killed after appending log entries it never got committed could apply them locally during its restart replay before it learns the new leader's log, briefly exposing divergent data to level=none reads.
+- **A write is acknowledged only after a quorum has accepted it, so an acknowledged write survives the Leader crashing.** (process-kill, high)
+  - Quote: > Yes, this is an intrinsic part of the Raft protocol.
+  - Inject: Immediately after the Leader returns HTTP 200 for a write. Kill the Leader (and optionally one follower in a 5-node cluster) before it can do anything else.
+  - Observe: Once a new Leader is elected, every acknowledged write must be readable with level=strong. A write that Fuss recorded as acknowledged but that is now missing means the promise was broken.
+  - Workload: 3-node cluster. Loop: POST /db/execute INSERT unique id. On HTTP 200 with no 'error' field in results, record it as acked, then immediately SIGKILL the leader. Wait for a leader in /status on the survivors. GET /db/query?level=strong&q=SELECT id FROM t and check that every acked id is present. Restart the killed node and repeat.
+  - Guess: Guess: the HTTP response might be sent after local apply but with a window where fsync of the Raft log on followers is not complete, so a correlated kill loses the entry.
+- **If the Leader's disk is full, writes must fail with an error rather than be acknowledged and later lost.** (disk-full, medium)
+  - Quote: > Yes, this is an intrinsic part of the Raft protocol.
+  - Inject: Fill the filesystem holding the Leader's -data-dir (for example, a small tmpfs or loop mount) while writes are ongoing.
+  - Observe: Each write either returns an error or is acknowledged. Every acknowledged write must still be present after space is freed and the nodes are restarted.
+  - Workload: Run the Leader on a 50MB loop-mounted data dir. Insert rows containing large blobs until writes start erroring, recording the status of each. Free space, restart all nodes, then SELECT and confirm all acked rows exist and the database is readable.
+  - Guess: Guess: a failed Raft log or snapshot write might be logged but not surfaced to the client, or a partial snapshot file might prevent restart.
+- **A write sent to a follower is applied through the Leader, and if no Leader is reachable the client gets an error instead of a false success.** (process-kill, high)
+  - Quote: > If a client sends a write-request to a node and that node is not the Leader, the node will transparently forward the request to the Leader, wait for a response, and then return the response to the client. If the node receiving the write cannot contact the Leader (which shouldn't happen during normal operation, as all functional clusters have a Leader), the write will fail and return an error to the client.
+  - Inject: Kill the Leader (or a majority of nodes) while writes are being sent to a follower.
+  - Observe: Each follower response is either a success whose row later appears cluster-wide, or an error. A success whose row never appears is a violation. A write that returned an error but appears anyway is allowed (indeterminate), but Fuss should log it as worth checking.
+  - Workload: 3-node cluster. Send all INSERTs only to follower F via POST /db/execute. Kill the leader mid-stream, and in a second run kill both other nodes. Record the responses. After restart, SELECT on all nodes and reconcile against Fuss's history.
+  - Guess: Guess: the follower could time out waiting for the forwarded response and report an error after the Leader actually committed the write, or report success based on a stale leader connection.
+- **Leader-required reads sent to a follower either return the Leader's up-to-date answer or fail with an error; they never silently return stale data.** (process-kill, high)
+  - Quote: > If a read request must be serviced by the Leader, however, rqlite will transparently forward the request to the Leader, wait for the Leader to handle it, and return the results to the client. If the node receiving the read cannot contact the Leader (which shouldn't happen during normal operation, as all functional clusters have a Leader), the read will fail and return an error to the client.
+  - Inject: Kill the Leader or a majority of nodes while level=strong (or level=weak) reads are sent to a follower.
+  - Observe: Each strong read returns data reflecting every write acknowledged before the read started, or returns an error. A stale success is a violation.
+  - Workload: Write an incrementing counter row via the leader, recording the acked values. Concurrently GET /db/query?level=strong&q=SELECT v FROM c on a follower. Kill the leader, then kill the majority. Check that no successful read returned a value lower than the latest value acked before that read began.
+  - Guess: Guess: a deposed Leader that has not yet noticed it lost leadership might serve a forwarded read from its own stale state.
+- **Reads with level=none still succeed on a node even when no Leader is reachable.** (process-kill, high)
+  - Quote: > Some reads, depending on the requested [_read consistency_](/docs/api/read-consistency/), do not need to be serviced by the Leader, and in that case the node can service the read regardless of whether it can contact the Leader or not.
+  - Inject: Kill all nodes except one in a 3-node cluster.
+  - Observe: GET /db/query?level=none on the surviving node returns HTTP 200 with data instead of an error. The data must be a prefix of the acknowledged history, never containing unacknowledged rows that were later lost.
+  - Workload: Insert rows. Kill 2 of 3 nodes. Repeatedly GET /db/query?level=none&q=SELECT * FROM t on the survivor and record the result. Restart the other nodes and compare.
+  - Guess: Guess: the survivor might reject all queries while it is in candidate state.
+- **A minority of nodes must refuse writes, and once the majority returns the results stay consistent.** (process-kill, medium)
+  - Quote: > This means that if an rqlite cluster is partitioned, only the side of the cluster that contains a majority of the nodes will be available. The other side of the cluster will not respond to writes. However the side that remains available will return consistent results, and when the partition is healed, consistent results will continue to be returned.
+  - Inject: Approximate a partition by killing a majority (2 of 3 nodes), leaving one node up. Then restart the killed nodes to simulate healing.
+  - Observe: Writes to the lone node return an error or time out, and none of them appear later as committed. After restart, all nodes agree and every pre-fault acknowledged write is present.
+  - Workload: 3 nodes. Insert rows A. Kill 2 nodes. POST /db/execute INSERT rows B to the survivor and expect errors. Restart the 2 nodes. Query all nodes with level=strong and level=none: A must be present, and any B that errored must not be present unless Fuss classified it as indeterminate.
+  - Guess: Guess: a write accepted into the lone node's local log before it noticed loss of quorum might be committed after the heal, despite having returned an error or timeout.
+- **A client talking to a node without quorum sees either a timeout or a 'no leader' error, not a success.** (process-kill, medium)
+  - Quote: > However if the client is on the other side of the partition, one of two things will happen. The client may be redirected to the Leader, but will then (presumably) fail to contact the Leader due to the partition, and experience a timeout. Alternatively the client may receive a `no leader` error.
+  - Inject: After killing a majority of the cluster.
+  - Observe: The HTTP response from the surviving node is a timeout or an error body containing 'no leader' or similar, never a 200 with successful results.
+  - Workload: Kill 2 of 3 nodes. POST /db/execute to the survivor with a client timeout. Classify each response as timeout, error, or success.
+  - Guess: Guess: the error text may differ ('leadership lost', 'not leader'), which would not be a safety violation, so Fuss should only flag successes.
+- **A single-node cluster that is killed and restarted keeps all writes it acknowledged.** (restart, high)
+  - Quote: > Of course, you won't have any redundancy or fault tolerance if you only run a single node. If the single node fails you will need to restart it.
+  - Inject: SIGKILL the single rqlited process at random moments during writes, including during snapshots (lower the snapshot threshold via the documented snapshot flags so snapshots happen often).
+  - Observe: After restarting with the same data dir, every acknowledged row is present and the node accepts writes again.
+  - Workload: Start a single node with a small -raft-snap threshold. Loop INSERTs and record the acks. SIGKILL at a random time. Restart with the same flags. SELECT all rows and compare against the acks. Repeat many times.
+  - Guess: Guess: being killed mid-snapshot or mid-WAL-checkpoint could leave a partial snapshot that fails to load, or lose entries truncated from the log.
+- **With 2 of 3 nodes dead, the remaining node must not act as a Leader or accept writes, even after it restarts.** (restart, high)
+  - Quote: > A 3-node cluster, in which two nodes fail, is not a single-node cluster. In that case you've still got a 3-node cluster, but one which is offline due to lack of quorum.
+  - Inject: Kill 2 nodes, then also restart the third node on its own.
+  - Observe: GET /status on the survivor never reports it as Leader, and writes to it are rejected.
+  - Workload: 3 nodes. Kill 2. Restart the third with its original flags. Poll /status for its raft state. POST /db/execute and expect failure.
+  - Guess: Guess: a restarted node whose peer configuration was lost or mis-read could bootstrap itself as a 1-node cluster.
+- **A write sent to a read replica is committed through the Leader and eventually appears on every node, including other replicas.** (process-kill, medium)
+  - Quote: > Yes. If a client sends a write request to a [read replica](/docs/clustering/read-replicas/), the replica transparently forwards the request to the Leader -- the client doesn't need to know it isn't talking to the Leader. This also makes read replicas an effective messaging fabric: a client at the edge can write a change via its local replica, and that change will be replicated to every other node connected to the cluster.
+  - Inject: Kill the Leader or the replica while writes are being sent via the replica. Restart afterward.
+  - Observe: Every write the replica acknowledged eventually appears on all voters and all replicas when queried with level=none. Writes that returned an error may appear only if Fuss marked them indeterminate.
+  - Workload: 3 voters plus 2 read-only nodes (-raft-non-voter=true). INSERT via replica R1. Kill the leader mid-stream, then also kill and restart R1. Query all 5 nodes with level=none after quiescence and compare against Fuss's history.
+  - Guess: Guess: a replica restarted from its data dir might not catch up on entries committed while it was down, if snapshot install fails.
+- **A bulk request sent with transaction=true is applied entirely or not at all, even if a node crashes during it.** (process-kill, high)
+  - Quote: > You can wrap a bulk update in a transaction such that all the statements in the bulk request will succeed, or none of them will.
+  - Inject: SIGKILL the Leader while a large transactional bulk request is in flight, or right after it is acknowledged.
+  - Observe: After restart, each bulk batch (tagged with a batch id in every row) is either fully present or fully absent. A partial batch is a violation. Also, a batch containing a deliberately failing statement must leave no rows.
+  - Workload: POST /db/execute?transaction with a JSON array of 1000 INSERTs sharing batch_id=k. Include some batches whose last statement violates a constraint. Kill the leader at random. Restart, then SELECT batch_id, count(*) FROM t GROUP BY batch_id. Each count must be 0 or 1000, and failing batches must be 0.
+  - Guess: Guess: a crash during SQLite apply after a Raft commit, replayed on restart, might interact badly with a snapshot taken mid-apply and leave a partial batch.
+- **Concurrent operations behave as if executed in some serial order.** (concurrent-calls, medium)
+  - Quote: > Is the underlying serializable isolation level of SQLite maintained?
+Yes, it is.
+  - Inject: Throughout a run with many concurrent clients, combined with leader kills.
+  - Observe: Fuss's recorded history of transfers and strong reads passes a serializability checker. For example, the total balance across accounts is always constant in strong reads, and no read observes a partially applied transactional bulk request.
+  - Workload: Accounts table. Clients send transactional bulk requests: UPDATE a SET bal=bal-1 WHERE id=x; UPDATE a SET bal=bal+1 WHERE id=y. Readers send GET /db/query?level=strong&q=SELECT sum(bal) FROM a. Kill the leader periodically. Check that the sum is invariant and feed the history to an Elle-style checker.
+  - Guess: Guess: reads served by a newly elected Leader before it applies all committed entries might observe a prefix that does not line up with acknowledged writes.
+- **All writes are applied in one total order that is the same on every node.** (concurrent-calls, medium)
+  - Quote: > There is also a more fundamental reason too -- the Raft log serializes all writes, so even if SQLite supported concurrent updates, the Raft system would prevent writers taking advantage of it.
+  - Inject: Send many concurrent writes to different nodes while killing and restarting nodes.
+  - Observe: Each write appends a row using an AUTOINCREMENT id plus the client tag. After quiescence, the (id, tag) sequence is identical on every node, and each client's own writes appear in the order that client received acks.
+  - Workload: Many clients each POST /db/execute INSERT INTO log(tag) VALUES('cX-n') to random nodes. Kill and restart nodes randomly. Finally SELECT id, tag FROM log ORDER BY id on all nodes and compare the sequences, and check per-client ack order.
+  - Guess: Guess: forwarded writes retried internally after a leader change could be applied twice or out of order relative to the client's acks.
+- **Long-running non-strong reads should not stall writes (apart from brief snapshot pauses).** (concurrent-calls, low)
+  - Quote: > No, a read does not block other reads, nor does a read block a write -- as long as the reads do not use the _Strong_ consistency level.
+  - Inject: While many long-running level=weak or level=none queries are executing.
+  - Observe: Write latency stays bounded (no write waits for the full duration of a long read), except for short stalls that line up with snapshots.
+  - Workload: Run many concurrent GET /db/query?level=none with an expensive SELECT (for example, a cross join). Concurrently time POST /db/execute INSERTs. Compare write latency distributions with and without the reads, using a low snapshot threshold.
+  - Guess: Guess: a long read holding a SQLite read transaction could block snapshotting, which then blocks writes for the full duration of the read, not just milliseconds.
+- **Losing one node in a 3-node cluster leaves the cluster available for reads and writes after a brief failover.** (process-kill, medium)
+  - Quote: > This means that any application talking to rqlite shouldn't notice if a node fails because other nodes in the cluster automatically take over.
+  - Inject: Kill any single node, including the Leader, during steady load.
+  - Observe: Writes and strong reads sent to the surviving nodes resume succeeding within a bounded failover window, and no acknowledged data is lost.
+  - Workload: 3 nodes, continuous INSERTs and strong SELECTs spread across nodes. Kill one node. Measure the gap until success resumes, and verify all acks are present afterward.
+  - Guess: Guess: clients pinned to the killed node will obviously fail, and leader election plus forwarding reconnection may take seconds, so 'shouldn't notice' is only true with retries elsewhere.
+
+## rqlite.io-guides-backup.md
+
+- **A backup taken while writes are in flight is a valid SQLite file holding a consistent snapshot of the database.** (concurrent-calls, high)
+  - Quote: > rqlite supports hot backups, so you can back up a node while it is running.
+  - Inject: Run a steady stream of acknowledged INSERTs through /db/execute while GET /db/backup is streaming.
+  - Observe: The downloaded file passes PRAGMA integrity_check. Its rows are a prefix-closed set of Fuss's acknowledged writes: every write acked before the backup request started is present, and no unacknowledged or torn write appears.
+  - Workload: CREATE TABLE t(id INTEGER PRIMARY KEY, v); loop: POST /db/execute INSERT id=n, log ack to history; concurrently: GET /db/backup -o b.sqlite3 repeatedly; open each with sqlite3, run integrity_check, and compare ids to history.
+  - Guess: Guess: a WAL-mode copy could be taken between a WAL write and a checkpoint, giving a file that is missing frames or fails the integrity check.
+- **A backup taken under load can be booted or loaded into a fresh node, and that node then serves exactly the backup's contents.** (concurrent-calls, high)
+  - Quote: > In either case the generated file can then be used to restore a node (or cluster) using the restore API.
+  - Inject: Take the backup while writes are in flight, then restore it into a fresh node.
+  - Observe: SELECT on the restored node returns the same rows as reading the backup file directly with sqlite3.
+  - Workload: Write load on node A; GET /db/backup -o b.sqlite3 from A; start a fresh single node B; POST /boot with b.sqlite3; SELECT * FROM t on B; diff against sqlite3 b.sqlite3.
+  - Guess: Guess: the default WAL-mode file might carry WAL state that is lost or mishandled on boot.
+- **If a backup stream fails partway, the response carries an X-Stream-Error trailer instead of looking like a clean, complete download.** (disk-full, medium)
+  - Quote: > Instead **if** the stream is interrupted the node will set the Trailing HTTP header `X-STREAM-ERROR`.
+  - Inject: Fill the data-directory filesystem just before or during a GET /db/backup?fmt=delete or ?vacuum request, since both need an extra on-disk copy.
+  - Observe: Every response is one of three things: a complete file that passes integrity_check, a response with the X-Stream-Error trailer set, or a transport-level error. A truncated or invalid body with a clean chunked terminator and no trailer is a violation.
+  - Workload: Load roughly 50MB of data; fill the disk to near-full with a filler file; curl --raw GET /db/backup?fmt=delete and capture the body and trailers; validate the body with sqlite3.
+  - Guess: Guess: an error during the temporary-copy phase might happen before streaming starts and produce an empty body with HTTP 200 and no trailer.
+- **Without enough disk space a DELETE-mode backup fails visibly, and the node keeps working afterward.** (disk-full, medium)
+  - Quote: > Requesting a DELETE mode backup involves making a copy of the SQLite database so ensure you have sufficient disk space or the backup may fail.
+  - Inject: While the extra copy for fmt=delete is being made.
+  - Observe: The failure is visible (trailer or error), no corrupt file is presented as success, and once space is freed the node still accepts writes and reads with its data intact.
+  - Workload: Fill the disk; GET /db/backup?fmt=delete; free the space; POST /db/execute INSERT; GET /db/query SELECT count(*); compare with history.
+  - Guess: Guess: a leftover temp copy might stay on disk, or a failed copy might wedge the store.
+- **A backup requested from a follower returns the leader's full, valid database, or fails visibly.** (process-kill, medium)
+  - Quote: > Note that if the node is not the Leader, the node will transparently forward the request to the Leader, wait for the backup data from the Leader, and return it to the client.
+  - Inject: Kill the leader while the follower is forwarding a backup request.
+  - Observe: The follower's response is either a complete, valid backup containing all writes acked before the request, or a visible error or trailer. It is never a silently partial file. Repeating the request after the new election succeeds.
+  - Workload: Start a 3-node cluster; write rows; GET follower:/db/backup; at the same moment, SIGKILL the leader; validate the result; retry the GET after the new leader appears.
+  - Guess: Guess: the proxy may relay a truncated leader stream with a clean termination.
+- **With ?redirect, a follower answers 301, and the Location header points at the current leader.** (restart, medium)
+  - Quote: > In that case if a Follower receives a backup request the Follower will respond with HTTP 301 Moved Permanently and include the address of the Leader as the `Location` header in the response.
+  - Inject: Right after killing and restarting the leader, which forces a leadership change.
+  - Observe: The Location header matches the leader reported by /status after the election. It must not point at the dead node.
+  - Workload: Start a 3-node cluster; kill the leader; wait for the election; GET follower:/db/backup?redirect; compare Location with the leader shown in /status.
+  - Guess: Guess: the follower may cache a stale leader address for a while after the election.
+- **Auto-backup skips uploading when nothing has changed since the last upload, including across a node restart.** (restart, medium)
+  - Quote: > rqlite writes a **compressed** copy of its SQLite database, and will not create a backup if the SQLite database hasn't changed since the last upload took place.
+  - Inject: Restart the node after an upload, with no writes in between.
+  - Observe: With type=file and timestamp:true, count the files in the backup dir. No new timestamped file should appear in intervals with no writes, before or after the restart. Note that the restart case is an inference: the spec does not say whether the 'last upload' memory survives a restart.
+  - Workload: Point -auto-backup at a file config with interval 5s, timestamp true, and a Fuss-readable dir; write once; wait for one file; idle for 30s and count files; restart rqlited; idle for 30s and count again.
+  - Guess: Guess: the 'last upload' marker may be kept only in memory, so a restart forces a redundant upload.
+- **Only one node, the leader, uploads auto-backups, and after a leader dies the new leader keeps producing backups that include later writes.** (process-kill, high)
+  - Quote: > Only the Leader performs the backup. If a new node becomes the Leader it will take over the backup process.
+  - Inject: Kill the leader between backup intervals while writes continue.
+  - Observe: Give each node its own backup dir. Only the current leader's dir gains new files. After the kill, the new leader's dir gains files whose decompressed contents include writes acked after the kill.
+  - Workload: Start 3 nodes, each with a file auto-backup config (interval 5s, timestamp true, separate dir); write continuously; SIGKILL the leader; keep writing; gunzip the newest file from the new leader and check it for the post-kill ids.
+  - Guess: Guess: the backup goroutine may start only at boot, so a node promoted later never begins uploading.
+- **With timestamping, every upload creates a new, distinct UTC-timestamped file and never overwrites an earlier one.** (clock-skew, medium)
+  - Quote: > To enable timestamping add `timestamp: true` ... which will result in a new backup file being created each time. ... `TIMESTAMP` will be in the form `YYYYMMDDHHMMSS`, UTC timezone.
+  - Inject: Step the leader's clock backward between uploads, or forward and then back.
+  - Observe: The number of files equals the number of uploads, and no earlier file's contents change. Name collisions or overwrites after the backward clock step are violations. Names must match the UTC YYYYMMDDHHMMSS form.
+  - Workload: Use a file config with interval 2s and timestamp true; write between intervals; record a hash of each file; step the clock back 1 hour; keep writing; check that the file count only grows and that old hashes are unchanged.
+  - Guess: Guess: names come straight from wall-clock time, so a backward step can regenerate an existing name and overwrite that backup.
+- **Auto-backup checks on the configured interval and uploads whenever data has changed, even if the wall clock jumps.** (clock-skew, medium)
+  - Quote: > In the example above, rqlite will check every 5 minutes if an upload is required, and do so if needed.
+  - Inject: Jump the clock forward or backward by a large amount while auto-backup is running.
+  - Observe: After the jump, a write is still followed by a new backup within about one interval of real elapsed time.
+  - Workload: Use a file config with interval 5s; jump the clock back 1 day; INSERT a row; wait 15s of real time; check that a new or updated backup contains the row.
+  - Guess: Guess: if the scheduler compares wall-clock timestamps instead of using a monotonic timer, a backward jump could stall uploads.
+- **After a successful load or boot of a SQLite file, the node holds exactly that file's data, with nothing left over from before, and this survives a restart.** (restart, high)
+  - Quote: > However, if you do decide to _Load_ or _Boot_ a system with a SQLite binary file, any existing data will be replaced in its entirety by the operation.
+  - Inject: Kill and restart the node immediately after the load or boot returns success.
+  - Observe: After the restart, the node's rows equal the loaded file's rows exactly. No pre-existing rows or tables remain.
+  - Workload: Create table old and insert rows; POST /db/load with Content-type application/octet-stream and restore.sqlite; on 200, SIGKILL and restart; SELECT from sqlite_master and foo; diff against restore.sqlite.
+  - Guess: Guess: the load might be acked before it is durably snapshotted or logged, so a crash rolls the node back to the old data.
+- **A load or boot interrupted by a crash should never leave a mix of old and new data. Note that the spec states the replace-in-entirety outcome only for a completed operation, so this crash-mid-operation check is Fuss's inference.** (process-kill, low)
+  - Quote: > any existing data will be replaced in its entirety by the operation.
+  - Inject: Partway through streaming a large file to /boot or /db/load.
+  - Observe: After the restart, the node has either only the old data or only the new data. Mixed tables, or a node that fails to start with a corrupt store, are suspicious.
+  - Workload: Seed old data; POST /boot with a 500MB file; SIGKILL midway; restart; inspect sqlite_master and row counts.
+  - Guess: Guess: boot may write the database file in place before swapping it in, so a crash leaves a torn file.
+- **A load sent to a follower is applied once, cluster-wide, or fails visibly.** (process-kill, medium)
+  - Quote: > You can send _Load_ requests to any node in your cluster and that node will transparently forward the request to the Leader if necessary.
+  - Inject: Kill the leader while a follower is forwarding a load request.
+  - Observe: If the load returned success, every surviving node eventually serves the loaded data. If it failed, a retry yields the loaded data with no mixed state.
+  - Workload: Start a 3-node cluster; POST follower:/db/load with a SQLite file; SIGKILL the leader at the same moment; after the election, read from all nodes with level=strong and compare.
+  - Guess: Guess: the forwarded request may be applied on the old leader but its success never relayed, so the client sees an error for a load that actually happened.
+- **Auto-restore runs only on an empty node, so restarting a node that already has data must not overwrite it with the cloud backup.** (restart, high)
+  - Quote: > If enabled and **the node has no pre-existing data**, rqlite will download the SQLite data stored in the cloud, and initialize your system with it.
+  - Inject: Restart a node with -auto-restore after it has accepted writes made since the initial restore.
+  - Observe: Writes acknowledged before the restart are still present afterward. The node is not reset to the backup's contents.
+  - Workload: Run local MinIO holding backup B; start rqlited with -auto-restore pointing at MinIO; confirm B's data; INSERT new rows; SIGKILL; restart with the same flags; SELECT and confirm the new rows are present.
+  - Guess: Guess: the 'pre-existing data' check might look only at the SQLite file and not the Raft log or snapshots, so it misjudges a crashed node as empty.
+- **In a fresh cluster with auto-restore on every node, the data is installed once and all nodes converge to the same contents, with no duplicates.** (process-kill, medium)
+  - Quote: > Also note that if you bootstrap a new cluster and pass `-auto-restore` to each node, only the node that becomes the Leader will actually install the data. The other nodes will pick up the data through the normal Raft consensus mechanism.
+  - Inject: Kill the first leader shortly after cluster bootstrap, during or right after its restore.
+  - Observe: All surviving nodes eventually return identical row sets equal to the backup. There are no duplicated or missing rows, and no node is stuck empty.
+  - Workload: Run MinIO holding backup B; start 3 nodes with -auto-restore and -bootstrap-expect 3; SIGKILL the leader right after election; restart it; read from each node with level=none and diff against B.
+  - Guess: Guess: a second node that becomes leader after the crash may also see 'no data' and install the backup again, racing with the replicated copy.
+- **If the backup download fails, rqlite exits with an error by default, and keeps starting up only when continue_on_failure is true.** (other, high)
+  - Quote: > By default rqlite will exit with an error if it fails to download the backup file. If you wish an rqlite node to continue starting up even if the download fails, set `continue_on_failure: true`.
+  - Inject: Make the S3 endpoint unreachable (stop the local MinIO) before starting rqlited with -auto-restore.
+  - Observe: With false, the process exits with a non-zero code and the HTTP API never comes up. With true, the process stays up and /status responds with an empty database.
+  - Workload: Stop MinIO; start rqlited -auto-restore with continue_on_failure false and record the exit code; repeat with true and poll GET /status.
+  - Guess: Guess: a hung download might hit neither an error nor the timeout path, so the node blocks forever instead of exiting or continuing.
+
+## rqlite.io-guides-data-integrity.md
+
+- **On startup a node verifies every data file against its sidecar CRC and refuses to run if any file does not match.** (process-kill, medium)
+  - Quote: > When a node starts, rqlite computes a [CRC checksum](https://en.wikipedia.org/wiki/Cyclic_redundancy_check) over every on-disk data file and compares it to a value that was stored when rqlite originally wrote the file (this value is stored in a _sidecar_ file). The node refuses to run if any file fails the check.
+  - Inject: SIGKILL the node while it is writing data files: during a burst of writes, during a snapshot triggered by a low -raft-snap threshold, or right after a file is created but possibly before its sidecar is written.
+  - Observe: After restart, either the node serves /readyz and returns every acknowledged write, or it exits and logs a CRC or integrity error. Fuss can read each data file and its sidecar, recompute the CRC itself, and check that refusal happens only when the CRCs differ. The key bug signal is a node that starts and serves data even though Fuss's recomputed CRC mismatches the sidecar. A second signal is a node that refuses to start after an ordinary crash with no external modification. That is not a broken promise, but it is a false positive worth reporting.
+  - Workload: Start rqlited with -raft-snap=50 and a data dir. Loop POST /db/execute 'INSERT INTO t(v) VALUES(?)' with unique values, recording each acknowledgement. SIGKILL at a random moment. Snapshot the data dir read-only and recompute CRCs against the sidecars. Restart with the same flags. Record whether the process exits or becomes ready. If ready, GET /db/query?level=strong 'SELECT v FROM t' and compare the result to the acknowledged writes.
+  - Guess: Guess: if the data file and its sidecar are not written and fsynced as a unit, a crash between them could leave a stale sidecar. That would make a healthy node refuse to start, or leave a file with no sidecar that gets skipped and never checked.
+- **Data files left truncated or incomplete by running out of disk must be caught at the next startup instead of being silently used.** (disk-full, medium)
+  - Quote: > The node refuses to run if any file fails the check. This catches bitrot, or other modification, that may have occurred while a node is shut down.
+  - Inject: Fill the filesystem holding the data dir while writes and snapshots are in progress. Then stop the node and free the space before restarting.
+  - Observe: On restart, either startup is clean and every acknowledged write is present, or the node refuses to start with an integrity error. Fuss can recompute CRCs over the files and compare them to the sidecars to confirm that rqlite's decision matches. A bug is a node that starts while serving fewer rows than were acknowledged, or that returns 'malformed' errors.
+  - Workload: Mount a small tmpfs or loop filesystem as the data dir. Start rqlited with -raft-snap=50. Insert rows until the disk fills, recording acknowledgements and errors. Kill the node, enlarge or free the filesystem, and restart. Check /readyz, then GET /db/query?level=strong 'SELECT count(*), max(v) FROM t' against the acknowledged set.
+  - Guess: Guess: a short write under ENOSPC might be computed or recorded in the sidecar inconsistently, or an error path might leave a partial snapshot file that the next startup treats as valid.
+- **A follower never installs a snapshot whose received bytes fail the CRC, so a cut-off or damaged transfer never becomes the follower's state.** (process-kill, medium)
+  - Quote: > When a Leader sends a snapshot to a Follower, it sends the stored CRC with it. The Follower recomputes the CRC over the bytes it received and rejects the snapshot if the values do not match.
+  - Inject: Kill the leader, or the follower, while the leader is streaming a snapshot to a lagging or new follower. A large dataset makes the transfer window wide enough to hit.
+  - Observe: Once the cluster has healed, the follower either completes catch-up and returns exactly the leader's rows, or it keeps retrying. It must never serve a partial dataset. Fuss compares GET /db/query?level=none on the follower with ?level=strong on the leader, and also checks that every snapshot file in the follower's data dir has a sidecar CRC that matches Fuss's own recomputation.
+  - Workload: Start a 3-node cluster with -raft-snap=100. Stop node3. Insert about 200k rows on the leader so it snapshots and truncates its log. Restart node3 so it needs a snapshot install. During the transfer, SIGKILL the leader or node3. Restart all nodes. Poll node3 until it is ready, then compare SELECT count(*), sum(v) on node3 (level=none) with the leader (level=strong).
+  - Guess: Guess: if the follower checks the CRC only after it has partly applied or renamed the incoming snapshot, a crash in that window could leave half-installed state that is used on restart.
+- **A database whose structure is broken after a snapshot merge is never served. rqlite logs an error and refuses it instead.** (process-kill, low)
+  - Quote: > After rqlite merges previously snapshotted SQLite data, it runs SQLite's [`PRAGMA quick_check`](https://sqlite.org/pragma.html#pragma_quick_check) against the resulting database. The check walks most of the database's internal structure: B-trees and page references. A failure causes rqlite to log the error and refuse to proceed with the new state.
+  - Inject: SIGKILL during frequent snapshotting, when previously snapshotted data is being merged, or during the restart that follows such a crash.
+  - Observe: After restart, the node either refuses to proceed and logs a quick_check failure, or it serves queries cleanly. Fuss runs GET /db/query 'PRAGMA integrity_check' and full-table scans. Any 'database disk image is malformed' error, or any row count below the acknowledged writes, while the node reports itself ready means the promise is broken.
+  - Workload: Start a single node with -raft-snap=20 -raft-snap-int=1s. Run continuous INSERT, UPDATE and DELETE operations with an index on column v. SIGKILL at random intervals, then restart. After each restart, check /readyz, then query 'PRAGMA integrity_check', 'SELECT count(*) FROM t', and 'SELECT * FROM t ORDER BY v' against Fuss's model.
+  - Guess: Guess: the check might run only on one merge path, such as snapshot install, and not on the crash-recovery merge at startup, so damaged state could slip through there.
+- **Whenever corruption is detected, the node does not serve or replicate the bad data.** (restart, low)
+  - Quote: > When a node detects corruption -- at startup, on snapshot receive, or during `PRAGMA quick_check` -- it refuses to use the bad data.
+  - Inject: Restart the node after any crash or disk-full episode in which Fuss's own CRC recomputation shows a mismatch between a data file and its sidecar.
+  - Observe: If Fuss's recomputed CRC mismatches the sidecar, the node must not become ready, must not answer queries with data, and must not hand that data to peers. Fuss checks that /readyz never succeeds and that other nodes' contents still match Fuss's acknowledged history.
+  - Workload: Reuse the crash and disk-full loops above. Whenever a pre-restart CRC scan finds a mismatch, restart the node and poll /readyz and GET /db/query on it for 60 seconds. Query the healthy peers with level=strong and compare their results to the model.
+  - Guess: Guess: a node might refuse locally yet still take part in Raft (for example by voting) or serve level=none reads before the check finishes.
+- **A node restarted with an empty data directory rejoins the cluster and ends up with exactly the leader's current state.** (restart, high)
+  - Quote: > To recover, ensure the node is stopped, remove its data directory, restart it, and let it rejoin the cluster. Alternatively remove and deprovision the node, and add a new node to the cluster. In either case rqlite will replicate the current state from the Leader.
+  - Inject: Stop a follower and restart it with the same -node-id but a fresh, empty data directory path (Fuss never writes to the old directory). Optionally SIGKILL the leader while the fresh node is catching up.
+  - Observe: The fresh node eventually reports ready and its full dataset (level=none) equals the leader's (level=strong) and Fuss's acknowledged history. No acknowledged write is missing and no unacknowledged-then-rolled-back write appears.
+  - Workload: Start a 3-node cluster. Run continuous inserts with unique ids, logging acknowledgements to a Fuss history file. Stop node2 and restart it with -node-id=node2, a new empty data dir, and -join pointing at a live peer. While it catches up, keep writing and optionally SIGKILL and restart the leader. Once all nodes are ready, compare SELECT id FROM t ORDER BY id on node2 (level=none, after a brief settle) and on the leader (level=strong) against the history.
+  - Guess: Guess: a node rejoining with the same ID but no state could be confused with its old Raft identity, especially across a leader change mid-catch-up, and end up stuck or missing log entries applied before its snapshot.
+- **Recovery by re-replication works only while a quorum and a healthy peer exist. Without quorum, the wiped node must not invent or serve state of its own.** (process-kill, medium)
+  - Quote: > This path depends on the cluster having quorum and at least one healthy peer with intact data.
+  - Inject: SIGKILL enough nodes to lose quorum, then start a follower with a fresh, empty data directory.
+  - Observe: The fresh node does not become ready and does not accept writes or serve an empty dataset as authoritative. Once quorum is restored, it catches up to the full acknowledged history.
+  - Workload: Start a 3-node cluster and insert N rows, recording acknowledgements. SIGKILL node1 and node3. Start node2 with a fresh data dir and -join pointing at the dead peers. Send POST /db/execute and GET /db/query?level=strong to node2 and expect errors or timeouts. Restart node1 and node3, then verify that node2 converges to N rows.
+  - Guess: Guess: a fresh node with a wiped data dir might bootstrap itself as a new single-node cluster if the join fails, splitting off with empty state.
+

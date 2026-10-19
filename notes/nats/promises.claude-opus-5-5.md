@@ -1,0 +1,885 @@
+# NATS JetStream promises Fuss could test (claude-opus-5-5)
+
+Candidates only. Check every quote against the spec and write the rules yourself.
+
+## configuration-clustering-jetstream_clustering-administration.md
+
+- **A stream with replicas > 1 keeps each acknowledged message on several nodes, so losing one node does not lose acknowledged data.** (process-kill, high)
+  - Quote: > when you choose a number more than 1, \(we suggest 1, 3 or 5\), the data will be stored on multiple nodes in your cluster using the RAFT protocol as above.
+  - Inject: SIGKILL the stream leader while publishes are in flight, right after some publish acks are received
+  - Observe: Every publish that got a PubAck (stream seq recorded in Fuss's own log) is still readable at the same sequence with the same payload from the new leader; per-sequence order matches the ack order.
+  - Workload: nats stream add ORDERS --subjects 'orders.>' --replicas 3 --storage file --defaults; loop: nats pub orders.N <uuid> with JetStream acks, logging seq+payload; kill -9 leader (found via nats stream info ORDERS --json); keep publishing; then nats stream get ORDERS <seq> for every logged seq
+  - Guess: Guess: if acks go out before a quorum has durably fsynced (sync interval defaults), a near-simultaneous kill of the leader and one follower could lose acked writes.
+- **A replica reported as 'current' really holds all messages the leader has.** (restart, medium)
+  - Quote: > The `current` indicates that followers are up to date and have all the messages, here both cluster peers were seen very recently.
+  - Inject: Stop a follower, publish a batch, restart it, then poll stream info until it reports current
+  - Observe: Once nats stream info reports the replica as current, step leadership onto that replica (or kill the others) and verify that its message count, last seq and every logged message match what was acked.
+  - Workload: stream R3; kill follower n3; publish 1000 msgs logging acks; restart n3; poll nats stream info ORDERS --json until n3 current=true; kill the leader and the other follower is not allowed (quorum), so step down repeatedly until n3 is leader; nats stream info and nats stream get each seq
+  - Guess: Guess: 'current' may be judged from lag and heartbeat timing rather than the applied index, so it could flip to current before catch-up has been fully applied or fsynced.
+- **Changing a stream's replica count keeps all existing messages, and the new replica set ends up holding them.** (process-kill, medium)
+  - Quote: > The replica count can be edited once configured.
+  - Inject: Kill one involved node right after issuing nats stream edit --replicas 3 on an R1 stream (or 3->5), while data is being copied
+  - Observe: Stream info eventually shows the requested replica count with all replicas current; message count, last seq and contents equal Fuss's ack log, with no gaps or duplicates.
+  - Workload: nats stream add S --replicas 1; publish N msgs logging acks; nats stream edit S --replicas 3 -f; kill -9 a newly chosen peer; restart it; poll nats stream info S --json; verify every seq
+  - Guess: Guess: the snapshot or catch-up to new peers may be interrupted by the kill and leave a peer reported current with a partial copy.
+- **A leader election only briefly interrupts the stream; it does not lose or reorder acknowledged messages.** (concurrent-calls, high)
+  - Quote: > Leader elections will represent short interruptions to the stream so if you know you will work on a node later it might be worth moving leadership away from it ahead of time.
+  - Inject: Issue nats stream cluster step-down repeatedly while several clients publish concurrently, with Nats-Msg-Id set and retries on timeout
+  - Observe: The publish error or timeout window is bounded (seconds). All acked messages are present and the per-subject order matches the ack seq order. Retries with the same Nats-Msg-Id inside the duplicate window do not create duplicates.
+  - Workload: R3 stream with duplicate_window 2m; 4 publishers using msg-id headers, retrying on timeout; every 2s run nats stream cluster step-down ORDERS; afterwards read the whole stream and compare against the ack log, checking for duplicate msg-ids
+  - Guess: Guess: the dedupe state may not carry over to the new leader, so a retry after a timed-out publish could be stored twice.
+- **After a step-down, the old leader stays a replica and can become leader again.** (other, high)
+  - Quote: > Moving leadership away from a node does not remove it from the cluster and does not prevent it from becoming a leader again, this is merely a triggered leader election.
+  - Inject: Right after a step-down, then later step down repeatedly or kill the other replicas' leadership
+  - Observe: nats stream info still lists the old leader as a replica (current), and after further step-downs it shows up as leader again at some point.
+  - Workload: nats stream cluster step-down ORDERS; record old leader; check nats stream info lists it as a replica; loop step-down up to 10 times until it is leader again
+  - Guess: Guess: a node that just stepped down could be held in a backoff state and repeatedly skipped, or its consumer groups might not rejoin.
+- **Stepping down a consumer leader is just an election; the consumer keeps its delivery and ack state.** (concurrent-calls, high)
+  - Quote: > The same is true for consumers, `nats consumer cluster step-down ORDERS NEW`.
+  - Inject: During active pull and ack traffic on a durable R3 consumer, issue consumer step-down
+  - Observe: No acked message is redelivered beyond the at-least-once allowance (it is not redelivered after its ack was confirmed via AckSync). No message is skipped. The consumer's ack floor never moves backwards across elections.
+  - Workload: nats consumer add ORDERS NEW --pull --ack explicit; consumer loop: fetch, AckSync, log seq; every 2s nats consumer cluster step-down ORDERS NEW; check that the union of logged seqs covers 1..N, and list redeliveries of already-acked seqs
+  - Guess: Guess: acks that are in flight during the election could be dropped, and the ack floor reverting would cause redelivery of confirmed acks.
+- **Stepping down the meta leader elects a new meta leader without losing stream or consumer definitions.** (concurrent-calls, medium)
+  - Quote: > Similar to Streams and Consumers above the Meta Group allows leader stand down.
+  - Inject: Issue nats server cluster step-down while concurrently creating and deleting streams
+  - Observe: A new meta leader is reported. Every stream create that returned success exists afterwards with its config, and every successful delete stays deleted.
+  - Workload: loop creating streams T1..Tn and deleting some, logging the API results; run nats server cluster step-down --user admin repeatedly; afterwards nats stream ls and compare against the log
+  - Guess: Guess: a create proposal acked by the old leader but not yet committed may vanish or reappear after the election.
+- **When a single node shuts down or crashes, the cluster keeps serving JetStream.** (process-kill, high)
+  - Quote: > Generally when shutting down NATS, including using Lame Duck Mode, the cluster will notice this and continue to function.
+  - Inject: SIGKILL (and separately lame-duck via nats-server --signal ldm) one node of five during steady publish/consume
+  - Observe: Publishes to R3 streams keep getting acks after a bounded pause. The meta report marks the node offline / not current. No acked data is lost.
+  - Workload: 5-node cluster; R3 streams with publishers and consumers running; kill -9 n2; watch publish ack latency and nats server report jetstream (Offline=true for n2); verify the ack log against stream contents
+  - Guess: Guess: if the killed node held meta, stream and consumer leadership at once, overlapping elections could stall the API longer than expected.
+- **The meta group report shows a dead or lagging node as not current or offline, with its lag and last-seen time.** (process-kill, medium)
+  - Quote: > In the Meta Group report the server `n2-c1` is not current and has not been seen for 9 seconds, it's also behind by 2 raft operations.
+  - Inject: Kill one node, then do meta operations (create streams) so that it falls behind
+  - Observe: /jsz or nats server req jetstream --leader shows that peer with current=false, an offline flag, active growing and lag > 0. After restart it returns to current with lag 0.
+  - Workload: kill -9 n3; nats stream add X1..X3; nats server req jetstream --leader --user admin; check the meta peer fields; restart n3; poll until current
+  - Guess: Guess: the offline detection timeout could make the report claim the peer is current for a while after it died.
+- **After a peer-remove, the stream gets a new replica within its placement rules and copies all data to it, restoring the replica count.** (process-kill, medium)
+  - Quote: > After the node is removed the cluster will notice that the replica count of a stream is not honored anymore and will immediately pick a new node and start replicating data to it. The new node will be selected using the same placement rules as the existing stream.
+  - Inject: Kill node n4 permanently, run server-level peer-remove, and keep publishing while the new replica catches up
+  - Observe: Stream info shows the replica count back at 3 with a new peer that satisfies the placement tags/cluster. The new peer eventually reports current, and its data matches the ack log (verify by making it leader).
+  - Workload: R3 stream with placement tags; kill -9 n4; nats server cluster peer-remove n4-c1 -f --user admin; keep publishing; poll nats stream info ORDERS --json; once current, step down until the new peer leads and verify all seqs
+  - Guess: Guess: replication to the new peer may race with ongoing publishes and miss messages written between the snapshot and the start of streaming.
+- **A stream-level peer-remove takes the node out of the stream and all of its consumers, replaces it, and keeps the consumers' state intact.** (concurrent-calls, medium)
+  - Quote: > At this point the stream and all consumers will have removed `n4-c1` from the group. A new node will be selected, and data will be replicated to it.
+  - Inject: Run nats stream cluster peer-remove while consumers are actively fetching and acking
+  - Observe: Stream and consumer info no longer list n4. The consumer replica sets are restored. Acked messages are not lost from the stream, and consumer progress does not regress.
+  - Workload: R3 stream with 2 durable R3 consumers doing fetch/AckSync; nats stream cluster peer-remove ORDERS n4-c1; nats consumer info for each consumer, checking cluster peers; compare consumer delivered/ack floor with Fuss's log
+  - Guess: Guess: a consumer group could keep n4 or lose its leader's ack state if the consumer leader was on n4.
+- **Peer-removing an online server disables JetStream on that server.** (other, medium)
+  - Quote: > It can be performed with nodes that are still online, but in this case, JetStream will be disabled on those nodes.
+  - Inject: Peer-remove a node that is still running
+  - Observe: That server's /jsz (or nats server req jetstream --name) reports JetStream disabled, and JetStream API calls routed only to it fail or are not served by it.
+  - Workload: nats server cluster peer-remove n5-c1 -f --user admin while n5 is up; curl n5:8222/jsz; nats server report jetstream
+  - Guess: Guess: the disable may not stick if the node restarts or reconnects, and it could rejoin as a JetStream peer.
+
+## configuration-clustering-jetstream_clustering.md
+
+- **Every message the cluster acknowledged was stored by a quorum, so after all servers crash and restart, the stream still contains every acknowledged message with its original sequence number.** (process-kill, high)
+  - Quote: > In order to ensure data consistency across complete restarts, a quorum of servers is required. A quorum is ½ cluster size + 1. This is the minimum number of nodes to ensure at least one node has the most recent data and state after a catastrophic failure.
+  - Inject: SIGKILL all three nats-server processes at once while publishes are in flight, then restart them all.
+  - Observe: Compare Fuss's log of PubAck (stream, seq) pairs with a full read of the stream after restart. Every acked seq must be present with the same payload. No acked seq may be missing or changed.
+  - Workload: nats stream add S --replicas 3 --subjects s.>; loop: js.Publish(s.x, unique payload), log ack seq; kill -9 all three servers; restart all three; wait for the stream leader; nats stream get S <seq> or an ordered consumer reading from seq 1; diff against the log.
+  - Guess: Guess: the RAFT log or message block may be acked after quorum replication but before an fsync on the followers, so a simultaneous kill could lose the tail.
+- **With a majority of servers up, new messages are stored and acknowledged. Below a majority, no new message is acknowledged.** (process-kill, high)
+  - Quote: > So for a cluster size of 3, you’ll need at least two JetStream enabled NATS servers available to store new messages. For a cluster size of 5, you’ll need at least 3 NATS servers, and so forth.
+  - Inject: Kill one of three servers and check that writes continue. Then kill a second server and check that writes stop.
+  - Observe: With 2 of 3 up, PubAcks arrive. With 1 of 3 up, publishes time out or return errors and no PubAck arrives. After the majority is restored, no message published during the minority period shows up as if it had been acked.
+  - Workload: R3 stream; continuous js.Publish with a short timeout; kill -9 n3 and record ack success; kill -9 n2 and record ack failures; restart n2 and n3; read the stream and check it contains only acked seqs plus possibly unacked-but-stored ones, with no gaps in acked seqs.
+  - Guess: Guess: a lone surviving former leader might briefly ack writes before it notices it lost quorum.
+- **A stream with no elected leader never acknowledges a publish.** (process-kill, high)
+  - Quote: > The elected leader handles ACKs and so forth, if there is no leader the stream will not accept messages.
+  - Inject: Kill the current stream leader, found with nats stream info, during a steady stream of publishes.
+  - Observe: During the election gap, publishes get no ack or get an error. After a new leader is elected, the acked sequence numbers keep increasing with no duplicate seqs. Every seq acked before the kill is still readable.
+  - Workload: R3 stream; publisher loop logging acks and errors with timestamps; nats stream info S to find the leader; kill -9 the leader; keep publishing; restart the killed server; verify all acked seqs exist and are unique.
+  - Guess: Guess: the old leader might ack a message just before dying that the new leader never received, which would leave an acked message missing.
+- **All replicas of a stream hold the same messages in the same order, so after leader changes the stream's contents and sequence order stay consistent.** (restart, medium)
+  - Quote: > Stream Group - each Stream creates a RAFT group, this group synchronizes state and data between its members.
+  - Inject: Repeatedly kill and restart different servers, each time forcing a leader change, while publishing.
+  - Observe: After things settle, step the leader to each server in turn with nats stream cluster step-down and read the whole stream each time. Every read must match exactly: same seqs, same payloads, same order. The message count and last seq from nats stream info must agree.
+  - Workload: R3 stream; publisher loop; a chaos loop that kills -9 a random server and restarts it after N seconds; at the end, for each server: step down until that server is leader, then dump the stream; compare the dumps against each other and against the ack log.
+  - Guess: Guess: a follower that restarts during a snapshot catch-up might keep a divergent tail that only shows up once it becomes leader.
+- **Consumer ack state is replicated, so after the consumer leader crashes, messages that were already acked are not delivered again as unacked and the delivery position is not lost.** (process-kill, medium)
+  - Quote: > Consumer Group - each Consumer creates a RAFT group, this group synchronizes consumer state between its members. The group will live on the machines where the Stream Group is and handle consumption ACKs etc.
+  - Inject: Kill the consumer leader, found with nats consumer info, right after a batch of acks has been confirmed with AckSync.
+  - Observe: Fuss logs each stream seq whose AckSync succeeded. After failover, no AckSync-confirmed seq is redelivered. The ack floor in nats consumer info is at or above the highest contiguous confirmed seq.
+  - Workload: R3 stream with N messages; durable pull consumer with explicit ack; fetch and AckSync in a loop, logging seqs; kill -9 the consumer leader; continue fetching; restart the server; check for redelivered seqs that had a confirmed ack.
+  - Guess: Guess: the ack reply might go out after the leader applies it locally but before it is replicated to the other consumer replicas.
+- **If the meta leader dies, a new one is elected and JetStream API calls such as stream create work again, without losing or duplicating stream and consumer definitions.** (process-kill, medium)
+  - Quote: > Meta Group - all servers join the Meta Group and the JetStream API is managed by this group. A leader is elected and this owns the API and takes care of server placement.
+  - Inject: Kill the meta leader, found with nats server report jetstream, while API calls like stream add and consumer add are in flight.
+  - Observe: Every stream or consumer whose create call returned success still exists after failover and restart. Calls that failed either did not create anything or created exactly one object. Stream ls shows no duplicates and no missing objects.
+  - Workload: Loop: nats stream add S_i --replicas 3, logging success or failure; kill -9 the meta leader mid-loop; continue; restart it; nats stream ls; diff against the log.
+  - Guess: Guess: a create acknowledged by the old meta leader might not be committed in the meta RAFT log before the crash.
+- **In a 5-node cluster, losing any two servers that form a zone still lets publishes be acked and consumers work.** (process-kill, medium)
+  - Quote: > For example, if 5 servers are JetStream enabled you would want two servers in one “zone”, two servers in another, and the remaining server in a third. This means you can lose any one “zone” at any time and continue operating.
+  - Inject: Kill two servers at the same moment during a publish and consume workload.
+  - Observe: Publishes resume getting acks after re-election. Consumers keep receiving messages. No acked message is lost after the killed servers restart.
+  - Workload: 5-node cluster; R3 and R5 streams; publish and consume loops; kill -9 n1 and n2 together; observe; restart both; verify the ack log against the stream contents.
+  - Guess: Guess: R3 streams whose peers sit on 2 of the killed nodes lose quorum, because placement does not know about zones unless tags are configured. So 'continue operating' may hold only for R5, or with zone tags.
+- **With only two of the three configured servers started, JetStream is usable and accepts R3 stream creation and publishes.** (restart, medium)
+  - Quote: > After two servers are running you'll be ready to use JetStream.
+  - Inject: Cold start the cluster with only n1 and n2. Start n3 later.
+  - Observe: Stream add and publish succeed with two nodes. When n3 joins, it catches up, and reading the stream with n3 as leader shows all previously acked messages.
+  - Workload: Start n1 and n2 with empty store dirs; nats stream add S --replicas 3; publish N messages and log acks; start n3; step down until n3 is leader; read the stream and compare.
+  - Guess: Guess: R3 stream placement may refuse to create the stream when only 2 peers are known, contradicting the 'ready' claim for replicated streams.
+
+## jetstream-consumers.md
+
+- **Every message stored in the stream is delivered to a consumer at least once.** (process-kill, high)
+  - Quote: > Unlike [Core NATS](https://docs.nats.io/nats-concepts/core-nats), which provides an at most once delivery guarantee, a consumer in JetStream can provide an at least **once delivery** guarantee.
+  - Inject: SIGKILL nats-server while a durable AckExplicit pull consumer is mid-batch: some messages are delivered but not yet acked, some acks are in flight, and new publishes are still arriving.
+  - Observe: Fuss logs every publish that got a positive PubAck (stream seq) and every delivered message (stream seq, delivery count) to its own history file. After restart and drain, every PubAck'd seq must appear in the deliveries at least once.
+  - Workload: nats stream add S --subjects 's.>' --storage file; nats consumer add S C --pull --ack explicit --deliver all; loop: nats pub s.x <n> (record PubAck seq); in parallel loop: nats consumer next S C --count 10 --ack; kill -9 server; restart server; keep running nats consumer next until no messages arrive for 2x AckWait.
+  - Guess: Guess: the consumer's stored ack floor could be flushed ahead of the actual acks, or a PubAck could be sent before the message is synced, so a message is silently skipped after a crash.
+- **A message that is delivered but not acked, or that is nacked, gets delivered again.** (restart, high)
+  - Quote: > This tracking ensures that if a message is not acknowledged (un-acked or 'nacked'), the consumer will automatically attempt to re-deliver it.
+  - Inject: Pull messages without acking (or send -NAK), then restart the server before redelivery happens.
+  - Observe: After restart, each un-acked or nacked seq is delivered again with a higher delivery count (from the message metadata), and is not dropped.
+  - Workload: nats consumer add S C --pull --ack explicit --wait 5s; nats pub s.x 1..20; nats consumer next S C --count 20 --no-ack; nak half of them via a client; kill -9 server; restart; nats consumer next S C --count 20 --ack; compare seqs.
+  - Guess: Guess: pending/redelivery state lives in memory and is written lazily, so it could be lost on a crash.
+- **When a message hits MaxDeliver without being acked, the server publishes a max-deliveries advisory.** (restart, medium)
+  - Quote: > If a message is not acknowledged within a user-specified number of delivery attempts, an advisory notification is emitted.
+  - Inject: Restart the server after a message has used up some, but not all, of its MaxDeliver attempts.
+  - Observe: A subscriber on $JS.EVENT.ADVISORY.CONSUMER.MAX_DELIVERIES.S.C gets exactly one advisory for that stream seq, sent after the MaxDeliver-th delivery, not earlier and not never.
+  - Workload: nats sub '$JS.EVENT.ADVISORY.CONSUMER.MAX_DELIVERIES.>' (logged); nats consumer add S C --pull --ack explicit --max-deliver 4 --wait 2s; nats pub s.x m; nats consumer next S C --no-ack twice; kill -9; restart; nats consumer next S C --no-ack until no more deliveries; count deliveries and advisories.
+  - Guess: Guess: the delivery count could reset or roll back after restart, giving extra deliveries, or the advisory could be emitted only by the in-memory path and be lost around the restart.
+- **An ordered consumer gives the client stream messages in order with no gaps. On a gap, it recreates itself and resumes.** (restart, medium)
+  - Quote: > No acknowledgements (if gap is detected, consumer is recreated)
+  - Inject: Restart or kill the server while an ordered consumer is streaming a large backlog.
+  - Observe: The sequence of stream seqs the client receives strictly increases and has no holes (ignoring seqs deleted from the stream). Duplicates appear only where the client recreated the consumer.
+  - Workload: publish 100k messages to S; run a Go client with js.OrderedConsumer / nats sub --stream S (ordered) and log stream seqs; kill -9 server mid-read; restart; let the client finish; check that seqs are monotonic and gap-free.
+  - Guess: Guess: the client's gap detection works from consumer seq, and a reconnect could resume from the wrong stream seq after the server-side ephemeral is lost.
+- **A durable consumer survives server restarts and clients can resume it from where it left off.** (process-kill, high)
+  - Quote: > If set, clients can have subscriptions bind to the consumer and _resume_ until the consumer is explicitly deleted.
+  - Inject: SIGKILL the server repeatedly while clients consume and ack from a durable consumer.
+  - Observe: After each restart, nats consumer info S C still shows the consumer. Delivery resumes from just past the last acked seq that Fuss recorded, not from the start and not skipping ahead.
+  - Workload: nats consumer add S D --pull --ack explicit; consume and ack 1000 msgs, logging acks; kill -9; restart; nats consumer info S D; nats consumer next S D --count 10; compare the first seq with Fuss's last confirmed ack.
+  - Guess: Guess: the consumer's metadata or state file could be partly written during a crash, so on restart the consumer is missing or reset.
+- **Durable consumers without InactiveThreshold persist through idle periods and through server or client crashes.** (restart, medium)
+  - Quote: > By default, consumers will have the same replication factor as the stream they consume, and will remain even when there are periods of inactivity (unless `InactiveThreshold` is set explicitly). Consumers can recover from server and client failure.
+  - Inject: Leave the consumer idle with no bound clients, kill the server, and keep it down for a long time (or move the clock forward) before restarting.
+  - Observe: nats consumer ls S still lists the consumer, and its ack floor (nats consumer info) matches Fuss's recorded acks.
+  - Workload: nats consumer add S D --pull; ack some msgs; disconnect all clients; kill -9; advance the system clock by days; restart; nats consumer info S D.
+  - Guess: Guess: inactivity timing could compare against wall-clock timestamps from before the restart and wrongly treat the consumer as expired.
+- **An ephemeral consumer is deleted only after InactiveThreshold of inactivity with no bound subscriptions, not before.** (clock-skew, medium)
+  - Quote: > Durables and ephemeral have the same message delivery semantics but an ephemeral consumer will not have persisted state or fault tolerance (server memory only) and will be automatically _cleaned up_ (deleted) after a period of inactivity, when no subscriptions are bound to the consumer.
+  - Inject: While an ephemeral consumer has an active subscription, or has been idle for less than its InactiveThreshold, jump the server host clock forward or backward.
+  - Observe: The consumer stays (nats consumer info) while a subscription is bound or the idle time measured by Fuss's monotonic clock is under the threshold. It disappears soon after the threshold once nothing is bound.
+  - Workload: create an ephemeral pull consumer with --inactive-threshold 30s from a client; keep pulling every 5s; jump the clock +1h; check it still exists; stop pulling; check it is gone about 30s later by monotonic time.
+  - Guess: Guess: the inactivity check could use wall-clock time, so a forward jump deletes an active consumer and a backward jump keeps a dead one forever.
+- **An un-acked message is redelivered about AckWait after delivery, not much sooner and not much later.** (clock-skew, medium)
+  - Quote: > The duration that the server will wait for an acknowledgment for any individual message _once it has been delivered to a consumer_. If an acknowledgment is not received in time, the message will be redelivered.
+  - Inject: Right after a message is delivered without an ack, step the server clock forward or backward by much more than AckWait.
+  - Observe: Fuss's monotonic clock shows the gap between first delivery and redelivery is close to AckWait. A large clock step should not cause instant redelivery or a stalled redelivery.
+  - Workload: nats consumer add S C --pull --ack explicit --wait 10s; nats pub s.x m; nats consumer next S C --no-ack (record t0); date -s '+1 hour' on the server host; poll nats consumer next S C and record t1; repeat with -1 hour.
+  - Guess: Guess: redelivery deadlines could be stored as wall-clock timestamps, so a backward step delays redelivery by the size of the step.
+- **Across all clients of a consumer, there are never more than MaxAckPending un-acked messages outstanding.** (concurrent-calls, high)
+  - Quote: > Once this limit is reached, message delivery will be suspended. This limit applies across _all_ of the consumer's bound subscriptions.
+  - Inject: Many clients pull or receive pushes at the same time without acking, plus a server restart while the limit is reached.
+  - Observe: From Fuss's log, the number of distinct seqs delivered and not yet acked or expired never exceeds MaxAckPending at any time, including just after restart. nats consumer info Num Ack Pending stays at or below the limit.
+  - Workload: nats consumer add S C --pull --ack explicit --max-pending 50 --wait 60s; publish 1000; run 10 concurrent clients doing nats consumer next --count 20 --no-ack; kill -9; restart; repeat the pulls; count outstanding.
+  - Guess: Guess: after restart the pending set might not be rebuilt before delivery resumes, letting another full window go out on top of the old one.
+- **No message is delivered more than MaxDeliver times, even across restarts, and it stays in the stream after the limit is reached.** (process-kill, high)
+  - Quote: > The maximum number of times a specific message delivery will be attempted. Applies to any message that is re-sent due to acknowledgment policy (i.e., due to a negative acknowledgment or no acknowledgment sent by the client). The default is -1 (redeliver until acknowledged). Messages that have reached the maximum delivery count will stay in the stream.
+  - Inject: Kill the server between delivery attempts of a message that keeps being nacked.
+  - Observe: Fuss's count of deliveries per seq (and the server's delivery count in metadata) never goes above MaxDeliver. After the limit, nats stream get S <seq> still returns the message.
+  - Workload: nats consumer add S C --pull --ack explicit --max-deliver 3; nats pub s.x m; loop: nats consumer next S C and send -NAK; kill -9 after the 2nd delivery; restart; continue the loop for a while; nats stream get S 1.
+  - Guess: Guess: the delivery count is updated in memory before it is persisted, so a crash could roll it back and allow extra deliveries.
+- **Ack-timeout redeliveries follow the BackOff schedule (the last value repeats). A nak redelivers immediately, or after the nak delay if one is given.** (restart, medium)
+  - Quote: > When `MaxDeliver` is larger than the backoff list, the last delay in the list will apply for the remaining deliveries. Note that backoff is NOT applied to `nak`ed messages. A `nak` will result in immediate re-delivery unless `nakWithDelay` is used to set the re-delivery delay explicitly. When `BackOff` is set, it **overrides `AckWait` entirely**. The first value in the BackOff determines the `AckWait` value.
+  - Inject: Restart the server partway through a backoff schedule, and also step the clock during a long backoff delay.
+  - Observe: Gaps between redeliveries measured by Fuss's monotonic clock match the schedule (first = BackOff[0], later ones = BackOff[i], tail = last value). Nak'd messages come back right away, or after the given delay.
+  - Workload: nats consumer add S C --pull --ack explicit --max-deliver 6 --backoff-steps or a client with BackOff=[2s,5s,10s]; publish m; pull with no ack and record each redelivery time; kill -9 after the 2nd; restart; continue. Separately: pull, NakWithDelay(7s), record.
+  - Guess: Guess: after restart the delivery count or the next-due time is rebuilt wrongly, so the schedule restarts at BackOff[0] or fires everything at once.
+- **With AckAll, acking seq N also acks every earlier pending message, for all subscribers, and this holds after a crash.** (process-kill, high)
+  - Quote: > `AckAll`: Acknowledge only the last message received in a series; all previous messages are automatically acknowledged. Will acknowledge all pending messages for all subscribers for Pull Consumer.
+  - Inject: Kill the server right after the server confirms an AckAll for seq N (double-ack / AckSync returns).
+  - Observe: After restart, no seq at or below N is redelivered to any subscriber, and the ack floor in nats consumer info is at least N.
+  - Workload: nats consumer add S C --pull --ack all; publish 100; two clients pull 50 each; client B AckSync on the highest seq; kill -9 immediately; restart; pull until empty and check that no seq <= N comes back.
+  - Guess: Guess: the confirmed ack could be replied to before the floor is stored durably, so a crash brings earlier messages back.
+- **With AckNone, a delivered message is treated as acked and is not redelivered.** (process-kill, medium)
+  - Quote: > `AckNone`: No acknowledgment needed; the server assumes acknowledgment on delivery.
+  - Inject: Kill the server while it is pushing or pulling messages to an AckNone durable consumer.
+  - Observe: After restart, Fuss records how many already-delivered seqs come back. Any duplicate counts against the promise, but a small replay window right after a crash should be reported separately as a possible flush lag.
+  - Workload: nats consumer add S C --pull --ack none; publish 10k; pull continuously and log seqs; kill -9; restart; pull until empty; find duplicates.
+  - Guess: Guess: the delivered pointer is persisted lazily, so the server rolls back to an older position and resends messages.
+- **A late ack from the first receiver still counts after the message has been redelivered to someone else.** (concurrent-calls, medium)
+  - Quote: > > **Warning**: The server may consider an acknowledgment arriving out of the window. For instance, in a queue situation, if a first process fails to acknowledge within the window and the message has been redelivered to another consumer, the acknowledgment from the first consumer will be considered.
+  - Inject: Client A acks after AckWait has expired and the message has already gone to client B, which never acks.
+  - Observe: The message is not redelivered again after A's late ack. nats consumer info shows it acked (ack floor moves past it).
+  - Workload: nats consumer add S C --pull --ack explicit --wait 3s; publish m; client A pulls and sleeps 5s; client B pulls (gets the redelivery) and does not ack; A acks with AckSync; wait 10s and check that no more deliveries occur.
+  - Guess: Guess: the server could ignore the ack because it refers to an older delivery count.
+- **A start-time consumer delivers exactly the messages whose stored timestamp is on or after OptStartTime.** (clock-skew, medium)
+  - Quote: > `DeliverByStartTime`: Start with messages on or after the specified time. The consumer must specify `OptStartTime` defining the start time.
+  - Inject: Step the server clock backward while messages are being published, then create the consumer.
+  - Observe: Compare the delivered seqs with the timestamps from nats stream get. Every delivered message has a timestamp >= OptStartTime, and no stored message with timestamp >= OptStartTime is missing. Report any non-monotonic timestamps caused by the skew.
+  - Workload: publish batch A; date -s '-10 min'; publish batch B; date -s '+20 min'; publish batch C; nats consumer add S T --pull --deliver <time> ; pull all; check against nats stream get timestamps.
+  - Guess: Guess: the server may find the start position by binary search on timestamps it assumes are monotonic, so skewed timestamps cause skips.
+- **A DeliverNew durable delivers every message published after its creation and none from before, also after a restart.** (restart, high)
+  - Quote: > `DeliverNew`: Start receiving messages created after the consumer was created.
+  - Inject: Kill the server shortly after the consumer is created but before it has delivered anything.
+  - Observe: After restart, delivered seqs are exactly the PubAck'd seqs published after the consumer-create response. No earlier seqs appear and no later ones are missing.
+  - Workload: publish 100; nats consumer add S N --pull --deliver new (record time and last seq); publish 100; kill -9; restart; publish 100; pull until empty.
+  - Guess: Guess: if the start position is not persisted at creation, it could be recomputed on restart as 'new as of now' and skip the messages in between.
+- **ReplayOriginal reproduces the gaps between messages as they were originally published.** (clock-skew, low)
+  - Quote: > If the policy is `ReplayOriginal`, the messages in the stream will be pushed to the client at the same rate they were originally received, simulating the original timing.
+  - Inject: Step the server clock during replay, or publish with a clock step in the middle.
+  - Observe: Gaps between deliveries, measured on Fuss's monotonic clock, should match the gaps between stored timestamps. Report any huge stall or burst caused by the clock step.
+  - Workload: publish 20 msgs with 1s spacing; nats consumer add S R --deliver all --replay original --target r.out; nats sub r.out and record arrival times; step the server clock -1h midway.
+  - Guess: Guess: pacing might compute wall-clock deadlines, so a backward step pauses replay for an hour.
+- **Each delivery of a push consumer with a DeliverGroup goes to only one member of the group.** (concurrent-calls, medium)
+  - Quote: > The queue group name used to distribute messages among subscribers. Analogous to a [queue group](https://docs.nats.io/nats-concepts/core-nats/queue) in core NATS.
+  - Inject: Several queue subscribers are bound while some disconnect and reconnect and the server restarts.
+  - Observe: For each (seq, delivery count) pair, only one subscriber logs receipt. Duplicates only appear as redeliveries with a higher delivery count.
+  - Workload: nats consumer add S Q --target q.out --deliver-group g --ack explicit; start 5 nats sub q.out --queue g that log and ack; publish 10k; kill -9 and restart the server mid-run; compare logs.
+  - Guess: Guess: during reconnect the server could briefly treat members as separate interest and send the same delivery to two of them.
+- **With MemoryStorage set, the consumer's state is not written into the file store.** (restart, low)
+  - Quote: > If set, forces the consumer state to be kept in memory rather than inherit the storage type of the stream (default is file storage).
+  - Inject: During consumption and acks on a file-backed stream with a memory-storage consumer, then restart.
+  - Observe: Read-only inspection of the JetStream store dir shows no ack state for this consumer under the stream's obs/ directory. Compare with a sibling file-backed durable to confirm Fuss is looking in the right place.
+  - Workload: nats stream add S --storage file; create consumer M with MemoryStorage=true via a client and file-backed durable F; consume and ack on both; ls -R <store>/jetstream/<acct>/streams/S/obs; kill -9; restart; nats consumer info for M and F.
+  - Guess: Guess: the on-disk layout is undocumented, so Fuss may misread the store. Also the server could still write metadata or snapshots for memory consumers.
+- **When the disk fills while acks are flowing, outstanding deliveries still never exceed MaxAckPending, and acked messages are not later redelivered as if they were never acked.** (disk-full, medium)
+  - Quote: > Defines the maximum number of messages, without acknowledgment, that can be outstanding. Once this limit is reached, message delivery will be suspended.
+  - Inject: Fill the filesystem holding the JetStream store while clients are acking a durable consumer at a high rate.
+  - Observe: Fuss records which acks were confirmed (AckSync success) and which errored. After freeing space and restarting, confirmed acks are never redelivered, unconfirmed ones may be, and outstanding never exceeds MaxAckPending.
+  - Workload: store on a small loopback filesystem; nats consumer add S C --pull --ack explicit --max-pending 100; publish to near capacity; fallocate filler to fill the disk; consume with AckSync and log the results; remove filler; kill -9; restart; drain.
+  - Guess: Guess: a failed write of consumer state might be swallowed while the AckSync reply still reports success.
+
+## jetstream-model_deep_dive.md
+
+- **Publishing the same Nats-Msg-Id more than once within the window stores the message only once, even across a server crash and restart.** (process-kill, high)
+  - Quote: > JetStream support idempotent message writes by ignoring duplicate messages as indicated by the `Nats-Msg-Id` header.
+  - Inject: Right after the server acks the first publish with a given Msg-Id. Repeat with the kill landing while that first publish is still in flight with no ack yet.
+  - Observe: After restart, retry the publish with the same Msg-Id. Then check stream info message count and the stream messages: exactly one message per Msg-Id. The PubAck on the retry should have duplicate=true when the first copy was stored.
+  - Workload: nats stream add ORDERS --subjects 'ORDERS.*' --dupe-window 2m --storage file; nats req -H Nats-Msg-Id:1 ORDERS.new hello1; kill -9 nats-server; restart; nats req -H Nats-Msg-Id:1 ORDERS.new hello2; nats stream info ORDERS; nats stream get ORDERS 1
+  - Guess: Guess: the in-memory dedup table may be rebuilt from disk on restart, and may miss entries whose message was written but not yet synced. That could let a duplicate through.
+- **When duplicates race, the body that ends up stored is the first one accepted, and later bodies with the same ID are discarded.** (concurrent-calls, high)
+  - Quote: > and in the output you can see that the duplicate publications were detected and only one message (the first one) is actually stored in the stream
+  - Inject: Fire many publishes with the same Msg-Id and different bodies at once from separate connections. Optionally kill the server mid-burst.
+  - Observe: Exactly one stored message. Its body matches the one publish whose PubAck had duplicate=false, and every other PubAck reports duplicate=true.
+  - Workload: Start N goroutines, each running js.Publish("ORDERS.new", body_i, nats.MsgId("X")) and recording each PubAck; then nats stream get ORDERS <seq>
+  - Guess: Guess: a race between the dedup check and the store append could let two copies in, or make two publishers both see duplicate=false.
+- **Duplicates are rejected for the configured window (2 minutes by default) and accepted again once it has passed.** (clock-skew, medium)
+  - Quote: > The default window to track duplicates in is 2 minutes, this can be set on the command line using `--dupe-window` when creating a stream, though we would caution against large windows.
+  - Inject: Between the first publish and a retry with the same Msg-Id: step the host wall clock forward or backward, or restart the server, while the window should still be open.
+  - Observe: A retry inside the real elapsed window gets duplicate=true and the message count stays the same. A retry after the window adds a new message.
+  - Workload: nats stream add ORDERS --dupe-window 30s; nats req -H Nats-Msg-Id:a ORDERS.new x; skew clock +5m (or restart); nats req -H Nats-Msg-Id:a ORDERS.new y; nats stream info ORDERS
+  - Guess: Guess: window expiry may use the wall clock instead of a monotonic clock, so a forward skew could expire dedup entries early.
+- **A positive publish ack means the message is durably stored and will still be there after a crash.** (process-kill, high)
+  - Quote: > if you send a `Request()` to a subject covered by the configuration of the Stream the service will reply to you once it stored the message.
+  - Inject: Immediately after the client receives the PubAck, before any graceful shutdown.
+  - Observe: Every message whose PubAck Fuss logged is present at its acked sequence after restart, with the same body. No acked sequence is missing or holds a different body.
+  - Workload: Loop: nats req ORDERS.new msg-$i, logging the sequence from each PubAck; kill -9 at a random moment; restart; nats stream get ORDERS <seq> for every logged sequence
+  - Guess: Guess: file store writes may be buffered and fsync'd lazily (sync interval), so acked data in the OS page cache could be lost if the whole host loses power. A plain process kill is less likely to lose it.
+- **Once an AckSync succeeds, that message is never delivered again by that consumer, even after a server crash.** (process-kill, high)
+  - Quote: > If the response received from the server indicates success you can be sure that the message will never be re-delivered by the consumer (due to a loss of your acknowledgement).
+  - Inject: Right after the client receives a successful AckSync response.
+  - Observe: After restart, keep fetching from the same durable consumer until no messages remain and AckWait has passed. No message that was AckSync'd shows up again.
+  - Workload: nats consumer add ORDERS DISPATCH --pull --ack explicit; client fetches and calls msg.AckSync() for each, logging the stream sequence; kill -9; restart; fetch repeatedly and compare against the log
+  - Guess: Guess: consumer state (ack floor) may be persisted asynchronously from the ack reply, so a crash could roll the ack floor back.
+- **With Msg-Id dedup on publish and AckSync on consume, each logical message is stored once and processed once end to end.** (process-kill, medium)
+  - Quote: > JetStream supports Exactly Once publication and consumption by combining Message Deduplication and double acks.
+  - Inject: At random points while the publisher retries timed-out publishes with the same Msg-Id and the consumer AckSyncs.
+  - Observe: Fuss's own log shows each Msg-Id stored once (stream count equals unique IDs). Each Msg-Id has exactly one successful AckSync and no delivery after that successful AckSync.
+  - Workload: Publisher: for id in 1..N, retry js.Publish(..., MsgId(id)) until PubAck. Consumer: fetch, record, AckSync. Kill and restart the server repeatedly, then reconcile the logs.
+  - Guess: Guess: retries that straddle a restart plus lazily persisted dedup or ack state could produce a second copy or a redelivery.
+- **In a work-queue stream, an acked message is removed and never comes back, even after a restart.** (restart, high)
+  - Quote: > In `WorkQueuePolicy` the messages will be removed as soon as _the_ Consumer received an Acknowledgement.
+  - Inject: Kill or restart the server right after a successful AckSync on a work-queue stream.
+  - Observe: Stream message count drops by one per ack and stays that way after restart. A get on an acked sequence returns not found. The acked message is never redelivered.
+  - Workload: nats stream add Q --retention work --subjects 'q.*'; nats consumer add Q W --pull --ack explicit; publish 100; fetch, AckSync 50; kill -9; restart; nats stream info Q; fetch the rest
+  - Guess: Guess: the stream-side delete and the consumer ack floor are persisted separately, so a crash between them could resurrect the message or lose an unacked one.
+- **A work-queue stream rejects a second consumer whose filter overlaps an existing one.** (concurrent-calls, medium)
+  - Quote: > each subject captured by the stream can only have one consumer at a time
+  - Inject: Issue several consumer-create calls with overlapping filters at the same moment, optionally around a restart.
+  - Observe: At most one create succeeds. nats consumer ls shows no two consumers with overlapping filters, and this still holds after restart.
+  - Workload: Run in parallel: nats consumer add Q A --pull --filter q.x & nats consumer add Q B --pull --filter 'q.*' & ...; then nats consumer ls Q and inspect each consumer's filter
+  - Guess: Guess: the overlap check and the consumer registration might not be atomic under concurrent creates.
+- **In an interest stream, a message stays until every consumer has acked it, then it is removed, and this holds across restart.** (restart, high)
+  - Quote: > Once all currently defined consumers have received explicit acknowledgement from a subscribing application for the message it is then removed from the stream.
+  - Inject: Restart after one consumer has acked and another has not, and again after both have acked.
+  - Observe: The message is still present while any consumer has not acked it, including after restart. It is gone once all consumers have acked it.
+  - Workload: nats stream add I --retention interest; add consumers C1 and C2; publish 1; C1 AckSync; kill -9; restart; nats stream info I (expect 1); C2 AckSync; restart; nats stream info I (expect 0)
+  - Guess: Guess: interest tracking may be recomputed on restart from consumer state that lags the acks, causing early removal or a message that never gets removed.
+- **The stream never holds more than MaxMsgs messages or MaxBytes bytes, or messages older than MaxAge.** (clock-skew, high)
+  - Quote: > In all Retention Policies the basic limits apply as upper bounds, these are `MaxMsgs` for how many messages are kept in total, `MaxBytes` for how big the set can be in total and `MaxAge` for what is the oldest message that will be kept.
+  - Inject: Step the wall clock forward or backward while messages are near MaxAge. Separately, kill the server during heavy publishing at the count or byte limit.
+  - Observe: Stream info never reports more than the limits after things settle. No message whose original timestamp is older than MaxAge (measured on Fuss's own clock) remains. Under backward skew, no messages are dropped early.
+  - Workload: nats stream add L --max-msgs 100 --max-bytes 10KB --max-age 1m; publish continuously; skew clock or kill -9 and restart; poll nats stream info L
+  - Guess: Guess: MaxAge expiry uses message timestamps compared with the wall clock, so a forward skew may mass-expire messages and a backward skew may keep them too long.
+- **With DiscardNew at the limit, new publishes get an error and are not stored. With DiscardOld, the oldest messages are removed instead.** (concurrent-calls, high)
+  - Quote: > The `DiscardOld` option removes old messages making space for new, while `DiscardNew` refuses any new messages.
+  - Inject: Many concurrent publishers hit a stream sitting just below its limit. Optionally restart the server at the limit.
+  - Observe: With DiscardNew: count never exceeds MaxMsgs, every publish that got a positive PubAck is stored, every rejected one is absent, and the earliest messages are kept. With DiscardOld: the newest messages are kept and the first sequence advances.
+  - Workload: nats stream add D --max-msgs 10 --discard new; 50 parallel nats req D.x m$i; nats stream info D; compare the stored sequences with the PubAcks Fuss logged
+  - Guess: Guess: the limit check may race with the append, so the stream could overshoot or a positive PubAck could be followed by eviction.
+- **Messages larger than MaxMsgSize are rejected and never stored, including after the stream config survives a restart.** (restart, medium)
+  - Quote: > you can say a Stream will only accept messages up to 1024 bytes using `MaxMsgSize`.
+  - Inject: Restart the server, then publish oversized messages.
+  - Observe: Oversized publishes get an error PubAck, and no stored message exceeds MaxMsgSize.
+  - Workload: nats stream add S --max-msg-size 1024; restart; nats req S.x <2KB payload>; nats stream info S
+  - Guess: Guess: the config reload after restart could drop or default the limit.
+- **Durable consumers and their position survive client disconnects and server restarts.** (restart, high)
+  - Quote: > So far, all the Consumers you have seen were Durable, meaning they exist even after you disconnect from JetStream.
+  - Inject: Kill the server after a durable consumer has delivered and acked part of the stream.
+  - Observe: After restart, nats consumer info shows the same consumer with an ack floor at or beyond the last confirmed AckSync. Fetching resumes from there instead of the start.
+  - Workload: nats consumer add ORDERS D --pull --ack explicit; fetch and AckSync 10; kill -9; restart; nats consumer info ORDERS D; nats consumer next ORDERS D
+  - Guess: Guess: consumer state files may be written periodically, so the position could roll back. That would cause redelivery, which is allowed for non-AckSync acks but not for AckSync'd ones.
+- **After the start point, a consumer eventually delivers every unacked message and never skips any, including across restarts.** (process-kill, high)
+  - Quote: > Regardless of what mode you set, this is only the starting point. Once started it will always give you what you have not seen or acknowledged.
+  - Inject: Kill the server while messages are delivered but not yet acked.
+  - Observe: Every stream sequence from the start point onward is delivered at least once and is either acked or still pending. No sequence is missing from Fuss's delivery log, and first deliveries arrive in increasing stream order.
+  - Workload: Publish 1..N; a pull consumer fetches with explicit ack and acks a random subset; kill -9; restart; fetch until empty after AckWait; check coverage of 1..N
+  - Guess: Guess: on recovery, the delivered pointer could be restored ahead of the ack floor without redelivering the pending gap.
+- **With AckAll, acking message N also acks every earlier message, and none of them are redelivered, even after a restart.** (restart, high)
+  - Quote: > In this mode if you acknowledge message `100` it will also acknowledge message `1`-`99`, this is good for processing batches and to reduce ack overhead
+  - Inject: Right after a successful synchronous ack of message 100 on an AckAll consumer.
+  - Observe: After restart and once AckWait has passed, none of messages 1-100 are redelivered, and the ack floor is at 100 or higher.
+  - Workload: nats consumer add ORDERS A --pull --ack all; fetch 100; AckSync only the 100th; kill -9; restart; fetch; nats consumer info ORDERS A
+  - Guess: Guess: the persisted ack floor might be updated without the range of pending entries, so leftover pending entries come back after restart.
+- **A NAK'd message is redelivered later, including after a restart.** (restart, medium)
+  - Quote: > Signals that the message will not be processed now and processing can move onto the next message, NAK'd message will be retried
+  - Inject: After a NAK is sent, before the redelivery happens.
+  - Observe: The NAK'd stream sequence is delivered again, with a higher delivery count, after restart.
+  - Workload: Fetch 1; msg.Nak() with a reply; kill -9; restart; fetch and check that the same stream sequence returns
+  - Guess: Guess: a NAK might be treated as a final state in persisted state and get lost.
+- **A progress ack pushes back redelivery by one more AckWait.** (clock-skew, medium)
+  - Quote: > When sent before the AckWait period indicates that work is ongoing and the period should be extended by another equal to `AckWait`
+  - Inject: Jump the wall clock forward just after a +WPI is sent.
+  - Observe: No redelivery to other fetchers within AckWait (by Fuss's monotonic clock) after the +WPI. Redelivery does happen after the extension expires with no further progress acks.
+  - Workload: Consumer with --wait 10s; fetch; at 8s send msg.InProgress(); skew clock +1h; a second fetcher polls; record the redelivery time
+  - Guess: Guess: AckWait deadlines may be computed from the wall clock, so a forward skew could trigger an early redelivery.
+- **After AckTerm, the message is never redelivered, even after a restart.** (restart, medium)
+  - Quote: > Instructs the server to stop redelivery of a message without acknowledging it as successfully processed
+  - Inject: After a successful synchronous AckTerm.
+  - Observe: The terminated sequence is never delivered again after restart and AckWait.
+  - Workload: Fetch 1; msg.Term() with a reply subject and wait for the reply; kill -9; restart; fetch until empty
+  - Guess: Guess: a terminated message might be recorded in memory only and lost on crash.
+- **The server confirms each ack that carries a reply subject, and a confirmed ack takes effect durably.** (process-kill, medium)
+  - Quote: > All of these acknowledgement modes, except `AckNext`, support double acknowledgement - if you set a reply subject when acknowledging the server will in turn acknowledge having received your ACK.
+  - Inject: Right after the server's confirmation of an ack, NAK, or term arrives.
+  - Observe: The confirmed effect (acked, terminated, or NAK'd) is reflected in consumer behavior after restart.
+  - Workload: For each ack type, send it with a reply subject and wait; kill -9; restart; observe redelivery behavior
+  - Guess: Guess: the confirmation may be sent before the state is persisted.
+- **Consumer sequence numbers only increase with each delivery attempt and never repeat or go backward, including across restarts.** (restart, medium)
+  - Quote: > The Consumer sequence increases - each delivery attempt increases the sequence - and our redelivered count also goes up.
+  - Inject: Restart between delivery attempts of an unacked message.
+  - Observe: The consumer sequences in message metadata that Fuss logs are strictly increasing across the restart. Redelivered messages carry a growing delivery count.
+  - Workload: Fetch with --no-ack several times while logging the metadata (consumer seq, num delivered); kill -9; restart; fetch again and compare
+  - Guess: Guess: if the delivered sequence persisted on disk lags the in-memory value, consumer sequences could be reused after a crash.
+- **An ephemeral consumer stays alive while it has a subscriber, survives brief interruptions, and is cleaned up after a grace period with no subscribers.** (restart, low)
+  - Quote: > An Ephemeral Consumer exists as long as any subscription is active on its delivery subject. It is automatically be removed, after a short grace period to handle restarts, when there are no subscribers.
+  - Inject: Restart the server, or disconnect and reconnect the subscriber briefly, while an ephemeral consumer is active.
+  - Observe: nats consumer ls shows the ephemeral consumer still present during the grace period and gone some time after its last subscriber leaves.
+  - Workload: nats sub my.monitor; nats consumer add ORDERS --ephemeral --target my.monitor --ack none; restart the server; check nats consumer ls; kill the sub; wait; check nats consumer ls again
+  - Guess: Guess: the grace-period timer could be reset or lost on restart, leaking consumers or removing them too early.
+- **A ReplayOriginal consumer reproduces the original gaps between messages.** (clock-skew, medium)
+  - Quote: > You might want to replay messages at the rate they arrived though, meaning if messages first arrived 1 minute apart, and you make a new Consumer it will get the messages a minute apart.
+  - Inject: Step the wall clock during a replay.
+  - Observe: The gaps between deliveries, measured on Fuss's monotonic clock, match the gaps between stored timestamps.
+  - Workload: Publish 3 messages 10s apart; nats consumer add ... --replay original --target out; nats sub out; skew the clock mid-replay; record arrival times
+  - Guess: Guess: replay pacing may use wall-clock deltas, so a skew could cause bursts or long stalls.
+- **A by_start_time consumer starts at the first message stored at or after the given time.** (clock-skew, medium)
+  - Quote: > Delivers from a specific time onward. Requires `OptStartTime` to be set
+  - Inject: Skew the server clock backward between publishes so stored timestamps go out of order, then create the consumer.
+  - Observe: The first delivered message matches what Fuss expects from its own publish log and the stored timestamps. Check for skipped or extra messages.
+  - Workload: Publish m1; skew clock -5m; publish m2 and m3; nats consumer add ORDERS T --pull --deliver <time> ; nats consumer next ORDERS T
+  - Guess: Guess: the start-time lookup may assume timestamps increase with sequence and binary-search incorrectly when they don't.
+- **Each stored record carries a hash and sequence, so a torn write from a crash can be detected and is not served as a valid message.** (disk-full, medium)
+  - Quote: > We do store some message data with each message, namely: * Message headers * The subject it was received on * The time it was received * The message payload * A hash of the message * The message sequence
+  - Inject: Fill the disk, or kill the process, mid-append during heavy publishing.
+  - Observe: After restart, no message is served with a corrupted body or subject, and every acked message is intact. Fuss can also read the block files read-only and verify record framing.
+  - Workload: Fill the filesystem to near capacity; publish large messages in a loop via nats req; kill -9 or let ENOSPC hit; free space; restart; nats stream get every sequence and compare with the publish log
+  - Guess: Guess: recovery may truncate at the first bad record and lose later acked records, or skip the hash check.
+
+## nats_admin-jetstream_admin-disaster_recovery.md
+
+- **If an R3+ stream loses a node but keeps quorum, and a spare node exists and the dead node is peer-removed, JetStream automatically builds a replacement replica.** (process-kill, high)
+  - Quote: > NATS will create replacement stream replicas automatically under the following conditions:
+
+* Impacted stream is of replica configuration R3 (or greater)
+* Remaining intact nodes (stream replicas) meet minimum RAFT quorum: floor(R/2) + 1
+* Available node(s) in the stream's cluster for new replica(s)
+* Impacted node(s) removed from the stream's domain RAFT Meta group (e.g. `nats server cluster peer-remove`)
+  - Inject: Permanently kill one replica's server while publishes are still being acknowledged. Then run peer-remove while the cluster is still under publish load.
+  - Observe: `nats stream info` should eventually list a new replica on the spare node with current=true. Every message Fuss recorded as acked must be readable from the stream, with the same sequence and payload. This must still hold after the original leader is later killed.
+  - Workload: Start 4 servers. `nats stream add S --replicas 3 --storage file`. Publish N numbered messages and log each ack. Kill one replica's process and never restart it. Run `nats server cluster peer-remove <name>`. Keep publishing. Poll `nats stream info S`. Read every sequence with `nats stream get` and compare against the ack log.
+  - Guess: Guess: catch-up to the new replica could race with ongoing writes or a leader change, leaving the new replica with gaps. A later failover to that replica would then lose acked messages.
+- **Automatic recovery depends on quorum. If quorum is lost, the stream should not silently invent replicas or accept writes it cannot replicate.** (process-kill, medium)
+  - Quote: > Remaining intact nodes (stream replicas) meet minimum RAFT quorum: floor(R/2) + 1
+  - Inject: Kill two of three replicas of an R3 stream, then peer-remove them.
+  - Observe: Publishes should fail or time out rather than be acked. No replacement replicas should appear until quorum returns. After the killed nodes restart, no acked message may be missing.
+  - Workload: R3 stream on a 5-node cluster. Publish and log acks. Kill 2 replicas. Attempt publishes and record whether each was acked or errored. Run peer-remove on the killed nodes. Watch `nats stream info`. Restart the nodes. Verify the full ack log against stream contents.
+  - Guess: Guess: the remaining minority replica might acknowledge writes or get promoted, causing acked-then-lost messages once the majority returns.
+- **A stream backup restored elsewhere reproduces the stream's config, durable consumer config and positions, and every message with its timestamp and headers.** (restart, high)
+  - Quote: > The backup includes (by default):
+
+* Stream configuration and state
+* Stream durable consumer configuration and state
+* All message payload data including metadata like timestamps and headers
+  - Inject: After the backup completes, kill the source server and restore onto a fresh server with an empty storage directory.
+  - Observe: Compare the restored stream with Fuss's pre-backup history. Check `nats stream info` config and state (first/last sequence, message count). Check `nats consumer info` ack floor and delivered sequence. Check each message's subject, payload, headers and timestamp via `nats stream get`.
+  - Workload: Create a file stream and a durable consumer. Publish N messages with unique headers. Consume and ack the first K. Record everything. Run `nats stream backup S dir`. Kill the server. Start a new server. Run `nats stream restore dir`. Diff the restored state against the record. Then fetch from the consumer and confirm the next delivery is K+1.
+  - Guess: Guess: consumer state may be snapshotted at a slightly different moment than the stream data, so restored ack floors could lag and cause redeliveries, or run ahead and skip messages.
+- **While a backup runs, stream config edits are refused and retention-based deletion is paused.** (concurrent-calls, medium)
+  - Quote: > During a backup operation, the stream is placed in a status where it's configuration cannot change and no data will be
+evicted based on stream retention policies.
+  - Inject: Mid-backup, while the progress bar or log lines show chunks still being transferred.
+  - Observe: `nats stream edit` during the backup should fail, or at least the config must not change. With limits like max-msgs, max-age or work-queue retention, `nats stream info` first-sequence must not advance during the backup. The backup must contain every message present at backup start.
+  - Workload: Create a stream with `--max-msgs` small and `--max-age 2s`, filled near the limit with large payloads so the backup is slow. Start `nats stream backup S dir --no-progress`. Concurrently publish past the limit, run `nats stream edit S --max-msgs X`, and poll `nats stream info` first-seq. After the backup, restore to a new server and check its contents.
+  - Guess: Guess: the age-based expiry timer or limit enforcement on publish might not check the backup status, so messages are evicted during the snapshot.
+- **A backup restores correctly onto the original server or a different server or cluster, and the restored stream survives restart.** (process-kill, medium)
+  - Quote: > An existing backup (as above) can be restored to the same or a new NATS server (or cluster) using the `nats stream restore` command.
+  - Inject: Kill the target server right after `nats stream restore` reports success. A second variant kills it mid-restore.
+  - Observe: After restart, a restore that reported success must have its full contents present. A restore killed partway must either leave no stream or a stream that is visibly not fully restored, never a stream silently missing messages. Fuss can check this with `nats stream ls`, `nats stream info` and message reads.
+  - Workload: Back up stream S. On a target server, run `nats stream restore dir`. Kill -9 either after success or mid-progress. Restart the server. Run `nats stream info S` and read all messages. Compare with the backup's recorded state.
+  - Guess: Guess: restored data may be acknowledged before it is fsynced, or a half-restored stream may be registered as a normal stream after restart.
+- **Account backup and restore captures and reproduces every stream in the account, with config, consumer state and messages.** (restart, high)
+  - Quote: > The `nats account backup` and `nats account restore` commands allow you to back up and restore all streams in an account at once, including their configuration, consumer state, and all message data.
+  - Inject: Between backup and restore, kill the source server and use a fresh server. A variant kills the target mid account-restore.
+  - Observe: Every stream recorded by Fuss must exist on the target after restore. Each must match Fuss's recorded config, message contents and consumer positions. Each stream must appear as its own subdirectory in the backup directory, which Fuss can read.
+  - Workload: Create 3 file streams with durable consumers and partial acks. Log all of it. Run `nats account backup dir --consumers`. List the subdirectories in dir. Kill the server. Start a fresh server. Run `nats account restore dir`. Diff each stream and consumer.
+  - Guess: Guess: per-stream backups are taken sequentially, so streams can be captured at different points in time. A crash mid account-restore may leave only some streams restored, with no clear indication.
+- **Restoring over an existing stream name fails instead of overwriting or merging.** (concurrent-calls, medium)
+  - Quote: > `nats account restore` will fail if a stream with the same name already exists. You must remove the existing stream before restoring from backup.
+  - Inject: Run two `nats account restore` processes on the same backup simultaneously, and separately restore while a same-named stream exists.
+  - Observe: For an existing stream, the restore must error, and the stream's messages and sequence numbers must be unchanged. For concurrent restores, exactly one should create each stream. There must be no duplicated or interleaved messages and no corrupted state.
+  - Workload: Create stream S with known messages. Run `nats account restore dir`, where dir contains S, and expect failure. Verify S is unchanged. Delete S. Launch two `nats account restore dir` at once. Check the resulting S against the backup contents.
+  - Guess: Guess: the existence check and stream creation may not be atomic, so two concurrent restores could both pass the check and interleave their data.
+- **Backing up with --check detects a corrupt or incomplete backup.** (process-kill, low)
+  - Quote: > | `--check` | Check backup integrity |
+  - Inject: Kill the nats-server mid `nats account backup --check`, or kill the CLI process mid-backup.
+  - Observe: An interrupted backup must not be reported as a successful, checked backup. A later restore from it must either fail or produce the correct data, never silently truncated data.
+  - Workload: Fill a large stream. Start `nats account backup dir --check --no-progress`. Kill the server partway. Record the CLI exit code and output. Attempt `nats account restore dir` on a fresh server and compare the result against the record.
+  - Guess: Guess: the integrity check may verify only chunks received, not the expected total, so a truncated snapshot could pass.
+
+## nats_admin-jetstream_admin-replication.md
+
+- **A mirror holds the origin stream's messages in the same order and, where possible, with the same sequence numbers.** (process-kill, medium)
+  - Quote: > A _mirror_ copies data from 1 other stream, as far as possible IDs and ordering will match exactly the source.
+  - Inject: While a steady publish loop into the origin stream is running and the mirror is actively catching up (mirror Lag > 0). Kill the server hosting the mirror, or the origin's leader, then restart it.
+  - Observe: After publishing stops and mirror Lag reaches 0, read both streams in full with an ordered consumer or direct get. Compare the (stream sequence, payload) lists. The mirror should be an exact prefix-equal copy, with no gaps, no reordering, and no duplicated payloads. Also check for sequence-number drift against Fuss's own log of acked publishes.
+  - Workload: nats s add SRC --subjects 'src.>' --storage file; nats s add MIR --mirror SRC --storage file; loop: nats req src.x 'msg {{Count}}' --count 5000 (record each ack seq to the Fuss log); kill -9 the nats-server mid-loop; restart it with the same config; wait until `nats s info MIR` shows Lag 0; dump both streams with `nats s get` or a consumer and diff them.
+  - Guess: Guess: the mirror's consumer position on the origin may be persisted separately from the mirror's own store. A crash between the two could make it re-fetch messages (duplicates or shifted sequences) or skip a range (gap).
+- **Only data copied from the origin ever appears in a mirror; nothing published directly to subjects ends up in it.** (restart, medium)
+  - Quote: > A _mirror_ does not listen on a subject for any data to be added.
+  - Inject: After the mirror is created, restart the server. Then publish on the origin's subjects and on other arbitrary subjects.
+  - Observe: The mirror's message count and contents equal exactly the origin's, before and after the restart. No extra messages appear, and no publish to a subject is acked by the mirror stream name.
+  - Workload: nats s add SRC --subjects 'src.>'; nats s add MIR --mirror SRC; restart nats-server; nats req src.a x --count 10; nats pub mir.anything y; check that the stream name in each publish ack is never MIR; compare `nats s info MIR` msg count with SRC.
+  - Guess: Guess: on config reload after restart, the mirror config could be re-applied incorrectly and the stream could gain a subject binding.
+- **A mirror with a subject filter or start point copies only matching messages from that start point onward, and this keeps working across restarts.** (clock-skew, medium)
+  - Quote: > A _mirror_ can filter by subject and the Start Sequence and Start Time can be set.
+  - Inject: Create a mirror with a Start Time while the server clock is skewed forward or backward relative to the message timestamps. Also skew the clock and restart the server while the mirror is still catching up.
+  - Observe: The mirror should contain exactly the origin messages whose stored timestamp is at or after Start Time (or whose sequence is at or after Start Sequence) and that match the filter. Watch for messages before the start appearing after a restart, or for valid messages missing.
+  - Workload: Publish 1000 msgs to SRC on subjects src.a and src.b, recording ack times; create MIR with --mirror SRC, start time T (the midpoint), and filter src.a; start the server under libfaketime offset ±1h; restart mid catch-up; compare MIR contents to the expected set computed from the Fuss log.
+  - Guess: Guess: if resume after restart re-evaluates Start Time against wall-clock 'now' rather than stored message timestamps, skew could cause re-copying or skipping.
+- **A sourced stream eventually holds every message from every one of its sources.** (process-kill, high)
+  - Quote: > A _source_ is a stream where data is copied from, one stream can have multiple sources and will read data in from them all.
+  - Inject: While publishing concurrently into two source streams and the aggregate stream is pulling from both. Kill the server or cluster node hosting the aggregate stream, then restart it.
+  - Observe: Once Lag is 0 for every source in `nats s info ARCHIVE` (or `nats s report`), the set of payloads in ARCHIVE should equal the union of acked payloads in ORDERS and RETURNS. The count should be exact, with nothing missing and nothing duplicated.
+  - Workload: Use file storage for ORDERS and RETURNS so kills don't legitimately lose source data. nats s add ARCHIVE --source ORDERS --source RETURNS --storage file; run two concurrent loops: nats req ORDERS.new 'ORDER {{Count}}' --count 2000 and nats req RETURNS.new 'RETURN {{Count}}' --count 2000; kill -9 mid-run; restart; wait for Lag 0; assert ARCHIVE msg count = 4000 and the payload sets match.
+  - Guess: Guess: the per-source last-seen sequence may not be fsynced together with the copied messages. That could lose a tail or duplicate one after a crash.
+- **In a sourced stream, messages from any single source keep their original relative order, even though they are interleaved with other sources.** (process-kill, high)
+  - Quote: > We can therefore not maintain absolute ordering, but data from 1 single source will be in the correct order but mixed in with other streams.
+  - Inject: During concurrent catch-up from multiple sources. Kill and restart the aggregate stream's server, ideally more than once.
+  - Observe: Read ARCHIVE in sequence order and project it per source, using a payload prefix such as 'ORDER n' or 'RETURN n'. Each projection's counter must be strictly increasing with no repeats.
+  - Workload: As in the previous workload, with payloads carrying a per-source monotonic counter; kill -9 the server twice during catch-up; after Lag reaches 0, consume ARCHIVE with an ordered consumer and check monotonicity per source.
+  - Guess: Guess: on resume, a source could be re-fetched from an earlier sequence. Re-delivered older messages would then land after newer ones and break per-source order.
+- **A sourced stream that has its own subjects also stores messages published directly to it, alongside sourced data.** (process-kill, high)
+  - Quote: > The stream will also listen for messages on it's own subject.
+  - Inject: While publishing directly to the sourced stream's own subject and also into its sources at the same time. Kill and restart the server.
+  - Observe: Every direct publish acked with stream=ARCHIVE is present in ARCHIVE after restart. Sourced messages are also all present, and the total equals direct acks plus source acks.
+  - Workload: nats s add ARCHIVE --source ORDERS --source RETURNS --subjects 'archive.>' --storage file; run concurrently: nats req archive.direct 'D {{Count}}' --count 1000 and nats req ORDERS.new 'O {{Count}}' --count 1000; kill -9 mid-run; restart; verify that all acked D and O payloads are present exactly once.
+  - Guess: Guess: direct publishes and sourced writes may race on the same store. A crash could leave an acked direct publish unpersisted, or interleave writes inconsistently.
+- **A source configured with a start point and a subject filter copies only matching messages from that point on, and keeps doing so across restarts.** (restart, medium)
+  - Quote: > A source can have Start Time or Start Sequence and can filter by a subject.
+  - Inject: Restart the server after the sourced stream has partially caught up from a source that has a Start Sequence and a filter.
+  - Observe: ARCHIVE should contain only source messages with sequence at or after Start Sequence that match the filter, each exactly once. A restart must not cause messages before the start, or non-matching messages, to appear.
+  - Workload: Publish 1000 msgs to ORDERS on ORDERS.new and ORDERS.cancel; create ARCHIVE with source ORDERS, start sequence 500, filter ORDERS.new; restart nats-server mid catch-up; compare ARCHIVE to the expected subset from the Fuss log.
+  - Guess: Guess: after a restart, the source consumer might be recreated from the configured Start Sequence instead of its last processed position, re-copying already-copied messages.
+- **A chained mirror (mirroring a sourced stream) contains exactly what its origin has, and nothing else.** (process-kill, medium)
+  - Quote: > The _REPORT_ Stream does not listen for any incoming messages, it can only consume data from _ARCHIVE_.
+  - Inject: While data flows ORDERS/RETURNS → ARCHIVE → REPORT. Kill the server hosting ARCHIVE, the intermediate hop, then restart it.
+  - Observe: After all Lags reach 0, REPORT should equal ARCHIVE message-for-message in order, and ARCHIVE should equal the union of the sources.
+  - Workload: Create ORDERS and RETURNS as file streams; nats s add ARCHIVE --source ORDERS --source RETURNS; nats s add REPORT --mirror ARCHIVE; publish 100+100 as in the spec, scaled to thousands; kill -9 the ARCHIVE host mid-flow; restart; diff REPORT against ARCHIVE.
+  - Guess: Guess: if ARCHIVE re-copies a duplicate after its crash, REPORT will faithfully mirror the duplicate, and the error propagates down the chain.
+- **After writing 100 messages to each of two sources, the sourced stream ends with exactly 200 messages and its mirror with exactly 200, with 0 lost.** (process-kill, medium)
+  - Quote: > We can now see from a Stream Report that the data has been replicated:
+  - Inject: In the middle of the two `nats req --count 100` runs. Kill the server hosting ARCHIVE or REPORT, then restart it.
+  - Observe: `nats s report` shows ARCHIVE = REPORT = the number of acked publishes to the sources, the Lost column is 0, and the replication report has Lag 0 with an empty Error column.
+  - Workload: Replicate the spec setup with file-backed sources; nats req ORDERS.new 'ORDER {{Count}}' --count 100 & nats req RETURNS.new 'RETURN {{Count}}' --count 100; kill -9 during the runs; restart; poll `nats s report` until Lag 0; compare counts to the Fuss ack log.
+  - Guess: Guess: counts may converge to more than 200 because of re-fetch duplicates after a crash, since the spec does not say sourcing is deduplicated.
+- **The reported Lag reflects how far the mirror or source is behind, and returns to 0 once caught up.** (restart, low)
+  - Quote: > Here the `Lag` is how far behind we were reported as being last time we saw a message.
+  - Inject: While the mirror is behind. Restart the mirror's server and watch Lag during and after recovery.
+  - Observe: Lag decreases to 0 after recovery, and Lag 0 coincides with the mirror message count equaling the origin's. Watch for Lag 0 reported while messages are still missing.
+  - Workload: Stop the mirror's server; publish 5000 msgs to the origin; start the mirror's server; poll `nats s info MIR` every 200ms, logging Lag and message counts to Fuss; check that Lag 0 implies equal counts.
+  - Guess: Guess: per the wording, Lag is the value from the last message seen, so it may be stale. It could read 0 right after a restart before any fetch has happened.
+
+## jetstream-streams.md
+
+- **A message the server has acknowledged on a JetStream publish is stored and stays readable after a crash and restart.** (process-kill, high)
+  - Quote: > You can do a normal publish to the subject for unacknowledged delivery, though it’s better to use the JetStream publish calls instead as the JetStream server will reply with an acknowledgement that it was successfully stored.
+  - Inject: Send SIGKILL to nats-server right after a stream of acked publishes, ideally within milliseconds of the last ack.
+  - Observe: Fuss logs every PubAck (stream and sequence) to its own history file. After restart, Fuss reads the stream back with an ordered consumer or direct get. Every acked sequence must exist with the same subject and payload.
+  - Workload: nats stream add S --subjects 'o.>' --storage file --replicas 1; loop: js.Publish('o.N', payload N) and record the ack seq; kill -9 the server; restart it with the same config; nats stream view S, or fetch seq 1..max; diff against the history.
+  - Guess: Guess: the default sync interval may let the server ack before the data is fsynced. A kill -9 alone leaves the OS page cache intact, so to see real loss Fuss may need to stop the whole VM or container or drop the page cache. A plain process kill may never show it. Fuss can only set the sync interval through documented config.
+- **When the disk fills up, the server must not ack a publish it could not durably store.** (disk-full, medium)
+  - Quote: > You can do a normal publish to the subject for unacknowledged delivery, though it’s better to use the JetStream publish calls instead as the JetStream server will reply with an acknowledgement that it was successfully stored.
+  - Inject: Fill the filesystem that holds the JetStream store directory partway through a publish loop.
+  - Observe: Every publish that got a positive PubAck must be readable after space is freed and the server restarts. Publishes that failed or timed out may be present or absent, but none may be present more than once or corrupted.
+  - Workload: Use a small loopback or tmpfs filesystem as store_dir. Publish in a loop and record ack or error per message. Run fallocate to fill the disk. Keep publishing for a while, then free space, restart the server, and read the whole stream back.
+  - Guess: Guess: a partial block write on ENOSPC could leave a torn record, so recovery truncates past messages that were already acked.
+- **Republishing the same Nats-Msg-Id inside the duplicate window stores the message only once, including when the publish is retried after a crash.** (process-kill, high)
+  - Quote: > Streams support deduplication using a `Nats-Msg-Id` header and a sliding window within which to track duplicate messages.
+  - Inject: Kill the server after a publish is sent but before or just after its ack arrives. The client then retries with the same Msg-Id after restart, still inside the window.
+  - Observe: Count stored messages carrying each Msg-Id. There must be at most one per Msg-Id. The retry's PubAck should report duplicate=true, or the same sequence as the original.
+  - Workload: nats stream add S --subjects 'd.>' --dupe-window 2m; for i: publish with header Nats-Msg-Id=id-i; kill -9 at random; restart; republish every id whose ack was unknown or seen; read the stream and group by Msg-Id.
+  - Guess: Guess: the duplicate-tracking state may be rebuilt from disk on restart only partially, or may live only in memory, so a retry after restart gets stored a second time.
+- **With DiscardNew, the stream never holds more than its limit and extra publishes are refused. With DiscardOld, only the oldest messages are removed.** (concurrent-calls, high)
+  - Quote: > Upon reaching message limits, the server will automatically discard messages either by removing the oldest messages to make room for new ones (`DiscardOld`) or by refusing to store new messages (`DiscardNew`).
+  - Inject: Run many concurrent publishers while the stream sits right at its limit, optionally with a process kill in the middle.
+  - Observe: DiscardNew: the number of acked messages is at most MaxMsgs, and every acked message is still present. DiscardOld: the surviving messages are exactly the newest MaxMsgs by sequence, with no gaps in the middle.
+  - Workload: nats stream add S --max-msgs 100 --discard new; run 20 goroutines that publish 50 messages each; record acks and errors; read the stream; repeat with --discard old.
+  - Guess: Guess: the limit check and the append race under concurrency, so the stream briefly or permanently goes over the limit, or acks a message it then drops.
+- **The MaxMsgs limit is still enforced correctly after a crash and restart.** (restart, medium)
+  - Quote: > Maximum number of messages stored in the stream. Adheres to Discard Policy, removing oldest or refusing new messages if the Stream exceeds this number of messages.
+  - Inject: Kill the server while publishes are pushing the stream over MaxMsgs, then restart it.
+  - Observe: After restart, nats stream info shows a message count at or below MaxMsgs. The first and last sequences agree with the history: newest kept for DiscardOld, no acked message missing for DiscardNew.
+  - Workload: nats stream add S --max-msgs 1000 --discard old; publish 5000 messages; kill -9 midway; restart; nats stream info S; read the first and last sequences.
+  - Guess: Guess: recovery rebuilds the message count from block files and may count messages that were deleted but not yet compacted.
+- **Stream bytes never exceed MaxBytes, under load and after restart.** (concurrent-calls, medium)
+  - Quote: > Maximum number of bytes stored in the stream. Adheres to Discard Policy, removing oldest or refusing new messages if the Stream exceeds this size.
+  - Inject: Run concurrent large publishes near the byte limit, followed by a restart.
+  - Observe: The bytes reported by nats stream info stay at or below MaxBytes. With DiscardNew, every acked message is still present.
+  - Workload: nats stream add S --max-bytes 1MB --discard new; publish 10KB messages from 10 clients concurrently; record acks; restart; check stream info and read back.
+  - Guess: Guess: byte accounting may be done after the append, which allows an overshoot under concurrency.
+- **Messages are removed once they are older than MaxAge, and not removed before that.** (clock-skew, medium)
+  - Quote: > For example, if `MaxAge` is set to one minute, the server will automatically delete messages older than one minute with this policy.
+  - Inject: Step the server host clock forward by a large amount, and separately backward, while the stream holds messages of known age.
+  - Observe: Fuss checks the stored message timestamps and its own wall-clock record. It flags messages deleted well before MaxAge by real elapsed time, and messages that survive far past MaxAge after a backward jump.
+  - Workload: nats stream add S --max-age 1m; publish 100 messages; jump the server clock +2h with faketime or date -s; poll stream info for the message count; repeat with a -2h jump and wait 2 real minutes.
+  - Guess: Guess: expiry compares stored wall-clock timestamps with the current wall clock, so a forward jump instantly purges fresh data and a backward jump keeps data forever.
+- **In a work-queue stream, a message whose ack was confirmed is deleted and never delivered again, even across crashes.** (process-kill, high)
+  - Quote: > `WorkQueuePolicy` - Retention with the typical behavior of a FIFO queue. Each message can be consumed only once. This is enforced by only allowing _one_ consumer to be created _per subject_ for a work-queue stream (i.e. the consumers' subject filter(s) must _not_ overlap). Once a given message is ack’ed, it will be deleted from the stream.
+  - Inject: Kill the server just after the consumer sends an ack, especially a double-ack, i.e. AckSync, that the server confirmed.
+  - Observe: Fuss records each message whose AckSync succeeded. After restart, none of those may be redelivered, and none may appear in the stream when read with direct get by sequence.
+  - Workload: nats stream add Q --retention work --subjects 'q.>'; nats consumer add Q W --pull --ack explicit; publish 1000 messages; fetch and AckSync in a loop; kill -9 at random; restart; keep fetching; check for redelivery of confirmed-acked sequences.
+  - Guess: Guess: the ack is applied to consumer state but the stream-side delete is flushed later, so after a crash the message comes back as pending.
+- **The server refuses to create overlapping consumers on a work-queue stream, even when the create requests are concurrent.** (concurrent-calls, medium)
+  - Quote: > Each message can be consumed only once. This is enforced by only allowing _one_ consumer to be created _per subject_ for a work-queue stream (i.e. the consumers' subject filter(s) must _not_ overlap).
+  - Inject: Send many consumer-create requests with overlapping filters at the same moment.
+  - Observe: At most one of the overlapping consumers succeeds. nats consumer ls shows no two consumers with overlapping filters, before and after restart.
+  - Workload: nats stream add Q --retention work --subjects 'q.>'; from 10 clients at once, nats consumer add Q Ci --filter 'q.>'; list consumers; restart; list again.
+  - Guess: Guess: the overlap check and the consumer registration are not done under one lock, so two creates both pass the check.
+- **Messages that ran out of MaxDeliver attempts on a work-queue stream are not dropped, including across restarts.** (restart, medium)
+  - Quote: > Messages that have attempted redelivery and have reached `MaxDeliver` attempts for the consumer will remain in the stream and must be manually deleted via the JetStream API.
+  - Inject: Restart the server after messages have hit MaxDeliver without being acked.
+  - Observe: Direct get by sequence still returns those messages after restart, and nats stream info counts them.
+  - Workload: nats stream add Q --retention work; nats consumer add Q W --pull --max-deliver 2 --ack-wait 1s; publish 10 messages; fetch them twice and never ack; restart; get each sequence directly.
+  - Guess: Guess: recovery may treat max-delivered messages like acked ones and remove them.
+- **An interest-policy message is kept until every interested consumer acks it, and is not deleted early even after a crash.** (process-kill, high)
+  - Quote: > Once a given message is ack’ed by _all_ consumers filtering on the subject, the message is deleted (same behavior as `WorkQueuePolicy`).
+  - Inject: Kill the server after one of two consumers has acked a message but before the second has.
+  - Observe: After restart, the second consumer still receives every message it never acked. No message is lost while any consumer still has interest in it.
+  - Workload: nats stream add I --retention interest --subjects 'i.>'; add durable pull consumers A and B; publish 500 messages; A fetches and acks all; kill -9; restart; B fetches everything and Fuss checks that all 500 arrive.
+  - Guess: Guess: after restart, interest state is rebuilt from a stale consumer snapshot, so messages look fully acked and get deleted.
+- **Once a stream is sealed, no message disappears and the seal holds across restarts.** (restart, medium)
+  - Quote: > Sealed streams do not allow messages to be deleted via limits or API, sealed streams can not be unsealed via configuration update.
+  - Inject: Seal the stream, then kill and restart the server. Also inject a clock jump past MaxAge.
+  - Observe: The message set is identical before and after the restart and the clock jump. Delete, purge and unseal requests are all refused.
+  - Workload: nats stream add S --max-age 1m; publish 100 messages; nats stream seal S; kill -9; restart; jump the clock +1h; read all messages; try nats stream rmm and nats stream purge.
+  - Guess: Guess: the age-expiry timer runs during recovery before the sealed flag is loaded.
+- **With DenyDelete set, message delete calls are refused, including after a restart.** (restart, medium)
+  - Quote: > Restricts the ability to delete messages from a stream via the API.
+  - Inject: Restart the server after creating the stream with DenyDelete, then issue delete calls.
+  - Observe: Delete API calls return an error and the message is still readable.
+  - Workload: nats stream add S --deny-delete; publish; kill -9; restart; nats stream rmm S 1; nats stream get S 1.
+  - Guess: Guess: the flag may not persist into the stream metadata file that is reloaded on restart.
+- **With DenyPurge set, purge calls are refused, including after a restart.** (restart, medium)
+  - Quote: > Restricts the ability to purge messages from a stream via the API.
+  - Inject: Restart the server after creating the stream with DenyPurge, then issue purge calls.
+  - Observe: The purge call errors and the message count is unchanged.
+  - Workload: nats stream add S --deny-purge; publish 100 messages; kill -9; restart; nats stream purge S -f; nats stream info S.
+  - Guess: Guess: same as DenyDelete, the config flag may be lost on reload.
+- **An atomic batch is either stored completely or not at all, even if the server is killed mid-batch.** (process-kill, medium)
+  - Quote: > If set, allows atomically writing a batch of N messages into the stream.
+  - Inject: Kill the server after some of the batch messages have been sent but before the commit message, and also right after the commit is sent.
+  - Observe: After restart, each batch id has either all N of its messages, in order and contiguous, or none of them. A batch whose commit was acked must be fully present.
+  - Workload: nats stream add S --allow-batch (AllowAtomicPublish=true); a client publishes N messages carrying the Nats-Batch-Id / Nats-Batch-Sequence headers and a commit header on the last one; kill -9 at random points; restart; read and group by batch id.
+  - Guess: Guess: the batch is staged and then applied as several appends, so a crash during the apply leaves a prefix of the batch on disk.
+- **After an acked rollup, the older messages in its scope are gone and do not come back after a crash.** (process-kill, medium)
+  - Quote: > The `Nats-Rollup: all` header will purge all prior messages in the stream. Whereas the `sub` value will purge all prior messages for a given subject.
+  - Inject: Kill the server immediately after the rollup publish is acked.
+  - Observe: After restart, only the rollup message and later messages remain in scope (the whole stream for all, the subject for sub). The rollup message itself is present.
+  - Workload: nats stream add S --allow-rollup; publish 100 messages on s.a; publish with header Nats-Rollup: sub on s.a; kill -9; restart; read all s.a messages.
+  - Guess: Guess: the purge is recorded lazily as tombstones, and a crash replays the old blocks without them.
+- **A message only gets republished after it has been written, so every republished message must be in the stream, and republish order follows stream order.** (process-kill, high)
+  - Quote: > If enabled, the `RePublish` stream option will result in the server re-publishing messages received into a stream automatically and immediately after a successful write, to a distinct destination subject.
+  - Inject: Kill the server while publishes and republishes are flowing.
+  - Observe: Fuss subscribes to the destination and logs each republished message's Nats-Sequence header. After restart, every logged sequence must exist in the stream with the same data, and the logged sequences must be strictly increasing.
+  - Workload: nats stream add S --subjects 'r.>' with republish src 'r.>' dest 'rp.>'; nats sub 'rp.>' and log it; publish in a loop; kill -9; restart; compare the log to the stream contents.
+  - Guess: Guess: the republish fires after the in-memory append but before the data is durable, so a crash leaves republished messages that the stream no longer has.
+- **A mirror eventually holds every origin message in the same order, without duplicates, even if the server restarts during replication.** (restart, high)
+  - Quote: > When a stream is configured with a `source` or `mirror`, it will automatically and asynchronously replicate messages from the origin stream.
+  - Inject: Kill and restart the server while the mirror is catching up on a large backlog.
+  - Observe: Once publishing stops and things settle, the mirror's messages match the origin's one-for-one, with the same order and payloads and no duplicates or gaps.
+  - Workload: nats stream add O --subjects 'o.>'; nats stream add M --mirror O; publish 10000 messages to O; kill -9 during the mirror's catch-up; restart; wait; compare O and M message by message.
+  - Guess: Guess: the mirror's record of its last origin sequence is persisted separately from its data, so after a crash it re-fetches or skips a range.
+- **Deleting or publishing on a sourcing stream never changes the origin stream, including across restarts.** (restart, low)
+  - Quote: > Changes to the source or mirror, e.g. deleting messages or publishing, do not reflect on the origin stream.
+  - Inject: Restart after deleting messages from the mirror or source stream.
+  - Observe: The origin's message set and sequences are unchanged. The mirror does not re-pull the messages that were deleted from it.
+  - Workload: Set up O and mirror M; publish 100 messages; nats stream rmm M 5; kill -9; restart; read O (all 100 present) and M.
+  - Guess: Guess: on restart, the mirror might rewind and re-fetch the deleted messages.
+- **Each subject keeps at most MaxMsgsPerSubject messages, the newest ones, under concurrency and after restart.** (concurrent-calls, medium)
+  - Quote: > Limits maximum number of messages in the stream to retain _per subject_.
+  - Inject: Run concurrent publishes to the same subject, then kill and restart.
+  - Observe: For each subject, the stored count is at most the limit, and the stored messages are the latest acked ones for that subject.
+  - Workload: nats stream add S --max-msgs-per-subject 3; 10 clients publish to s.k concurrently; kill -9; restart; nats stream subjects S and read s.k.
+  - Guess: Guess: the per-subject index is rebuilt on recovery and miscounts, so old entries stay.
+- **Once a subject is full, new publishes to that subject are refused and the existing ones are kept.** (concurrent-calls, medium)
+  - Quote: > If true, applies discard new semantics on a per subject basis. Requires `DiscardPolicy` to be `DiscardNew` and the `MaxMsgsPerSubject` to be set.
+  - Inject: Run concurrent publishes to a subject that is at its per-subject limit.
+  - Observe: Acked messages for the subject never exceed the limit, and all acked messages are still present.
+  - Workload: nats stream add S --discard new --discard-per-subject --max-msgs-per-subject 1; 20 clients publish to s.k concurrently; count acks; read s.k.
+  - Guess: Guess: a check-then-append race lets two publishes both succeed.
+- **When the last message of a subject expires, a delete marker shows up for that subject.** (clock-skew, low)
+  - Quote: > If set, a subject delete marker will be placed after the last message of a subject ages out.
+  - Inject: Jump the server clock forward past MaxAge, and separately restart the server across the expiry moment.
+  - Observe: Exactly one marker message appears for each subject whose last message expired. No marker appears while a live message still exists.
+  - Workload: nats stream add S --max-age 30s --subject-delete-marker-ttl 1m (with AllowMsgTTL); publish one message per subject; wait or jump the clock; read the stream and look for markers.
+  - Guess: Guess: expiry handled during recovery may skip writing markers, or write duplicate markers.
+- **Scheduled messages are delivered at their scheduled time, exactly once, even across restarts.** (restart, low)
+  - Quote: > If set, allows message scheduling in the stream.
+  - Inject: Kill the server shortly before a schedule's due time and restart it after that time. Also apply clock skew.
+  - Observe: Each scheduled message appears in the stream exactly once, not before its due time by Fuss's clock, and not lost across the restart.
+  - Workload: nats stream add S with AllowMsgSchedules; publish schedule messages due in 30s using the documented schedule headers; kill -9 at 25s; restart at 40s; read the target subject.
+  - Guess: Guess: the schedule state may not be durable, or the server may re-fire it after restart and duplicate it. The spec gives no detail, so the exact expected behavior is unclear.
+- **The counter value equals the sum of acked increments, even under concurrency and crashes.** (process-kill, low)
+  - Quote: > If set, the stream will function as a counter stream, hosting distributed counter CRDTs.
+  - Inject: Kill the server during concurrent increments.
+  - Observe: After restart, the counter value read from the stream lies between the sum of acked increments and the sum of all attempted increments.
+  - Workload: nats stream add C with AllowMsgCounter; 10 clients publish increment headers to c.x; kill -9; restart; read the last message on c.x.
+  - Guess: Guess: the running total is computed in memory and may lose acked increments on crash. The spec does not define the counter semantics.
+- **Messages on a subject that was later removed from the stream config stay readable, including after a restart.** (restart, medium)
+  - Quote: > Note, if messages are stored by a stream on a subject that is subsequently removed from the stream config, consumers will still observe those messages if their subject filter overlaps.
+  - Inject: Restart the server after removing the subject from the stream config.
+  - Observe: A consumer filtered on the old subject still receives every message stored before the change.
+  - Workload: nats stream add S --subjects 'a.>,b.>'; publish to b.x; nats stream edit S --subjects 'a.>'; kill -9; restart; nats consumer add S C --filter 'b.>'; fetch everything.
+  - Guess: Guess: recovery may prune messages on subjects that are no longer in the config.
+- **Compressed file storage gives back the exact stored messages after a crash.** (process-kill, medium)
+  - Quote: > If file-based and a compression algorithm is specified, the stream data will be compressed on disk.
+  - Inject: Kill the server during heavy writes to an s2-compressed stream.
+  - Observe: Acked messages read back byte-identical after restart. Fuss can also check, read-only, that the block files are not plaintext.
+  - Workload: nats stream add S --compression s2; publish random payloads and record hashes; kill -9; restart; read back and compare hashes.
+  - Guess: Guess: a block is compressed when sealed, and a crash during compression leaves a block that cannot be decoded.
+
+## jetstream.md
+
+- **Messages acknowledged on a file-based stream are already in the OS page cache, so killing only the nats-server process (not the OS) should not lose them.** (process-kill, high)
+  - Quote: > However, while JetStream does flush file writes to the OS synchronously, under the default configuration it does not immediately `fsync` data to disk.
+  - Inject: SIGKILL nats-server immediately after a burst of publish acks is received, well inside the default 2-minute sync_interval.
+  - Observe: After restart, every sequence and Msg-Id that Fuss recorded as acked is returned by `nats stream get` or a full replay. The stream's last sequence is at least the highest acked sequence.
+  - Workload: nats stream add S --subjects s.> --storage file --replicas 1; loop `nats pub s.x <id> --jetstream` while logging each ack's seq; kill -9; restart nats-server with the same -js -sd dir; replay with an ephemeral consumer using deliver all and compare against the log.
+  - Guess: Guess: unflushed in-process buffers (for example, write coalescing in the filestore) could hold acked data that was not yet written to the OS when the process died.
+- **Every acknowledged publish takes effect atomically at a single point between request and ack, consistent with real-time order.** (process-kill, high)
+  - Quote: > For writes (publications to a stream), the formal consistency model of NATS JetStream is [Linearizable](https://jepsen.io/consistency/models/linearizable).
+  - Inject: Kill or restart the stream leader (or random cluster nodes) while concurrent publishers are in flight.
+  - Observe: Feed Fuss's log of publish invocations, acks, errors and timeouts, plus the final stream contents, to a linearizability checker. No acked write may be missing. No write may appear ordered before a write that completed before it started. Timed-out writes may appear or not, but at most once.
+  - Workload: Start a 3-node cluster from config files; nats stream add S --replicas 3; N concurrent clients publish unique payloads with timestamps logged; kill -9 the leader mid-run; restart it; read the full stream and check.
+  - Guess: Guess: a leader change could let a deposed leader ack a write that the new leader never sees.
+- **In a cluster, stream state stays immediately consistent across failures, with no divergent histories between replicas.** (restart, medium)
+  - Quote: > JetStream uses a NATS optimized RAFT distributed quorum algorithm to distribute the persistence service between NATS servers in a cluster while maintaining immediate consistency (as opposed to [eventual consistency](https://en.wikipedia.org/wiki/Eventual\_consistency)) even in the face of failures.
+  - Inject: Rolling kill and restart of nodes, including a minority isolated by stopping and restarting processes, during continuous publishing.
+  - Observe: After healing, direct-get requests sent to each replica by sequence return identical messages. Read-only inspection of each node's storage directory shows the same last sequence. No sequence maps to two different payloads across the observation log.
+  - Workload: 3-node cluster; nats stream add S --replicas 3 --allow-direct; continuous publish; repeatedly kill -9 one node and restart it; at the end run `nats stream get S <seq>` against each server and compare.
+  - Guess: Guess: catch-up after restart could truncate or skip entries if a snapshot and the log disagree.
+- **One client's writes are applied in the order issued, and a client never reads an older state after reading a newer one.** (restart, medium)
+  - Quote: > Do note, while we do guarantee immediate consistency when it comes to [monotonic writes](https://jepsen.io/consistency/models/monotonic-writes) and [monotonic reads](https://jepsen.io/consistency/models/monotonic-reads).
+  - Inject: Kill and restart the leader, or the server the client is connected to, between successive reads or writes from the same client.
+  - Observe: Per client, the stream sequences of its sequential publishes strictly increase. Successive reads of the stream's last sequence or last message never go backwards.
+  - Workload: One client publishes p1..pn synchronously and logs seqs; another client repeatedly runs `nats stream info S` or gets the last message by subject, logging the results; kill the leader periodically.
+  - Guess: Guess: reads served by a lagging follower or mirror after failover could return an older last-seq.
+- **All messages get one global order with unique, gap-free sequence numbers, and compare-and-publish (expected last sequence) lets clients control that order.** (concurrent-calls, high)
+  - Quote: > On the read side (listening to or replaying messages from streams) the formal models don't really apply because JetStream does not support atomic batching of multiple operations together (so the only kind of 'transaction' is the persisting, replicating and voting of a single operation on the stream) but in essence, JetStream is [serializable](https://jepsen.io/consistency/models/serializable) because messages are added to a stream in one global order (which you can control using compare and publish).
+  - Inject: Many clients publish with the Nats-Expected-Last-Sequence header at once, with a leader kill mixed in.
+  - Observe: Every consumer sees the same order. At most one publisher succeeds for each expected-last-sequence value. Sequence numbers are unique, and the only gaps are explained by deletes.
+  - Workload: Concurrent clients read the last seq, then publish with header Nats-Expected-Last-Sequence=<seq>; log successes and failures; replay the stream from two independent consumers and compare orders.
+  - Guess: Guess: the expected-sequence check might be evaluated before replication, so two publishers could both pass around a leader change.
+- **An ack from a replicated stream means a majority holds the message, so losing a minority right after the ack loses nothing.** (process-kill, high)
+  - Quote: > In a replicated setup, a published message is acknowledged after it successfully replicated to at least a quorum of servers.
+  - Inject: kill -9 the stream leader the instant Fuss receives a publish ack.
+  - Observe: After a new leader is elected, the acked message is present at its acked sequence.
+  - Workload: 3-node cluster, R3 stream; publish a message, receive the ack, immediately kill -9 the leader; query `nats stream get S <seq>` through the remaining nodes.
+  - Guess: Guess: the ack might be sent once the leader commits locally, before follower acknowledgements are actually counted.
+- **An R3 stream stays available for reads and writes, and loses no acked data, when any one of its servers is down.** (process-kill, high)
+  - Quote: > Replicas=3 - Can tolerate the loss of one server servicing the stream. An ideal balance between risk and performance.
+  - Inject: Kill any single replica (leader or follower) and keep it down while the workload continues.
+  - Observe: After a brief election, publishes keep getting acks. Earlier acked messages remain readable. No acked message is lost after the node returns.
+  - Workload: 3-node cluster; nats stream add S --replicas 3; continuous publish and consume; kill -9 one node for 60s; restart; verify against the log.
+  - Guess: Guess: a stuck leader election, or a consumer leader placed on the dead node, could keep the stream unavailable longer than expected.
+- **An R5 stream survives two servers dying at the same moment with no acked data lost and service continuing.** (process-kill, high)
+  - Quote: > Replicas=5 - Can tolerate simultaneous loss of two servers servicing the stream. Mitigates risk at the expense of performance.
+  - Inject: kill -9 two replicas simultaneously, including the leader, during publishing.
+  - Observe: Publishes resume with acks. Every previously acked message is readable from the surviving three nodes.
+  - Workload: 5-node cluster; nats stream add S --replicas 5; publish loop; kill two nodes at once; continue; restart them; verify.
+  - Guess: Guess: if the remaining three include a lagging follower, it might win the election and truncate.
+- **With sync_interval: always, every acked message is fsynced to disk before the ack, so even an OS crash cannot lose it.** (other, low)
+  - Quote: > Setting a lower `sync_interval` increases the frequency of disk writes, and reduces the window for potential data loss, but at the expense of performance. Additionally, setting `sync_interval: always` will make sure servers `fsync` after every message before it is acknowledged.
+  - Inject: Hard power-off or OS crash of the host or VM running nats-server right after acks (requires running nats-server inside a VM Fuss controls).
+  - Observe: After the VM reboots and nats-server restarts, every acked message is present in the replay.
+  - Workload: Config with jetstream { sync_interval: always }; nats stream add S --storage file; publish and log acks; hard-reset the VM; restart; replay and compare.
+  - Guess: Guess: metadata or index files might not be fsynced together with the message block, so recovery could discard the tail.
+- **With the default or a configured sync_interval, data acked longer ago than the interval survives an OS crash.** (other, low)
+  - Quote: > The data will be `fsync`-ed no later than this interval.
+  - Inject: Hard reset of the VM more than sync_interval after a batch of acks, with no further writes in between.
+  - Observe: Messages acked more than sync_interval before the crash are all present after reboot. Loss is allowed only within the final interval.
+  - Workload: Config sync_interval: 10s; publish batch A, wait 30s, publish batch B; hard-reset the VM within 1s; restart; batch A must be complete.
+  - Guess: Guess: the sync timer could be skipped or drift under load or wall-clock skew.
+- **A publish ack means the message was stored. A publish that fails, for example when the disk is full, must return an error and not be silently acked.** (disk-full, high)
+  - Quote: > When using the JetStream publish calls to publish to streams there is an acknowledgment mechanism between the publisher and the NATS server, and you have the choice of making synchronous or asynchronous (i.e. 'batched') JetStream publish calls.
+  - Inject: Fill the filesystem holding the JetStream store directory during a mixed synchronous and asynchronous publish burst, then free the space.
+  - Observe: Every acked message is present after space is freed and the server restarts. Every publish that got an error is either absent or appears at most once. No acked message is corrupted or truncated on replay.
+  - Workload: Put the store dir on a small tmpfs or loop device; nats stream add S --storage file; async publish loop logging acks and errors; fill the disk with a dd file; continue; delete the file; restart; replay.
+  - Guess: Guess: a write error on a message block might be detected only after the ack, or might leave a partial record that breaks recovery of later blocks.
+- **Republishing with the same Nats-Msg-Id within the duplicate window stores the message only once, even across crashes and retries.** (process-kill, high)
+  - Quote: > Therefore, JetStream also offers an '_exactly once_' quality of service. For the publishing side, it relies on the publishing application attaching a unique message or publication ID in a message header and on the server keeping track of those IDs for a configurable rolling period of time in order to detect the publisher publishing the same message twice.
+  - Inject: Kill the server (or leader) after it receives a publish but before the client gets the ack, then have the client retry with the same Msg-Id after restart.
+  - Observe: Each Msg-Id appears exactly once in the stream. Retry acks carry duplicate=true and the original sequence.
+  - Workload: nats stream add S --dupe-window 2m; publish with header Nats-Msg-Id:<uuid>, retrying on timeout with the same id; kill -9 and restart repeatedly; replay and count each id.
+  - Guess: Guess: the dedup ID table might live only in memory and not be rebuilt from stored messages on restart, so retries after a crash create duplicates.
+- **The duplicate window is a rolling time period, so wall-clock jumps should not make the server forget IDs early or block new ones.** (clock-skew, medium)
+  - Quote: > Therefore, JetStream also offers an '_exactly once_' quality of service. For the publishing side, it relies on the publishing application attaching a unique message or publication ID in a message header and on the server keeping track of those IDs for a configurable rolling period of time in order to detect the publisher publishing the same message twice.
+  - Inject: Step the server's clock forward past the dupe window between an original publish and its retry, or backward after a publish.
+  - Observe: A retry sent within the real elapsed window is still detected as a duplicate (or Fuss records the deviation). Distinct IDs are never rejected.
+  - Workload: nats stream add S --dupe-window 1m; publish id X; jump the clock +10m with faketime or a namespace clock; republish id X; check whether it is stored twice.
+  - Guess: Guess: window expiry is likely computed from wall-clock timestamps, so a forward jump expires IDs immediately.
+- **Once a consumer ack is confirmed by the server (double ack), that message is never redelivered, even after a server crash.** (process-kill, high)
+  - Quote: > For the subscribers a _double_ acknowledgment mechanism is used to avoid a message being erroneously re-sent to a subscriber by the server after some kinds of failures.
+  - Inject: kill -9 the server right after the client receives the ack confirmation for a message.
+  - Observe: After restart, no message whose ack confirmation Fuss logged is ever delivered again on that durable consumer.
+  - Workload: nats consumer add S C --pull --ack explicit; fetch, then AckSync (double ack) and log confirmation; kill -9; restart; keep fetching for longer than ack-wait; check for redeliveries of confirmed seqs.
+  - Guess: Guess: consumer ack state may be persisted lazily, so a crash rolls back the ack floor.
+- **Unacked messages are redelivered after ack-wait, and ack-all acknowledges every earlier message too. This must hold across restarts.** (restart, high)
+  - Quote: > * Some consumers support acknowledging _all_ the messages up to the sequence number of the message being acknowledged, some consumers provide the highest quality of service but require acknowledging the reception and processing of each message explicitly as well as the maximum amount of time the server will wait for an acknowledgment for a specific message before re-delivering it (to another process attached to the consumer).
+  - Inject: Restart the server while messages are delivered but unacked, or right after an ack-all.
+  - Observe: Every delivered-but-unacked message is eventually redelivered after restart. Nothing below an ack-all sequence is redelivered.
+  - Workload: Two consumers, one --ack explicit and one --ack all, with --wait 5s; fetch 10, ack some (or ack-all on #7); kill -9; restart; fetch again and compare redelivered seqs to the log.
+  - Guess: Guess: pending or redelivery state may not survive restart, causing lost messages or redelivery of acked ones.
+- **The ack-wait timeout governs redelivery timing, so clock jumps should not cause premature mass redelivery or indefinite stalls.** (clock-skew, medium)
+  - Quote: > * Some consumers support acknowledging _all_ the messages up to the sequence number of the message being acknowledged, some consumers provide the highest quality of service but require acknowledging the reception and processing of each message explicitly as well as the maximum amount of time the server will wait for an acknowledgment for a specific message before re-delivering it (to another process attached to the consumer).
+  - Inject: Jump the server clock forward or backward while messages are pending acks.
+  - Observe: Redelivery times measured on Fuss's own monotonic clock stay close to ack-wait. No message is stuck forever after a backward jump.
+  - Workload: Consumer --ack explicit --wait 30s; fetch messages without acking; step the server clock -1h or +1h; record when redeliveries arrive.
+  - Guess: Guess: if timers use wall-clock rather than monotonic time, a backward jump could delay redelivery by the size of the jump.
+- **A nak causes prompt redelivery, and an in-progress ack resets the ack-wait timer so the message is not redelivered while work continues.** (restart, medium)
+  - Quote: > * You can also send back _negative_ acknowledgements.
+* You can even send _in progress_ acknowledgments (to indicate that you are still processing the message in question and need more time before acking or nacking it).
+  - Inject: Restart the server or consumer leader between a +WPI (in progress) and the final ack, or right after a -NAK.
+  - Observe: Naked messages get redelivered. Messages kept alive with in-progress acks are not redelivered to another worker before ack-wait elapses after the last +WPI. Logs show no double processing where none should occur.
+  - Workload: Pull consumer --wait 10s; worker A fetches, sends +WPI every 5s for 30s, then acks; worker B fetches concurrently; inject a restart midway; check whether B ever received A's message.
+  - Guess: Guess: the in-progress deadline extension may not be persisted or replicated, so after failover the original deadline applies.
+- **In a work-queue stream, each message is consumed and removed once, and an acked message never reappears, even after crashes.** (process-kill, high)
+  - Quote: > * _work queue_ (the stream is used as a shared queue and messages are removed from it as they are consumed) is to provide the exactly-once consumption of messages in the stream.
+  - Inject: kill -9 the server while several pull workers fetch and ack concurrently.
+  - Observe: Across all workers, each message is acked successfully exactly once. After restart, acked messages are absent from the stream (stream info message count and first seq). No message is lost without an ack.
+  - Workload: nats stream add Q --retention work --subjects q.>; nats consumer add Q W --pull --ack explicit; publish 10k unique ids; 4 workers fetch with AckSync; kill -9 and restart repeatedly; tally.
+  - Guess: Guess: the removal on ack and the consumer ack floor could be persisted at different times, so a crash resurrects consumed messages.
+- **In an interest stream, a message stays until every defined consumer has handled it, so no message is dropped before a slow consumer gets it.** (restart, high)
+  - Quote: > * _interest_ (messages are kept in the stream for as long as there are consumers that haven't delivered the message yet) is a variation of work queue that only retains messages if there is interest (consumers currently defined on the stream) for the message's subject.
+  - Inject: Restart the server after a fast consumer has acked but before a slow consumer has fetched.
+  - Observe: After restart, the slow consumer still receives every message. Messages are removed only after all consumers ack.
+  - Workload: nats stream add I --retention interest; consumers FAST and SLOW; publish 1000; FAST acks all; kill -9; restart; SLOW fetches all 1000; stream count drops to 0 afterwards.
+  - Guess: Guess: interest checks on restart could run before all consumer states load, causing premature deletion.
+- **At a limit, discard-old drops the oldest messages, while discard-new rejects new publishes with an error and never acks them.** (concurrent-calls, high)
+  - Quote: > * _discard old_ means that the stream will automatically delete the oldest message in the stream to make room for the new messages.
+* _discard new_ means that the new message is discarded (and the JetStream publish call returns an error indicating that a limit was reached).
+  - Inject: Many concurrent publishers hit max-msgs or max-bytes at once, plus a restart at the limit.
+  - Observe: With discard new, the count of acked messages never exceeds the limit, every over-limit publish gets an error, and no errored message appears. With discard old, the stream holds exactly the newest N acked messages.
+  - Workload: nats stream add L --max-msgs 100 --discard new; 10 concurrent publishers send 50 each; count acks vs errors and stream contents; repeat with --discard old and verify the remaining seqs are the newest 100.
+  - Guess: Guess: a race between concurrent stores might let the limit check pass for several publishes, overshooting.
+- **Limits are enforced on limits, work-queue and interest streams alike, including after restart.** (restart, high)
+  - Quote: > Note that regardless of the retention policy selected, the limits (and the discard policy) _always_ apply.
+  - Inject: Restart the server when a work-queue or interest stream is at its limit.
+  - Observe: After restart, the stream never exceeds max-msgs or max-bytes, and discard behavior matches the configuration.
+  - Workload: nats stream add W --retention work --max-msgs 50 --discard new; publish 60 without consuming; check 10 errors; kill -9; restart; publish again and expect an error; count stays at 50.
+  - Guess: Guess: limit accounting might be recomputed incorrectly from disk after a crash.
+- **Messages older than max-age are removed, which should behave sanely under clock changes and restarts.** (clock-skew, medium)
+  - Quote: > * Maximum message age.
+  - Inject: Step the server clock forward by more than max-age, or backward, while the stream holds messages, and restart.
+  - Observe: Fuss records whether messages younger than max-age (by its own clock) vanish after a forward jump, and whether expiry stops after a backward jump. Also checks that expiry still happens after restart.
+  - Workload: nats stream add A --max-age 1m; publish 100; jump the clock +2h; check the stream count; separately publish, kill -9, wait 2m, restart, and confirm the messages expired.
+  - Guess: Guess: expiry uses wall-clock message timestamps, so a forward jump instantly purges fresh data.
+- **Messages over max-msg-size are rejected with an error, and creating consumers beyond max-consumers fails, even under concurrency.** (concurrent-calls, high)
+  - Quote: > * Maximum individual message size.
+* You can also set limits on the number of consumers that can be defined for the stream at any given point in time.
+  - Inject: Many clients create consumers concurrently at the limit, and publish oversize messages.
+  - Observe: Successful consumer creations never exceed the limit (`nats consumer ls`). Oversize publishes get errors and never appear in the stream.
+  - Workload: nats stream add C --max-consumers 5 --max-msg-size 1024; 20 parallel `nats consumer add` calls; publish a 2KB payload; verify.
+  - Guess: Guess: concurrent consumer creation might check the count before inserting, exceeding the limit.
+- **Deliver-all replays every stored message in order, and replay-original preserves the original inter-message timing.** (clock-skew, medium)
+  - Quote: > * _all_ of the messages currently stored in the stream, meaning a complete 'replay' and you can select the 'replay policy' (i.e. the speed of the replay) to be either:
+  * _instant_ (meaning the messages are delivered to the consumer as fast as it can take them).
+  * _original_ (meaning the messages are delivered to the consumer at the rate they were published into the stream, which can be very useful for example for staging production traffic).
+  - Inject: Skew the server clock during an original-rate replay, or restart mid-replay.
+  - Observe: The replay contains all stored seqs in increasing order. With original replay, inter-arrival gaps on Fuss's monotonic clock match the publish gaps from its log.
+  - Workload: Publish 20 messages 1s apart; create a consumer --deliver all --replay original; measure arrival gaps; jump the clock mid-replay.
+  - Guess: Guess: original-rate pacing may compute delays from wall-clock timestamps, so skew causes bursts or long stalls.
+- **Consumers can start exactly at the last message, the last message per subject, a given sequence, or a given time.** (restart, high)
+  - Quote: > * the _last_ message stored in the stream, or the _last message for each subject_ (as streams can capture more than one subject).
+* starting from a specific _sequence number_.
+* starting from a specific _start time_.
+  - Inject: Restart the server between publishing and creating or resuming the consumer.
+  - Observe: The first delivered message matches the expected seq, per-subject last values, or first message at or after the start time according to Fuss's log.
+  - Workload: Publish to s.a, s.b, s.c multiple times; kill -9 and restart; create consumers with --deliver last-per-subject, --deliver 42, and --deliver <time>; compare first deliveries.
+  - Guess: Guess: per-subject index or time index rebuilt after a crash could be stale, giving wrong start points.
+- **Ordered consumers deliver stream messages in strict sequence order without gaps or duplicates, even across server disruptions.** (restart, medium)
+  - Quote: > Client applications can choose to use fast un-acknowledged `push` (ordered) consumers to receive messages as fast as possible (for the selected replay policy) on a specified delivery subject or to an inbox.
+  - Inject: Restart or kill the server the ordered consumer is attached to mid-replay.
+  - Observe: The sequence of stream seqs received by the client is strictly increasing and contiguous (except for deleted seqs).
+  - Workload: Publish 50k messages; start an ordered consumer (for example `nats sub --stream S` with the ordered option, or the client OrderedConsumer); kill -9 and restart the server midway; check received seqs.
+  - Guess: Guess: the client-side reset after a server restart may resume from the wrong seq, causing gaps.
+- **Several clients sharing one pull consumer split the messages between them without loss, and the remaining clients pick up when one dies.** (process-kill, high)
+  - Quote: > Pull consumers can and are meant to be shared between applications (just like queue groups) in order to provide easy and transparent horizontal scalability of the processing or consumption of messages in a stream without having (for example) to worry about having to define partitions or worry about fault-tolerance.
+  - Inject: kill -9 one worker process holding unacked messages, and separately restart the server.
+  - Observe: Every message is eventually acked by some worker. Messages held by the dead worker are redelivered to others after ack-wait. Concurrently delivered messages are not given to two workers within ack-wait.
+  - Workload: Pull consumer --ack explicit --wait 5s; 4 worker processes fetch batches of 10; kill one worker; restart the server once; tally acks per message id.
+  - Guess: Guess: outstanding pull requests from a dead client may keep absorbing messages until they expire.
+- **A mirror eventually contains every origin message in the same order, and a sourcing stream gets every source message once, even after restarts.** (restart, high)
+  - Quote: > JetStream also allows server administrators to easily mirror streams, for example between different JetStream domains in order to offer disaster recovery. You can also define a stream that 'sources' from one or more other streams.
+  - Inject: Kill and restart the server hosting the mirror or sourcing stream while the origin keeps receiving publishes.
+  - Observe: After catch-up, mirror contents equal origin contents seq by seq. Sourced streams contain each origin message exactly once.
+  - Workload: nats stream add O; nats stream add M --mirror O; nats stream add X --source O; publish continuously; kill -9 and restart; compare the streams.
+  - Guess: Guess: the source position may be checkpointed lazily, so a restart re-sources messages, creating duplicates in X.
+- **KV create succeeds for only one client when a key is absent, and update succeeds only if the revision matches, under concurrency and crashes.** (concurrent-calls, high)
+  - Quote: > The Key Value store supports atomic `create` and `update` operations. This enables pessimistic locks (by creating a key and holding on to it) and optimistic locks (using CAS - compare and set).
+  - Inject: Many clients race create or update on the same key, with a leader kill mid-race.
+  - Observe: Exactly one create succeeds per key lifetime. Each revision is produced by exactly one successful update. No two clients both believe they hold the lock. Values form a single linear history.
+  - Workload: nats kv add B --replicas 3; 10 clients loop: get key k with revision r, then `nats kv update B k <v> r`; also race `nats kv create B lock`; kill the leader during the run; check the history.
+  - Guess: Guess: a retry after a timed-out CAS could succeed twice if the expected-revision check is not re-evaluated after failover.
+- **Watchers see every change in order, and history lists all retained values and deletes for a key, even across restarts.** (restart, medium)
+  - Quote: > You can subscribe to changes in a Key Value on the bucket or individual key level with `watch` and optionally retrieve a `history` of the values (and deletions) that have happened on a particular key.
+  - Inject: Restart the server while watchers are active and updates continue.
+  - Observe: The watch stream's revisions strictly increase, and the final value matches the last successful put. `nats kv history` contains every acked put and delete within the history limit, in order.
+  - Workload: nats kv add B --history 64; watcher on k; writer does puts and deletes, logging revisions; kill -9 and restart; compare watcher output and history to the log.
+  - Guess: Guess: a watcher reconnecting after restart may skip updates made during the outage.
+- **A large object put either completes and reads back byte-identical, or is not visible as a complete object, even if the server dies mid-upload.** (process-kill, medium)
+  - Quote: > The key being replaced by a file name and value being designed to store arbitrarily large `objects` (e.g. files, even if they are very large) rather than 'values' that are message-sized (i.e. limited to 1Mb by default). This is achieved by chunking messages.
+  - Inject: kill -9 the server partway through a multi-chunk object put.
+  - Observe: After restart, `nats object get` either fails or returns bytes whose digest matches the original. A completed put always reads back intact.
+  - Workload: nats object add O; nats object put O bigfile (500MB); kill -9 midway; restart; nats object ls and get; compare sha256.
+  - Guess: Guess: chunks may persist without the final metadata message, or the metadata may reference missing chunks after a crash.
+- **After faults end, the cluster returns to a working, consistent state without manual intervention.** (restart, low)
+  - Quote: > * The system must self-heal.
+  - Inject: After a series of kills, restarts and disk-full episodes, stop injecting faults.
+  - Observe: Within a bounded time, all streams and consumers report leaders, publishes and fetches succeed, and replicas converge to identical state.
+  - Workload: Run a random fault schedule on a 3-node cluster for 10 minutes; then idle; poll `nats stream info` and `nats consumer info` until healthy, and run a final publish and consume check.
+  - Guess: Guess: a replica that crashed during disk-full may stay permanently out of sync and need a manual peer-remove.
+

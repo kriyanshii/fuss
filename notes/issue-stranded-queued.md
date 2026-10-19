@@ -144,3 +144,7 @@ and here it cannot recover the run.
 - macOS 26.6.2 (25G83), APFS
 - Dagu built from source at `9f5966a2c` (`dagu version` prints `0.0.0`)
 - Default local file storage; `DAGU_AUTH_MODE=none`
+
+---
+
+Found with [Fuss](https://github.com/kriyanshii/fuss), an external fault-injection harness I'm building (not part of Dagu).

@@ -1,0 +1,8 @@
+steps:
+  - id: h
+    action: human.task
+    with:
+      prompt: Continue?
+  - id: after
+    depends: [h]
+    run: echo resumed

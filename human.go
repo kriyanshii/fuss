@@ -64,12 +64,22 @@ func humanCmd(home string, args ...string) *exec.Cmd {
 
 // completeArgs completes h. It must name the DAG: complete rejects a path.
 func completeArgs(runID string) []string {
-	return []string{"human-task", "complete", "--run-id=" + runID, "--step=h", "rec"}
+	return completeArgsFor("rec", runID)
+}
+
+// completeArgsFor is completeArgs for a run of any DAG name, e.g. a staged one.
+func completeArgsFor(dag, runID string) []string {
+	return []string{"human-task", "complete", "--run-id=" + runID, "--step=h", dag}
 }
 
 // humanStatus is parseStatus for this DAG, which has h and after, not a.
 func humanStatus(home, runID string) (runStatus, error) {
-	out, err := humanCmd(home, "status", "--run-id="+runID, "rec").CombinedOutput()
+	return humanStatusFor(home, "rec", runID)
+}
+
+// humanStatusFor is humanStatus for a run of any DAG name, e.g. a staged one.
+func humanStatusFor(home, dag, runID string) (runStatus, error) {
+	out, err := humanCmd(home, "status", "--run-id="+runID, dag).CombinedOutput()
 	if err != nil {
 		return runStatus{}, fmt.Errorf("dagu status: %w\n%s", err, out)
 	}
@@ -355,6 +365,11 @@ func queueControl(seed int64) error {
 func runHuman(seed int64, n, replay int, how string, maxOffset time.Duration) int {
 	if err := queueControl(seed); err != nil {
 		fmt.Println("CONTROL BROKEN: Fuss cannot see queue items; no seeds run:", err)
+		return exitControlBroken
+	}
+	// The STRANDED check must catch a known stranded run before any verdict counts.
+	if err := strandedControl(); err != nil {
+		fmt.Println("CONTROL BROKEN: the STRANDED check missed a staged stranded run; no seeds run:", err)
 		return exitControlBroken
 	}
 	failed, diverged := 0, 0

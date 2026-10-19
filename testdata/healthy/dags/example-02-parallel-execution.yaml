@@ -1,0 +1,36 @@
+# Parallel Execution
+# Run multiple tasks simultaneously
+
+description: Execute multiple tasks in parallel
+type: graph
+
+steps:
+  - id: setup
+    run: echo "Setting up environment"
+
+  # These steps run in parallel after setup
+  - id: task_a
+    run: |
+      echo "Task A starting"
+      sleep 1
+      echo "Task A complete"
+    depends: [setup]
+
+  - id: task_b
+    run: |
+      echo "Task B starting"
+      sleep 1
+      echo "Task B complete"
+    depends: [setup]
+
+  - id: task_c
+    run: |
+      echo "Task C starting"
+      sleep 1
+      echo "Task C complete"
+    depends: [setup]
+
+  # Wait for all parallel tasks to complete
+  - id: merge_results
+    run: echo "All parallel tasks completed"
+    depends: [task_a, task_b, task_c]

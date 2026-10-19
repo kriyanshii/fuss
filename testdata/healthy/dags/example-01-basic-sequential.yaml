@@ -1,0 +1,17 @@
+# Basic Sequential Execution
+# Steps execute one after another in order
+
+description: Execute steps one after another
+type: graph
+
+steps:
+  - id: start
+    run: echo "Step 1 - Starting workflow"
+
+  - id: process
+    run: echo "Step 2 - Processing data"
+    depends: [start]
+
+  - id: finish
+    run: echo "Step 3 - Workflow complete"
+    depends: [process]

@@ -1,0 +1,44 @@
+# Scheduled Workflows
+# Add a schedule to run workflows automatically
+
+description: Example of a scheduled workflow
+type: graph
+
+# Uncomment to run daily at 2:00 AM
+# schedule: "0 2 * * *"
+
+# Schedule examples:
+#   "0 * * * *"      - Every hour
+#   "*/5 * * * *"    - Every 5 minutes
+#   "0 9 * * 1-5"    - Weekdays at 9 AM
+#   "0 0 1 * *"      - First day of each month
+
+hist_retention_days: 7  # Keep 7 days of history (or use hist_retention_runs)
+
+params:
+  - name: environment
+    type: string
+    enum: [dev, staging, prod]
+    default: staging
+    description: Target environment for this run
+  - name: batch_size
+    type: integer
+    minimum: 1
+    maximum: 1000
+    default: 100
+    description: Number of records to process
+
+env:
+  - LOG_LEVEL: info
+
+steps:
+  - id: plan
+    run: echo "Planning ${params.batch_size} records for ${params.environment}"
+
+  - id: run_batch
+    run: echo "Running batch with LOG_LEVEL=${env.LOG_LEVEL}"
+    depends: [plan]
+
+  - id: cleanup
+    run: echo "Scheduled workflow complete"
+    depends: [run_batch]

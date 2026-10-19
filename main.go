@@ -35,7 +35,7 @@ func main() {
 	replay := flag.Int("replay", 1, "with -dag=human, run each seed this many times; a seed always picks the same kill delay")
 	queuedOffset := flag.Int("queued-offset", 0, "with -kill-at=queued, the seed picks a kill 0 to this many ms after Queued is seen; 0 kills at once")
 	selfCheck := flag.Bool("self-check", true, "run the zombie control first; if it is broken, no seeds are run")
-	control := flag.String("control", "", `"zombie" runs only the control: a staged stuck Running that Fuss must catch`)
+	control := flag.String("control", "", `"zombie": only the zombie control, a staged stuck Running that Fuss must catch; "stranded": only the STRANDED control, a staged stranded human-task run`)
 	measure := flag.Int("measure", 0, "if >0, run this many unkilled runs and print finalize timing; no verdicts")
 	measureStatus := flag.Bool("measure-status", true, "with -measure, also poll Dagu's status file (false shows Fuss's observer effect)")
 	flag.Parse()
@@ -78,6 +78,13 @@ func main() {
 		if !runZombieControl(*seed) {
 			os.Exit(exitControlBroken)
 		}
+		return
+	case "stranded":
+		if err := strandedControl(); err != nil {
+			fmt.Println("control=stranded BROKEN:", err)
+			os.Exit(exitControlBroken)
+		}
+		fmt.Println("control=stranded OK (staged stranded run judged STRANDED)")
 		return
 	default:
 		fatal(fmt.Errorf("unknown -control %q", *control))

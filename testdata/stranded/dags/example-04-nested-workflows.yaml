@@ -1,0 +1,40 @@
+# Nested Workflows
+# Call other workflows as sub-workflows
+
+description: Example of nested workflows
+type: graph
+
+steps:
+  - id: prepare
+    run: echo "Preparing data for child workflow"
+
+  - id: run_child
+    action: dag.run
+    with:
+      dag: child-workflow
+      params:
+        task_id: "123"
+    depends: [prepare]
+
+  - id: done
+    run: echo "Main workflow completed"
+    depends: [run_child]
+
+---
+# Child workflow definition
+name: child-workflow
+description: Child workflow called by the main workflow
+type: graph
+params:
+  - name: task_id
+    type: string
+    default: "000"
+    description: Task ID passed by the parent DAG
+
+steps:
+  - id: child_start
+    run: echo "Child workflow processing ${params.task_id}"
+
+  - id: child_finish
+    run: echo "Child workflow complete"
+    depends: [child_start]

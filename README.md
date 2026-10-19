@@ -1,11 +1,31 @@
 # fuss
 
-Fuss is a seeded, replayable fault-injection harness meant to test any binary
-from the outside, without modifying it. The same seed replays the same attack.
+Seeded crash testing for unmodified binaries, as a skill for Claude Code,
+Cursor, Codex and Gemini CLI. Every reported bug replays from its seed, 10 of
+10.
 
 Dagu is the first target. Today the Dagu-specific parts (DAG modes, status
 parsing, verdicts) are mixed into the core; separating them into a Dagu adapter
 is planned.
+
+## Why the AI never judges
+
+An agent running the skill can suggest promises to test, draft code and draft
+reports. It never decides whether the target passed or failed. Every verdict
+comes from Fuss's own check, printed in its `-json` output:
+
+- **A verdict has to replay.** A seed replays the same fault, and the check
+  reads the same evidence the same way each time. A model's answer can change
+  between two runs on the same input, so it cannot be replayed or audited.
+- **A check is proven before it is trusted.** Each check must first catch a
+  known broken state (a control). If a control fails, Fuss runs no seeds and
+  exits 3. There is no such test for a model's judgement.
+- **Models misread logs with confidence.** A wrong count or an overstated
+  claim reads just as convincingly as a right one. The check counts the log
+  the same way every time.
+
+People pick which promise to test and approve each check. The model helps
+with the work around them; the code decides.
 
 ## Running
 
@@ -14,6 +34,13 @@ go build -o fuss .
 ./fuss -target=/path/to/dagu -dag=human -kill-at=queued -seed=1 -n=2 -replay=10
 go test ./... -args -target=/path/to/dagu
 ```
+
+Add `-json` for one JSON line per trial, control and summary (seed, mode,
+where the fault landed, verdict, evidence, trial dir) instead of the human
+output. Without it, the output is unchanged.
+
+To run the loop through an agent, see `skills/fuss/SKILL.md` and
+`skills/fuss/INSTALL.md` (Claude Code: `/fuss <target and what to test>`).
 
 Without `-target`, Fuss uses `dagu` from `PATH`, and stops with an error if
 neither exists. Either way it prints the binary it resolved to stderr at

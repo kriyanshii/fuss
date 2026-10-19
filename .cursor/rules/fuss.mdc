@@ -1,0 +1,6 @@
+---
+description: Crash-test a program against a promise in its docs with Fuss (seeded, replayable; verdicts from Fuss only)
+alwaysApply: false
+---
+
+When asked to crash-test a program, find or reproduce a durability or recovery bug, or run Fuss, follow `skills/fuss/SKILL.md` step by step.

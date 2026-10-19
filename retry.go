@@ -100,14 +100,14 @@ func fmtSteps(st runStatus) string {
 // printRetry prints what the retry phase saw for one seed.
 func printRetry(t trial, r retryResult) {
 	if r.skipped != nil {
-		fmt.Printf("  retry skipped: %v\n", r.skipped)
+		say("  retry skipped: %v\n", r.skipped)
 		return
 	}
-	fmt.Printf("  snapshot: run=%s %s\n", r.snapshot.Run, fmtSteps(r.snapshot))
-	fmt.Printf("  retry: exit=%d\n", r.exit)
-	fmt.Printf("  final:    run=%s %s\n", r.final.Run, fmtSteps(r.final))
-	fmt.Printf("  after marker: %q\n", afterMarker(readRecord(t.record), t.runID))
+	say("  snapshot: run=%s %s\n", r.snapshot.Run, fmtSteps(r.snapshot))
+	say("  retry: exit=%d\n", r.exit)
+	say("  final:    run=%s %s\n", r.final.Run, fmtSteps(r.final))
+	say("  after marker: %q\n", afterMarker(readRecord(t.record), t.runID))
 	for _, n := range r.notes {
-		fmt.Println("  note:", n)
+		sayln("  note:", n)
 	}
 }

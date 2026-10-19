@@ -56,14 +56,17 @@ func runZombieControl(seed int64) bool {
 	t := runTrial(seed, killOnStart, "fuss-ctl-zombie", dagOne)
 	broken := zombieControl(t)
 	if len(broken) == 0 {
-		fmt.Printf("control=zombie seed=%d OK (ZOMBIE caught for the right reason)\n", seed)
+		say("control=zombie seed=%d OK (ZOMBIE caught for the right reason)\n", seed)
+		emit(map[string]any{"type": "control", "name": "zombie", "seed": seed, "ok": true})
 		os.RemoveAll(t.dir)
 		return true
 	}
-	fmt.Printf("control=zombie seed=%d BROKEN kill-at=%v killed=%v phase=%s dir=%s\n",
+	say("control=zombie seed=%d BROKEN kill-at=%v killed=%v phase=%s dir=%s\n",
 		seed, t.delay.Round(time.Millisecond), t.killed, t.phase, t.dir)
 	for _, b := range broken {
-		fmt.Println("  -", b)
+		sayln("  -", b)
 	}
+	emit(map[string]any{"type": "control", "name": "zombie", "seed": seed, "ok": false, "dir": t.dir,
+		"evidence": map[string]any{"kill_ms": ms(t.delay), "killed": t.killed, "label": t.phase, "problems": broken}})
 	return false
 }

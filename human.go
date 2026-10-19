@@ -364,14 +364,18 @@ func queueControl(seed int64) error {
 // how is killAfterDelay or killOnQueued; maxOffset applies to killOnQueued.
 func runHuman(seed int64, n, replay int, how string, maxOffset time.Duration) int {
 	if err := queueControl(seed); err != nil {
-		fmt.Println("CONTROL BROKEN: Fuss cannot see queue items; no seeds run:", err)
+		sayln("CONTROL BROKEN: Fuss cannot see queue items; no seeds run:", err)
+		emit(map[string]any{"type": "control", "name": "queue", "ok": false, "error": err.Error()})
 		return exitControlBroken
 	}
 	// The STRANDED check must catch a known stranded run before any verdict counts.
 	if err := strandedControl(); err != nil {
-		fmt.Println("CONTROL BROKEN: the STRANDED check missed a staged stranded run; no seeds run:", err)
+		sayln("CONTROL BROKEN: the STRANDED check missed a staged stranded run; no seeds run:", err)
+		emit(map[string]any{"type": "control", "name": "stranded", "ok": false, "error": err.Error()})
 		return exitControlBroken
 	}
+	emit(map[string]any{"type": "control", "name": "queue", "ok": true})
+	emit(map[string]any{"type": "control", "name": "stranded", "ok": true})
 	failed, diverged := 0, 0
 	for s := seed; s < seed+int64(n); s++ {
 		verdicts, labels := map[string]int{}, map[string]int{}
@@ -389,7 +393,7 @@ func runHuman(seed int64, n, replay int, how string, maxOffset time.Duration) in
 				if t.queuedSeen > 0 {
 					queued, at = t.queuedSeen.Round(time.Microsecond).String(), t.at.Round(time.Microsecond).String()
 				}
-				fmt.Printf("seed=%d rep=%d %s label=%s offset=%v queued-seen=%s kill-sent=%s item-at-kill=%d killed=%v repeat-exit=%d%s repeat=%q final=%s items=%d starts=%d\n",
+				say("seed=%d rep=%d %s label=%s offset=%v queued-seen=%s kill-sent=%s item-at-kill=%d killed=%v repeat-exit=%d%s repeat=%q final=%s items=%d starts=%d\n",
 					s, rep, t.verdict, t.label, t.offset.Round(time.Microsecond), queued, at, t.itemAtKill,
 					t.killed, t.repeatExit, hung, t.repeatOut, t.final.Run, t.items, t.starts)
 				if t.label == "queued-before-item" {
@@ -400,39 +404,56 @@ func runHuman(seed int64, n, replay int, how string, maxOffset time.Duration) in
 				}
 				// Fuss saw Queued, yet Dagu's state after the kill says it never got there.
 				if t.queuedSeen > 0 && (t.label == "before-store" || t.label == "store-before-queued") {
-					fmt.Printf("  ! saw Queued in the status file but dagu status says %s after the kill\n", t.label)
+					say("  ! saw Queued in the status file but dagu status says %s after the kill\n", t.label)
 				}
 			} else {
-				fmt.Printf("seed=%d rep=%d %s label=%s delay=%v at=%v killed=%v repeat-exit=%d%s repeat=%q final=%s items=%d starts=%d\n",
+				say("seed=%d rep=%d %s label=%s delay=%v at=%v killed=%v repeat-exit=%d%s repeat=%q final=%s items=%d starts=%d\n",
 					s, rep, t.verdict, t.label, t.delay.Round(time.Microsecond), t.at.Round(time.Microsecond),
 					t.killed, t.repeatExit, hung, t.repeatOut, t.final.Run, t.items, t.starts)
 			}
 			if t.repeatErr != "" {
-				fmt.Printf("  repeat stderr: %s\n", t.repeatErr)
+				say("  repeat stderr: %s\n", t.repeatErr)
 			}
+			ev := map[string]any{"killed": t.killed, "repeat_exit": t.repeatExit, "repeat_hung": t.repeatHung,
+				"repeat_out": t.repeatOut, "repeat_err": t.repeatErr, "final": t.final.Run, "items": t.items,
+				"starts": t.starts, "kill_sent_ms": ms(t.at)}
+			if how == killOnQueued {
+				ev["offset_ms"], ev["queued_seen_ms"], ev["item_at_kill"] = ms(t.offset), ms(t.queuedSeen), t.itemAtKill
+			} else {
+				ev["delay_ms"] = ms(t.delay)
+			}
+			emit(map[string]any{"type": "trial", "mode": dagHuman + "/" + how, "seed": s, "rep": rep, "label": t.label,
+				"verdict": t.verdict, "dir": t.dir, "dir_kept": t.verdict != "PASS", "evidence": ev})
 			if t.verdict == "PASS" {
 				os.RemoveAll(t.dir) // a replay recreates it
 				continue
 			}
 			failed++
-			fmt.Printf("  dir=%s\n", t.dir)
+			say("  dir=%s\n", t.dir)
 		}
-		fmt.Printf("seed=%d summary: %s | labels: %s\n", s, fmtCounts(verdicts, replay), fmtCounts(labels, replay))
+		say("seed=%d summary: %s | labels: %s\n", s, fmtCounts(verdicts, replay), fmtCounts(labels, replay))
+		emit(map[string]any{"type": "seed_summary", "mode": dagHuman + "/" + how, "seed": s, "replays": replay,
+			"verdicts": verdicts, "labels": labels, "diverged": replay > 1 && replayDiverged(verdicts, labels)})
 		if how == killOnQueued {
 			missed := maps.Clone(labels)
 			delete(missed, "queued-before-item")
-			fmt.Printf("seed=%d window: %d/%d kills landed queued-before-item, %d/%d of those STRANDED | missed %d: %s\n",
+			say("seed=%d window: %d/%d kills landed queued-before-item, %d/%d of those STRANDED | missed %d: %s\n",
 				s, inWindow, replay, inWindowStranded, inWindow, replay-inWindow, fmtCounts(missed, replay))
 			// A report, not a verdict: an offset at the window's edge can split.
 			if replayDiverged(verdicts, labels) {
 				diverged++
-				fmt.Printf("seed=%d REPLAY DIVERGED: replays did not reach the same state\n", s)
+				say("seed=%d REPLAY DIVERGED: replays did not reach the same state\n", s)
 			}
 		}
 	}
 	if how == killOnQueued && replay > 1 {
-		fmt.Printf("replay diverged: %d/%d seeds\n", diverged, n)
+		say("replay diverged: %d/%d seeds\n", diverged, n)
 	}
+	sum := map[string]any{"type": "summary", "mode": dagHuman + "/" + how, "seeds": n, "replays": replay, "not_pass": failed}
+	if how == killOnQueued && replay > 1 {
+		sum["diverged_seeds"] = diverged // counted only in this mode
+	}
+	emit(sum)
 	if failed > 0 {
 		return exitFail
 	}

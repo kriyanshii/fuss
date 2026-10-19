@@ -31,6 +31,7 @@ func main() {
 	doKill := flag.Bool("kill", true, "kill Dagu after the seeded delay; false runs to completion for calibration")
 	killAt := flag.String("kill-at", "delay", `"delay": seeded delay from start; "end": seeded 0-90ms offset after the end line; "stratified": seeded label, then offset after its opening event; "queued" (-dag=human): when Dagu's status file shows Queued`)
 	shape := flag.String("dag", dagOne, `DAG shape: "one" (step a), "two" (a then b), or "human" (kill human-task complete); "one" keeps earlier seeds replayable`)
+	jsonFlag := flag.Bool("json", false, "print one JSON line per trial, control and summary instead of human output")
 	target := flag.String("target", "", "path to the Dagu binary to test; empty uses dagu on PATH")
 	replay := flag.Int("replay", 1, "with -dag=human, run each seed this many times; a seed always picks the same kill delay")
 	queuedOffset := flag.Int("queued-offset", 0, "with -kill-at=queued, the seed picks a kill 0 to this many ms after Queued is seen; 0 kills at once")
@@ -47,6 +48,7 @@ func main() {
 		fatal(err)
 	}
 	daguBin = bin
+	jsonOut = *jsonFlag
 	fmt.Fprintf(os.Stderr, "fuss: dagu = %s (from %s)\n", daguBin, source)
 
 	// The human mode judges by queue items and the record, not by the zombie
@@ -68,6 +70,9 @@ func main() {
 	}
 
 	if *measure > 0 {
+		if jsonOut {
+			fatal(fmt.Errorf("-json is not supported with -measure, which prints timing, not verdicts"))
+		}
 		runMeasure(*seed, *measure, *measureStatus)
 		return
 	}
@@ -81,10 +86,12 @@ func main() {
 		return
 	case "stranded":
 		if err := strandedControl(); err != nil {
-			fmt.Println("control=stranded BROKEN:", err)
+			sayln("control=stranded BROKEN:", err)
+			emit(map[string]any{"type": "control", "name": "stranded", "ok": false, "error": err.Error()})
 			os.Exit(exitControlBroken)
 		}
-		fmt.Println("control=stranded OK (staged stranded run judged STRANDED)")
+		sayln("control=stranded OK (staged stranded run judged STRANDED)")
+		emit(map[string]any{"type": "control", "name": "stranded", "ok": true})
 		return
 	default:
 		fatal(fmt.Errorf("unknown -control %q", *control))
@@ -93,7 +100,7 @@ func main() {
 	// A broken control means a PASS proves nothing, and whatever broke it
 	// (binary, status format, ignored settings) would break every seed too.
 	if *selfCheck && !runZombieControl(*seed) {
-		fmt.Println("CONTROL BROKEN: Fuss cannot be trusted here; no seeds run")
+		sayln("CONTROL BROKEN: Fuss cannot be trusted here; no seeds run")
 		os.Exit(exitControlBroken)
 	}
 
@@ -115,7 +122,7 @@ func main() {
 		// Those modes aim at the end of step a, which is not the end of a two-step run.
 		fatal(fmt.Errorf("-kill-at=%s needs -dag=one", *killAt))
 	case *shape == dagTwo:
-		fmt.Println("note: -dag=two settles, retries and checks rule 4 after each kill")
+		sayln("note: -dag=two settles, retries and checks rule 4 after each kill")
 	}
 	failed := 0
 	var phases []string                     // first-seen order, for stable output
@@ -137,12 +144,12 @@ func main() {
 			verdict = "FAIL"
 			failed++
 		}
-		fmt.Printf("seed=%d %s delay=%v phase=%s killed=%v status=%s/%s\n",
+		say("seed=%d %s delay=%v phase=%s killed=%v status=%s/%s\n",
 			s, verdict, t.delay, t.phase, t.killed, st.Run, st.Step)
 		if t.target != "" {
 			hits[t.target+" → "+t.phase]++
 			if t.target != t.phase {
-				fmt.Printf("  MISSED target=%s landed=%s\n", t.target, t.phase)
+				say("  MISSED target=%s landed=%s\n", t.target, t.phase)
 			}
 		}
 		if outcomes[t.phase] == nil {
@@ -155,34 +162,47 @@ func main() {
 		}
 		// The label comes from Dagu's own file, so this is reported, not judged.
 		if (t.phase == "after-save" || t.phase == "after-compact" || t.phase == "after-exit") && st.Run != "Succeeded" {
-			fmt.Printf("  ! SURPRISE (not a verdict): Dagu had saved Succeeded before the kill but now reports %s/%s; dir=%s\n", st.Run, st.Step, t.dir)
+			say("  ! SURPRISE (not a verdict): Dagu had saved Succeeded before the kill but now reports %s/%s; dir=%s\n", st.Run, st.Step, t.dir)
 			verdict = "SURPRISE" // keep the dir
 		}
+		ev := map[string]any{"delay_ms": ms(t.delay), "killed": t.killed, "run": st.Run, "step": st.Step,
+			"steps": st.Steps, "problems": errStrings(problems), "exit": t.exit}
+		if t.shape == dagTwo {
+			retry := map[string]any{"exit": rr.exit, "snapshot": rr.snapshot.Steps, "final_run": rr.final.Run,
+				"final": rr.final.Steps, "notes": errStrings(rr.notes)}
+			if rr.skipped != nil {
+				retry["skipped"] = rr.skipped.Error()
+			}
+			ev["retry"] = retry
+		}
+		emit(map[string]any{"type": "trial", "mode": t.shape + "/" + how, "seed": s, "label": t.phase, "target": t.target,
+			"verdict": verdict, "dir": t.dir, "dir_kept": verdict != "PASS", "evidence": ev})
 		if verdict == "PASS" {
 			os.RemoveAll(t.dir) // a replay recreates it
 			continue
 		}
 		for _, p := range problems {
-			fmt.Println("  -", p)
+			sayln("  -", p)
 		}
-		fmt.Printf("  took=%v exit=%d err=%v dir=%s\n", t.took.Round(time.Millisecond), t.exit, t.waitErr, t.dir)
-		fmt.Printf("  record: %q\n", readRecord(t.record))
+		say("  took=%v exit=%d err=%v dir=%s\n", t.took.Round(time.Millisecond), t.exit, t.waitErr, t.dir)
+		say("  record: %q\n", readRecord(t.record))
 	}
-	fmt.Println("phases at kill:")
+	sayln("phases at kill:")
 	for _, p := range phases {
 		total := 0
 		for _, c := range outcomes[p] {
 			total += c
 		}
-		fmt.Printf("  %-14s %2d  %v\n", p, total, outcomes[p])
+		say("  %-14s %2d  %v\n", p, total, outcomes[p])
 	}
 	if len(hits) > 0 {
-		fmt.Println("target → landed:")
+		sayln("target → landed:")
 		for _, k := range slices.Sorted(maps.Keys(hits)) {
-			fmt.Printf("  %-30s %2d\n", k, hits[k])
+			say("  %-30s %2d\n", k, hits[k])
 		}
 	}
-	fmt.Printf("%d/%d PASS\n", *n-failed, *n)
+	emit(map[string]any{"type": "summary", "mode": *shape + "/" + how, "seeds": *n, "pass": *n - failed, "outcomes": outcomes, "hits": hits})
+	say("%d/%d PASS\n", *n-failed, *n)
 	if failed > 0 {
 		os.Exit(exitFail)
 	}

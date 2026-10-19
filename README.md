@@ -1,7 +1,12 @@
 # fuss
 
-Kills Dagu at seeded moments and checks what it reports afterwards against a
-record written outside Dagu. The same seed replays the same attack.
+Fuss is a seeded, replayable fault-injection harness meant to test any Go
+program from the outside, without modifying it. The same seed replays the same
+attack.
+
+Dagu is the first target. Today the Dagu-specific parts (DAG modes, status
+parsing, verdicts) are mixed into the core; separating them into a Dagu adapter
+is planned.
 
 ## Running
 

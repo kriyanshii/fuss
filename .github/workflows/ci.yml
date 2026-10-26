@@ -51,9 +51,10 @@ jobs:
     
     - name: Install Dagu
       run: |
-        # Install a specific version of Dagu that's known to work
-        # v1.14.4 is the last version before potential breaking changes
-        go install github.com/dagu-dev/dagu@v1.14.4
+        # Module path is github.com/dagu-org/dagu (not the old dagu-dev path).
+        # v1.14.4 installs as a binary; later 1.x tags do not (`go install`
+        # reports that build constraints exclude all Go files).
+        go install github.com/dagu-org/dagu@v1.14.4
         which dagu || echo "dagu not in PATH"
         
     - name: Run Dagu integration tests
@@ -74,8 +75,8 @@ jobs:
     
     - name: Install rqlite
       run: |
-        # Install rqlite from their releases
-        RQLITE_VERSION=8.31.4
+        # 8.31.4 is not a published release (HTTP 404). Pin a real 8.x tarball.
+        RQLITE_VERSION=8.43.4
         wget https://github.com/rqlite/rqlite/releases/download/v${RQLITE_VERSION}/rqlite-v${RQLITE_VERSION}-linux-amd64.tar.gz
         tar xzf rqlite-v${RQLITE_VERSION}-linux-amd64.tar.gz
         sudo mv rqlite-v${RQLITE_VERSION}-linux-amd64/rqlited /usr/local/bin/

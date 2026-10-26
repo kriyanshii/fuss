@@ -33,13 +33,17 @@ These hold at every step. If a step would break one, stop and tell the person.
 
 ## Before you start
 
-- Fuss judges only Dagu today. The Dagu-specific parts are mixed into the
-  core; a separate adapter per target is planned. **If the target is not
-  Dagu, stop after step 2** and say that Fuss has no adapter for it yet. Do
-  not invent a check outside Fuss to fill the gap.
-- Build Fuss with `go build -o fuss .` and pass the target's binary with
-  `-target=/path/to/binary` (default: the target on `PATH`). Fuss prints the
-  binary it resolved to stderr; check it is the one you meant.
+- **Fuss supports multiple targets via adapters.** Currently available:
+  - `dagu`: DAG workflow scheduler (original target)
+  - `rqlite`: Distributed relational database  
+  - `fake`: Test adapter for development
+- Build Fuss with `go build -o fuss .` 
+- Select a target with `-adapter=<name>` (e.g., `-adapter=rqlite`)
+- Pass the target's binary with `-target=/path/to/binary` (default: looks on `PATH`)
+- Fuss prints the binary it resolved to stderr; check it is the one you meant
+- **If the target you need doesn't have an adapter yet**, check `README.md` for
+  instructions on adding a new target adapter. The adapter interface is in
+  `adapter.go`, with examples in `dagu_adapter.go` and `rqlite_adapter.go`.
 
 ## The loop
 
@@ -66,8 +70,9 @@ Say what each verdict means and what the check reads.
 
 **The person approves the check** before it is trusted. A check is trusted
 only after it is shown to catch a broken state, staged outside the target's
-real state, or a real past bug. In Fuss that is a control (`-control=zombie`,
-`-control=stranded`); a broken control makes Fuss exit 3 and run no seeds.
+real state, or a real past bug. In Fuss that is a control check. Each adapter
+defines its own controls (Dagu: `zombie`, `queue`, `stranded`; rqlite: 
+`durability`). A broken control makes Fuss exit 3 and run no seeds.
 
 ### 3. Write a blind prediction
 
@@ -81,23 +86,21 @@ wants to guess, add theirs under its own heading before showing any results.
 
 ### 4. Run and replay
 
-Run Fuss with `-json` and read its lines. Each line is one JSON object with a
-`type`:
+Run Fuss with `-adapter=<name> -json` and read its lines. Each line is one JSON
+object with a `type`:
 
 - `control`: `name`, `ok`. If any control has `"ok": false`, stop. Fuss did
   not run seeds and nothing it says is trustworthy until the control is fixed.
-- `trial`: `seed`, `rep`, `mode`, `label` (where the fault landed),
-  `verdict`, `dir` (kept unless PASS), `evidence`.
-- `seed_summary`: `verdicts`, `labels`, `diverged` (human mode).
+- `trial`: `seed`, `mode`, `label` (where the fault landed), `verdict`, 
+  `dir` (kept unless PASS), `evidence`.
 - `summary`: totals for the run.
 
 Exit codes: 0 all PASS, 1 some trial not PASS, 2 setup broken (the
 environment, not the target), 3 a control is broken.
 
-Replay one seed 10 times: `-replay=10` with `-dag=human`; other modes reject
-`-replay`, so run the same `-seed=N -n=1` 10 times. The bar is replay to the same
-**state**, not just the same verdict: same `verdict` and same `label` in all
-10. Then:
+For simple adapters, replay one seed multiple times with `-seed=N -n=1` run 10
+times. The bar is replay to the same **state**, not just the same verdict: same
+`verdict` and same `label` in all 10. Then:
 
 - **10 of 10, same state, a written promise broken:** a bug.
 - **Fewer than 10 of 10, or labels differ:** "unknown". Report it as REPLAY
@@ -106,8 +109,7 @@ Replay one seed 10 times: `-replay=10` with `-dag=human`; other modes reject
 - **Clean replay, no promise broken:** not a bug, however odd it looks.
 
 Whether a finding holds across *different* faults is a separate claim. Make it
-with a separate run, such as a sweep of seeded offsets (`-queued-offset=N`
-with many seeds and `-replay=3`).
+with a separate run, such as a sweep of many seeds (`-seed=1 -n=20`).
 
 Compare the results with your prediction and say plainly if it was wrong.
 

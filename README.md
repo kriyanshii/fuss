@@ -4,9 +4,15 @@ Seeded crash testing for unmodified binaries, as a skill for Claude Code,
 Cursor, Codex and Gemini CLI. Every reported bug replays from its seed, 10 of
 10.
 
-Dagu is the first target. Today the Dagu-specific parts (DAG modes, status
-parsing, verdicts) are mixed into the core; separating them into a Dagu adapter
-is planned.
+Fuss uses a **target adapter architecture** to test different programs. Currently
+supported targets:
+
+- **Dagu**: DAG workflow scheduler (original target) - tests zombie detection, retry, human tasks
+- **rqlite**: Distributed relational database - tests crash durability
+- **fake**: Test adapter for development and unit tests
+
+To add a new target, implement the `Adapter` interface in `adapter.go` (see
+`dagu_adapter.go` and `rqlite_adapter.go` for examples).
 
 ## Why the AI never judges
 
@@ -29,10 +35,26 @@ with the work around them; the code decides.
 
 ## Running
 
-```
+```bash
+# Build
 go build -o fuss .
-./fuss -target=/path/to/dagu -dag=human -kill-at=queued -seed=1 -n=2 -replay=10
-go test ./... -args -target=/path/to/dagu
+
+# Test the fake adapter (no external binary needed)
+./fuss -adapter=fake -n=5
+
+# Test Dagu (requires Dagu binary)
+./fuss -adapter=dagu -dag=one -target=/path/to/dagu -n=10
+
+# Test rqlite (requires rqlited binary)
+./fuss -adapter=rqlite -target=/path/to/rqlited -n=10
+
+# Run tests
+go test ./...                          # Unit tests (no external binaries needed)
+go test -run TestDaguIntegration       # Dagu integration tests (needs dagu)
+go test -run TestRqliteIntegration     # rqlite integration tests (needs rqlited)
+
+# Old Dagu mode (backward compatible, no -adapter flag)
+./fuss -target=/path/to/dagu -dag=one -n=2
 ```
 
 Add `-json` for one JSON line per trial, control and summary (seed, mode,
@@ -42,12 +64,33 @@ output. Without it, the output is unchanged.
 To run the loop through an agent, see `skills/fuss/SKILL.md` and
 `skills/fuss/INSTALL.md` (Claude Code: `/fuss <target and what to test>`).
 
-Without `-target`, Fuss uses `dagu` from `PATH`, and stops with an error if
-neither exists. Either way it prints the binary it resolved to stderr at
-startup (`fuss: dagu = … (from …)`), so a run never silently uses the wrong
-one. The scripts resolve the same way from a `TARGET` variable:
-`TARGET=/path/to/dagu scripts/strand_repro.sh` (the standalone reproducer
-from the issue) and `scripts/kill_complete.sh`.
+Without `-target`, Fuss uses the default binary name from `PATH` (e.g., `dagu`
+for the Dagu adapter, `rqlited` for rqlite), and stops with an error if not
+found. Either way it prints the binary it resolved to stderr at startup
+(`fuss: <target> = … (from …)`), so a run never silently uses the wrong one.
+
+## Adding a New Target
+
+To add a new target adapter:
+
+1. **Create the adapter file** (e.g., `mytarget_adapter.go`)
+2. **Implement the `Adapter` interface** from `adapter.go`:
+   - `Name()` - target name
+   - `ResolveBinary()` - find the target binary
+   - `Init()` - set up a trial (create dirs, config files)
+   - `Start()` - launch the target process
+   - `Status()` - query target state
+   - `Settle()` - wait for target to stop reporting "running" after crash
+   - `Check()` - validate against target's promises
+   - `RunControl()` - run control checks
+   - `Controls()` - list available controls
+3. **Add to main.go** in the `runWithAdapter` switch statement
+4. **Write unit tests** using the fake adapter pattern
+5. **Write integration tests** that require the real binary
+6. **Update CI** in `.github/workflows/ci.yml` to install and test with the binary
+
+See `dagu_adapter.go` (complex, with multiple modes) and `rqlite_adapter.go`
+(simple, single-node durability) as examples.
 
 `notes/` holds predictions written down before each run, kept next to what the
 run actually showed, and the issue draft as it was before filing (the filed

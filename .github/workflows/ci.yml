@@ -51,11 +51,14 @@ jobs:
     
     - name: Install Dagu
       run: |
-        # Module path is github.com/dagu-org/dagu (not the old dagu-dev path).
-        # v1.14.4 installs as a binary; later 1.x tags do not (`go install`
-        # reports that build constraints exclude all Go files).
-        go install github.com/dagu-org/dagu@v1.14.4
-        which dagu || echo "dagu not in PATH"
+        # Release binary, not go install: v1.14.4 has no --run-id, and later
+        # 1.x / current 2.22+ print a table `dagu status` Fuss cannot parse.
+        # v2.21.0 matches the CLI flags and the tree-format status fixture.
+        DAGU_VERSION=2.21.0
+        wget -q https://github.com/dagucloud/dagu/releases/download/v${DAGU_VERSION}/dagu_${DAGU_VERSION}_linux_amd64.tar.gz
+        tar xzf dagu_${DAGU_VERSION}_linux_amd64.tar.gz
+        sudo mv dagu /usr/local/bin/
+        dagu version
         
     - name: Run Dagu integration tests
       run: go test -v -run TestDaguIntegration -timeout 5m

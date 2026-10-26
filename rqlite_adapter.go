@@ -116,7 +116,9 @@ func (r *RqliteAdapter) Start(at AdapterTrial, log *os.File) (*exec.Cmd, error) 
 }
 
 func (r *RqliteAdapter) isReady(port int) bool {
-	url := fmt.Sprintf("http://localhost:%d/status", port)
+	// /status is 200 before Raft elects a leader; writes then fail with
+	// "leader not found". /readyz is 200 only once the node can serve.
+	url := fmt.Sprintf("http://localhost:%d/readyz", port)
 	resp, err := http.Get(url)
 	if err != nil {
 		return false

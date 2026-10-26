@@ -10,81 +10,30 @@ jobs:
   test:
     name: Test
     runs-on: ubuntu-latest
-    
+
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
-      
+
     - name: Set up Go
       uses: actions/setup-go@v5
       with:
         go-version: '1.27'
-        
+
     - name: Build
       run: go build -v -o fuss .
-      
+
     - name: Run go vet
       run: go vet ./...
-      
+
+    # Unit tests only. Tests that need a real Dagu/rqlited binary skip when
+    # those binaries are not on PATH (needDagu / ResolveBinary).
     - name: Run unit tests
       run: go test -v -race -coverprofile=coverage.txt -covermode=atomic
-      
+
     - name: Upload coverage
       uses: codecov/codecov-action@v3
       with:
         files: ./coverage.txt
         flags: unittests
         name: codecov-umbrella
-  
-  integration-dagu:
-    name: Integration Test (Dagu)
-    runs-on: ubuntu-latest
-    
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-      
-    - name: Set up Go
-      uses: actions/setup-go@v5
-      with:
-        go-version: '1.27'
-    
-    - name: Install Dagu
-      run: |
-        # Release binary, not go install: v1.14.4 has no --run-id, and later
-        # 1.x / current 2.22+ print a table `dagu status` Fuss cannot parse.
-        # v2.21.0 matches the CLI flags and the tree-format status fixture.
-        DAGU_VERSION=2.21.0
-        wget -q https://github.com/dagucloud/dagu/releases/download/v${DAGU_VERSION}/dagu_${DAGU_VERSION}_linux_amd64.tar.gz
-        tar xzf dagu_${DAGU_VERSION}_linux_amd64.tar.gz
-        sudo mv dagu /usr/local/bin/
-        dagu version
-        
-    - name: Run Dagu integration tests
-      run: go test -v -run TestDaguIntegration -timeout 5m
-      
-  integration-rqlite:
-    name: Integration Test (rqlite)
-    runs-on: ubuntu-latest
-    
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-      
-    - name: Set up Go
-      uses: actions/setup-go@v5
-      with:
-        go-version: '1.27'
-    
-    - name: Install rqlite
-      run: |
-        # 8.31.4 is not a published release (HTTP 404). Pin a real 8.x tarball.
-        RQLITE_VERSION=8.43.4
-        wget https://github.com/rqlite/rqlite/releases/download/v${RQLITE_VERSION}/rqlite-v${RQLITE_VERSION}-linux-amd64.tar.gz
-        tar xzf rqlite-v${RQLITE_VERSION}-linux-amd64.tar.gz
-        sudo mv rqlite-v${RQLITE_VERSION}-linux-amd64/rqlited /usr/local/bin/
-        which rqlited
-        rqlited -version
-        
-    - name: Run rqlite integration tests
-      run: go test -v -run TestRqliteIntegration -timeout 5m

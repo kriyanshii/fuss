@@ -49,8 +49,7 @@ func main() {
 	
 	// If adapter is specified, use the new adapter path
 	if *adapterName != "" {
-		runWithAdapter(*adapterName, *target, *seed, *n, *doKill, *jsonFlag, *control, *shape)
-		return
+		os.Exit(runWithAdapter(*adapterName, *target, *seed, *n, *doKill, *jsonFlag, *control, *shape))
 	}
 
 	// Printed to stderr so a run never silently uses the wrong binary,
@@ -225,8 +224,8 @@ func fatal(err error) {
 	os.Exit(exitSetup)
 }
 
-// runWithAdapter runs trials using the new adapter interface.
-func runWithAdapter(adapterName, targetFlag string, seed int64, n int, doKill, jsonFlag bool, control, shape string) {
+// runWithAdapter runs trials using the new adapter interface and returns a Fuss exit code.
+func runWithAdapter(adapterName, targetFlag string, seed int64, n int, doKill, jsonFlag bool, control, shape string) int {
 	// Create the adapter
 	var adapter Adapter
 	var err error
@@ -245,14 +244,21 @@ func runWithAdapter(adapterName, targetFlag string, seed int64, n int, doKill, j
 	if err != nil {
 		fatal(err)
 	}
-	
-	// Resolve binary
+	jsonOut = jsonFlag
+	return runAdapter(adapter, targetFlag, seed, n, doKill, control)
+}
+
+// runAdapter is the core adapter loop. Tests call it so exit codes can be checked
+// without os.Exit. A control that misses a staged broken state returns 3.
+func runAdapter(adapter Adapter, targetFlag string, seed int64, n int, doKill bool, control string) int {
 	bin, source, err := adapter.ResolveBinary(targetFlag)
 	if err != nil {
-		fatal(err)
+		fmt.Fprintln(os.Stderr, "fuss:", err)
+		return exitSetup
 	}
-	daguBin = bin // set global for old code compatibility
-	jsonOut = jsonFlag
+	if adapter.Name() == "dagu" {
+		daguBin = bin
+	}
 	fmt.Fprintf(os.Stderr, "fuss: %s = %s (from %s)\n", adapter.Name(), bin, source)
 	
 	// Run specific control if requested
@@ -260,11 +266,11 @@ func runWithAdapter(adapterName, targetFlag string, seed int64, n int, doKill, j
 		if err := adapter.RunControl(control, seed, bin); err != nil {
 			sayln("control="+control+" BROKEN:", err)
 			emit(map[string]any{"type": "control", "name": control, "ok": false, "error": err.Error()})
-			os.Exit(exitControlBroken)
+			return exitControlBroken
 		}
 		sayln("control=" + control + " OK")
 		emit(map[string]any{"type": "control", "name": control, "ok": true})
-		return
+		return exitPass
 	}
 	
 	// Run all controls before seeds
@@ -273,7 +279,7 @@ func runWithAdapter(adapterName, targetFlag string, seed int64, n int, doKill, j
 			sayln("CONTROL BROKEN: Fuss cannot be trusted; no seeds run")
 			sayln("control="+ctlName+" BROKEN:", err)
 			emit(map[string]any{"type": "control", "name": ctlName, "ok": false, "error": err.Error()})
-			os.Exit(exitControlBroken)
+			return exitControlBroken
 		}
 		sayln("control=" + ctlName + " OK")
 		emit(map[string]any{"type": "control", "name": ctlName, "ok": true})
@@ -335,8 +341,9 @@ func runWithAdapter(adapterName, targetFlag string, seed int64, n int, doKill, j
 	})
 	
 	if failed > 0 {
-		os.Exit(exitFail)
+		return exitFail
 	}
+	return exitPass
 }
 
 type adapterTrialResult struct {

@@ -8,7 +8,7 @@ Fuss uses a **target adapter architecture** to test different programs. Currentl
 supported targets:
 
 - **Dagu**: DAG workflow scheduler (original target) - tests zombie detection, retry, human tasks
-- **rqlite**: Distributed relational database - tests crash durability
+- **rqlite**: planned: example adapter exists, its check is not yet backed by a documented promise
 - **fake**: Test adapter for development and unit tests
 
 To add a new target, implement the `Adapter` interface in `adapter.go` (see

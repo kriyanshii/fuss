@@ -1,2 +1,7 @@
 # The compiled binary embeds local build paths.
 /fuss
+
+__pycache__/
+*.pyc
+claude_history/
+PROJECT_CONTEXT.md

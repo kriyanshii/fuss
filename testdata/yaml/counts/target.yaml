@@ -1,0 +1,28 @@
+name: counts
+binary:
+  default: sh
+  extra: ["/bin/sh"]
+args: ["testdata/yaml/counts/run.sh", "${home}", "${dir}"]
+data_dir: "${home}"
+kill:
+  at: delay
+  delay: { min_ms: 80, max_ms: 200 }
+check:
+  file_count:
+    glob: "${home}/items/item_*.json"
+    as: items
+  record_count:
+    contains: "start after"
+    as: starts
+  command:
+    command: ["/bin/echo", "Queued"]
+    as: status_out
+    contains: Queued
+  rules:
+    - if: { starts_gte: 2 }
+      verdict: DOUBLE-RESUME
+    - if: { starts_eq: 1 }
+      verdict: PASS
+    - if: { status_contains: Queued, items_eq: 0 }
+      verdict: STRANDED
+    - else: NO-RESUME

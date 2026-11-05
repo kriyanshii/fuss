@@ -30,8 +30,9 @@ const (
 
 func main() {
 	// New adapter flag for selecting target
-	adapterName := flag.String("adapter", "", `target adapter: "dagu" (default), "rqlite", or "fake"`)
-	
+	adapterName := flag.String("adapter", "", `target adapter: "dagu" (default), "rqlite", "fake", or examples/<name>/<name>.yaml`)
+	targetConfig := flag.String("target-config", "", "path to a YAML target config")
+
 	seed := flag.Int64("seed", 1, "first seed; the same seed replays the same run")
 	n := flag.Int("n", 1, "number of seeds to run, starting at -seed")
 	doKill := flag.Bool("kill", true, "kill Dagu after the seeded delay; false runs to completion for calibration")
@@ -46,9 +47,28 @@ func main() {
 	measure := flag.Int("measure", 0, "if >0, run this many unkilled runs and print finalize timing; no verdicts")
 	measureStatus := flag.Bool("measure-status", true, "with -measure, also poll Dagu's status file (false shows Fuss's observer effect)")
 	flag.Parse()
-	
-	// If adapter is specified, use the new adapter path
+
+	if *targetConfig != "" && *adapterName != "" {
+		fatal(fmt.Errorf("-target-config and -adapter cannot be set together"))
+	}
+	if *targetConfig != "" {
+		adapter, err := LoadYAMLTarget(*targetConfig)
+		if err != nil {
+			fatal(err)
+		}
+		jsonOut = *jsonFlag
+		os.Exit(runAdapter(adapter, *target, *seed, *n, *doKill, *control))
+	}
 	if *adapterName != "" {
+		exampleYAML := filepath.Join("examples", *adapterName, *adapterName+".yaml")
+		if _, err := os.Stat(exampleYAML); err == nil {
+			adapter, err := LoadYAMLTarget(exampleYAML)
+			if err != nil {
+				fatal(err)
+			}
+			jsonOut = *jsonFlag
+			os.Exit(runAdapter(adapter, *target, *seed, *n, *doKill, *control))
+		}
 		os.Exit(runWithAdapter(*adapterName, *target, *seed, *n, *doKill, *jsonFlag, *control, *shape))
 	}
 
@@ -229,7 +249,7 @@ func runWithAdapter(adapterName, targetFlag string, seed int64, n int, doKill, j
 	// Create the adapter
 	var adapter Adapter
 	var err error
-	
+
 	switch adapterName {
 	case "dagu":
 		adapter, err = NewDaguAdapter(shape)
@@ -238,9 +258,9 @@ func runWithAdapter(adapterName, targetFlag string, seed int64, n int, doKill, j
 	case "fake":
 		adapter = NewFakeAdapter()
 	default:
-		fatal(fmt.Errorf("unknown adapter %q; supported: dagu, rqlite, fake", adapterName))
+		fatal(fmt.Errorf("unknown adapter %q; supported: dagu, rqlite, fake, or examples/<name>/<name>.yaml", adapterName))
 	}
-	
+
 	if err != nil {
 		fatal(err)
 	}
@@ -260,7 +280,7 @@ func runAdapter(adapter Adapter, targetFlag string, seed int64, n int, doKill bo
 		daguBin = bin
 	}
 	fmt.Fprintf(os.Stderr, "fuss: %s = %s (from %s)\n", adapter.Name(), bin, source)
-	
+
 	// Run specific control if requested
 	if control != "" {
 		if err := adapter.RunControl(control, seed, bin); err != nil {
@@ -272,7 +292,7 @@ func runAdapter(adapter Adapter, targetFlag string, seed int64, n int, doKill bo
 		emit(map[string]any{"type": "control", "name": control, "ok": true})
 		return exitPass
 	}
-	
+
 	// Run all controls before seeds
 	for _, ctlName := range adapter.Controls() {
 		if err := adapter.RunControl(ctlName, seed, bin); err != nil {
@@ -284,31 +304,32 @@ func runAdapter(adapter Adapter, targetFlag string, seed int64, n int, doKill bo
 		sayln("control=" + ctlName + " OK")
 		emit(map[string]any{"type": "control", "name": ctlName, "ok": true})
 	}
-	
+
 	// Run trials
 	failed := 0
+	acks := 0
 	for s := seed; s < seed+int64(n); s++ {
 		result, err := runAdapterTrial(adapter, s, bin, doKill)
 		if err != nil {
 			fatal(err)
 		}
-		
+		acks += result.acks
 		if result.verdict != "PASS" {
 			failed++
 		}
-		
+
 		say("seed=%d %s phase=%s killed=%v status=%s delay=%v took=%v\n",
 			s, result.verdict, result.phase, result.killed,
 			result.status, result.delay.Round(time.Millisecond),
 			result.took.Round(time.Millisecond))
-		
+
 		if result.verdict != "PASS" {
 			for _, p := range result.problems {
 				sayln("  -", p)
 			}
 			say("  dir=%s\n", result.dir)
 		}
-		
+
 		emit(map[string]any{
 			"type":     "trial",
 			"mode":     adapter.Name(),
@@ -323,14 +344,15 @@ func runAdapter(adapter Adapter, targetFlag string, seed int64, n int, doKill bo
 				"status":   result.status,
 				"exit":     result.exit,
 				"took_ms":  ms(result.took),
+				"acks":     result.acks,
 			},
 		})
-		
+
 		if result.verdict == "PASS" {
 			os.RemoveAll(result.dir)
 		}
 	}
-	
+
 	say("%d/%d PASS\n", n-failed, n)
 	emit(map[string]any{
 		"type":  "summary",
@@ -338,8 +360,9 @@ func runAdapter(adapter Adapter, targetFlag string, seed int64, n int, doKill bo
 		"seeds": n,
 		"pass":  n - failed,
 		"fail":  failed,
+		"acks":  acks,
 	})
-	
+
 	if failed > 0 {
 		return exitFail
 	}
@@ -356,6 +379,7 @@ type adapterTrialResult struct {
 	exit     int
 	status   string
 	problems []error
+	acks     int
 }
 
 func runAdapterTrial(adapter Adapter, seed int64, binaryPath string, doKill bool) (*adapterTrialResult, error) {
@@ -363,52 +387,75 @@ func runAdapterTrial(adapter Adapter, seed int64, binaryPath string, doKill bool
 	if err != nil {
 		return nil, err
 	}
-	
+
 	result := &adapterTrialResult{dir: dir, phase: "not-killed"}
-	
+
 	// Initialize trial
 	at, err := adapter.Init(seed, dir, binaryPath)
 	if err != nil {
 		return nil, fmt.Errorf("init: %w", err)
 	}
-	
+
 	// Create log
 	log, err := os.Create(filepath.Join(dir, "target.log"))
 	if err != nil {
 		return nil, err
 	}
 	defer log.Close()
-	
-	// Pick delay
+
+	// Pick delay. YAML may set a window; otherwise 0-3000ms as before.
 	rng := rand.New(rand.NewSource(seed))
-	result.delay = time.Duration(rng.Intn(3000)) * time.Millisecond
-	
+	minMS, maxMS := 0, 3000
+	if w, ok := adapter.(interface{ KillWindow() (int, int) }); ok {
+		minMS, maxMS = w.KillWindow()
+	}
+	span := maxMS - minMS
+	if span <= 0 {
+		result.delay = time.Duration(minMS) * time.Millisecond
+	} else {
+		result.delay = time.Duration(minMS+rng.Intn(span)) * time.Millisecond
+	}
+
 	// Start target
 	start := time.Now()
 	cmd, err := adapter.Start(at, log)
 	if err != nil {
 		return nil, fmt.Errorf("start: %w", err)
 	}
-	
+
 	// Wait in background
 	done := make(chan error, 1)
 	go func() { done <- cmd.Wait() }()
-	
+
+	fileWaited := false
+	if kw, ok := adapter.(KillWaiter); ok {
+		waited, handled, werr := kw.WaitBeforeKill(at, seed)
+		if werr != nil {
+			return nil, fmt.Errorf("wait kill: %w", werr)
+		}
+		if handled {
+			result.delay = waited
+			fileWaited = true
+		}
+	}
+
 	// Apply kill
 	if doKill {
-		time.Sleep(result.delay)
+		if !fileWaited {
+			time.Sleep(result.delay)
+		}
 		result.phase = determinePhase(at)
 		if err := kill(cmd); err == nil {
 			result.killed = true
 		}
 	}
-	
+
 	// Wait for completion
 	<-done
 	result.took = time.Since(start)
 	result.exit = cmd.ProcessState.ExitCode()
 	result.killed = diedOfKill(cmd)
-	
+
 	// Get status
 	st, _ := adapter.Status(at)
 	if st != nil {
@@ -416,23 +463,29 @@ func runAdapterTrial(adapter Adapter, seed int64, binaryPath string, doKill bool
 	} else {
 		result.status = "unknown"
 	}
-	
+
 	// Check
-	result.problems = adapter.Check(at, result.killed, result.phase)
-	
-	if len(result.problems) > 0 {
-		result.verdict = "FAIL"
+	if nc, ok := adapter.(NamedChecker); ok {
+		cr := nc.CheckNamed(at, result.killed, result.phase)
+		result.problems = cr.Problems
+		result.acks = cr.Evidence
+		result.verdict = verdictFromCheck(cr)
 	} else {
-		result.verdict = "PASS"
+		result.problems = adapter.Check(at, result.killed, result.phase)
+		if len(result.problems) > 0 {
+			result.verdict = "FAIL"
+		} else {
+			result.verdict = "PASS"
+		}
 	}
-	
+
 	return result, nil
 }
 
 func determinePhase(at AdapterTrial) string {
 	rec := at.RecordContent()
 	runID := at.RunID()
-	
+
 	if len(rec) == 0 {
 		return "before-start"
 	}

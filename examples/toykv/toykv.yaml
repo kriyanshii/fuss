@@ -1,0 +1,49 @@
+name: toykv
+binary:
+  default: toykv
+  extra: ["./toykv"]
+args: ["-data-dir", "${home}", "-addr", "${addr}"]
+port_base: 18700
+port_mod: 500
+data_dir: "${home}"
+start:
+  wait_exit: false
+health:
+  http:
+    method: GET
+    url: "http://${addr}/k/ready"
+    timeout: 5s
+workload:
+  until: kill
+  wait_first_ack: true
+  http:
+    method: PUT
+    url: "http://${addr}/k/${seed}-${n}"
+    body: "v"
+    timeout: 100ms
+    ack_status: 200
+  ack:
+    key: "${seed}-${n}"
+    record: "ack ${key}\n"
+kill:
+  signal: SIGKILL
+  at: delay
+  delay: { min_ms: 0, max_ms: 3000 }
+restart:
+  health:
+    http:
+      method: GET
+      url: "http://${addr}/k/ready"
+      timeout: 5s
+check:
+  for_each: ack
+  http:
+    method: GET
+    url: "http://${addr}/k/${key}"
+    want_status: 200
+    timeout: 200ms
+  miss_verdict: "LOST WRITE"
+controls:
+  lost-write:
+    plant_record: "ack planted\n"
+    expect_verdict: "LOST WRITE"

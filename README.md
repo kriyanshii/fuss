@@ -11,8 +11,8 @@ supported targets:
 - **rqlite**: planned: example adapter exists, its check is not yet backed by a documented promise
 - **fake**: Test adapter for development and unit tests
 
-To add a new target, implement the `Adapter` interface in `adapter.go` (see
-`dagu_adapter.go` and `rqlite_adapter.go` for examples).
+To add a new target, write `examples/<name>/<name>.yaml` (`-adapter=<name>`
+or `-target-config=path`) or implement the `Adapter` interface in `adapter.go`.
 
 ## Why the AI never judges
 

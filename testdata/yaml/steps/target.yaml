@@ -1,0 +1,40 @@
+name: steps
+binary:
+  default: true
+  extra: ["/bin/true"]
+steps:
+  - name: a
+    command: ["/bin/sh", "-c", "echo A >> ${dir}/seq.txt"]
+    wait_exit: true
+    timeout: 2s
+  - name: hold
+    command: ["/bin/sh", "-c", "echo B >> ${dir}/seq.txt; sleep 30"]
+    wait_exit: false
+    kill:
+      at: file
+      file:
+        glob: "${dir}/seq.txt"
+        contains: B
+        poll: 5ms
+        offset_ms: 10
+        timeout: 5s
+  - name: c
+    command: ["/bin/sh", "-c", "echo C >> ${dir}/seq.txt"]
+    wait_exit: true
+    timeout: 2s
+  - name: pause
+    command: ["/bin/sh", "-c", "echo paused"]
+    run_for: 50ms
+    stop: SIGTERM
+check:
+  file_count:
+    glob: "${dir}/seq.txt"
+    as: files
+  command:
+    command: ["/bin/cat", "${dir}/seq.txt"]
+    as: seq
+    contains: C
+  rules:
+    - if: { seq_contains: C }
+      verdict: PASS
+    - else: FAIL

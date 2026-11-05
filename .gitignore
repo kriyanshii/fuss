@@ -1,5 +1,6 @@
 # The compiled binary embeds local build paths.
 /fuss
+/toykv
 
 __pycache__/
 *.pyc

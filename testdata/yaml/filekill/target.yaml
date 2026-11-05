@@ -1,0 +1,22 @@
+name: filekill
+binary:
+  default: sh
+  extra: ["/bin/sh"]
+args: ["testdata/yaml/filekill/hold.sh", "${home}"]
+data_dir: "${home}"
+kill:
+  at: file
+  file:
+    glob: "${home}/flag.txt"
+    contains: READY
+    poll: 5ms
+    offset_ms: 20
+    timeout: 5s
+check:
+  file_count:
+    glob: "${home}/flag.txt"
+    as: flags
+  rules:
+    - if: { flags_eq: 1 }
+      verdict: PASS
+    - else: FAIL

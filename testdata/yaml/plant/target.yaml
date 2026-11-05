@@ -1,0 +1,21 @@
+name: plant
+binary:
+  default: true
+  extra: ["/bin/true"]
+data_dir: "${home}"
+check:
+  file_count:
+    glob: "${home}/queue/item_*.json"
+    as: items
+  command:
+    command: ["/bin/cat", "${home}/status.txt"]
+    as: status_out
+    contains: Queued
+  rules:
+    - if: { status_contains: Queued, items_eq: 0 }
+      verdict: STRANDED
+    - else: PASS
+controls:
+  planted:
+    plant_dir: testdata/yaml/plant/fixture
+    expect_verdict: STRANDED

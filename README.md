@@ -7,12 +7,52 @@ Cursor, Codex and Gemini CLI. Every reported bug replays from its seed, 10 of
 Fuss uses a **target adapter architecture** to test different programs. Currently
 supported targets:
 
+- **toykv**: demo KV in `examples/toykv` (YAML). Default loses acked writes; `-fsync` does not
 - **Dagu**: DAG workflow scheduler (original target) - tests zombie detection, retry, human tasks
 - **rqlite**: planned: example adapter exists, its check is not yet backed by a documented promise
 - **fake**: Test adapter for development and unit tests
 
 To add a new target, write `examples/<name>/<name>.yaml` (`-adapter=<name>`
 or `-target-config=path`) or implement the `Adapter` interface in `adapter.go`.
+
+## Five minutes
+
+```bash
+git clone https://github.com/kriyanshii/fuss.git
+cd fuss
+go build -o fuss .
+go build -o toykv ./examples/toykv
+```
+
+Default toykv returns 200 before the write is on disk. `-adapter=toykv` loads
+`examples/toykv/toykv.yaml`.
+
+```bash
+./fuss -adapter=toykv -seed=1 -n=10 -json
+```
+
+Each trial prints `"verdict":"LOST WRITE"` (exit 1). The `lost-write` control
+must show `"ok":true` first.
+
+Same binary, fsync on — 200 means on disk
+(`examples/toykv/toykv-fsync.yaml` passes `-fsync`):
+
+```bash
+./fuss -target-config=examples/toykv/toykv-fsync.yaml -seed=1 -n=10 -json
+```
+
+Each trial prints `"verdict":"PASS"` (exit 0).
+
+Your binary: copy one YAML and point `-target` at it.
+
+```bash
+cp examples/toykv/toykv.yaml my.yaml
+# edit args, health, workload, and check
+./fuss -target-config=my.yaml -target=/path/to/your-binary -seed=1 -n=10 -json
+```
+
+Do not write into the target's data dir. Fuss does not. The demo server is
+`examples/toykv/README.md`.
 
 ## Why the AI never judges
 

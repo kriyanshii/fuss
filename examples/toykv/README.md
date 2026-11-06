@@ -1,6 +1,17 @@
 # toykv
 
 A tiny Go key-value server (stdlib only) used as a Fuss demo target.
+The five-minute first run is in the repo README.
+
+From the repo root:
+
+```bash
+go build -o fuss . && go build -o toykv ./examples/toykv
+./fuss -adapter=toykv -seed=1 -n=10 -json
+./fuss -target-config=examples/toykv/toykv-fsync.yaml -seed=1 -n=10 -json
+```
+
+The first command's `verdict` is `LOST WRITE`. The second is `PASS`.
 
 ```
 toykv -data-dir <dir> [-addr 127.0.0.1:18731] [-fsync]

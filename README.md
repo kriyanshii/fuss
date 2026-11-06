@@ -34,7 +34,7 @@ Default toykv returns 200 before the write is on disk. `-adapter=toykv` loads
 Each trial prints `"verdict":"LOST WRITE"` (exit 1). The `lost-write` control
 must show `"ok":true` first.
 
-Same binary, fsync on — 200 means on disk
+Same binary with fsync on, so a 200 means the write is on disk
 (`examples/toykv/toykv-fsync.yaml` passes `-fsync`):
 
 ```bash

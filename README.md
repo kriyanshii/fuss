@@ -54,6 +54,23 @@ cp examples/toykv/toykv.yaml my.yaml
 Do not write into the target's data dir. Fuss does not. The demo server is
 `examples/toykv/README.md`.
 
+## In CI
+
+Other repos can call this composite action from a workflow. Pin a commit SHA
+until you cut a tag; `@v0` in the example is the ref you would use after that.
+
+```yaml
+    - uses: kriyanshii/fuss@v0
+      with:
+        config: path/to/your.yaml
+        target: ./your-binary
+        seed: "1"
+        n: "10"
+```
+
+Every trial's `verdict` must match `expected-verdict` (default `PASS`). Set it
+to lock in a known failure such as toykv's `LOST WRITE`.
+
 ## Why the AI never judges
 
 An agent running the skill can suggest promises to test, draft code and draft

@@ -1,0 +1,94 @@
+name: fuss
+description: Build fuss and run it against a YAML target config, checking trial verdicts from -json.
+
+inputs:
+  config:
+    description: Path to a fuss YAML config, relative to the caller workspace
+    required: true
+  seed:
+    description: First seed; the same seed replays the same run
+    required: false
+    default: "1"
+  n:
+    description: Number of seeds to run, starting at seed
+    required: false
+    default: "10"
+  target:
+    description: Path to the target binary; when set, passed as -target (overrides the YAML binary)
+    required: false
+    default: ""
+  expected-verdict:
+    description: Every trial's verdict field must equal this string exactly
+    required: false
+    default: "PASS"
+
+runs:
+  using: composite
+  steps:
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version-file: ${{ github.action_path }}/go.mod
+        cache-dependency-path: ${{ github.action_path }}/go.sum
+
+    - name: Build fuss
+      shell: bash
+      run: go build -o "$RUNNER_TEMP/fuss" "${{ github.action_path }}"
+
+    - name: Run fuss and check trial verdicts
+      shell: bash
+      env:
+        FUSS_CONFIG: ${{ inputs.config }}
+        FUSS_SEED: ${{ inputs.seed }}
+        FUSS_N: ${{ inputs.n }}
+        FUSS_TARGET: ${{ inputs.target }}
+        EXPECTED_VERDICT: ${{ inputs.expected-verdict }}
+      run: |
+        json_out="$RUNNER_TEMP/fuss.json"
+        args=(-target-config "$FUSS_CONFIG" -seed="$FUSS_SEED" -n="$FUSS_N" -json)
+        if [ -n "$FUSS_TARGET" ]; then
+          args+=(-target "$FUSS_TARGET")
+        fi
+        set +e
+        "$RUNNER_TEMP/fuss" "${args[@]}" > "$json_out"
+        rc=$?
+        set -e
+        if [ "$rc" -eq 2 ] || [ "$rc" -eq 3 ]; then
+          echo "fuss exited $rc (setup or control broken)"
+          exit 1
+        fi
+        export FUSS_JSON="$json_out"
+        python3 <<'PY'
+        import json
+        import os
+        import sys
+
+        expected = os.environ["EXPECTED_VERDICT"]
+        path = os.environ["FUSS_JSON"]
+        verdicts = []
+        with open(path) as f:
+            for raw in f:
+                line = raw.strip()
+                if not line:
+                    continue
+                rec = json.loads(line)
+                kind = rec.get("type")
+                if kind == "control":
+                    if rec.get("ok") is not True:
+                        print("control did not report ok true:", rec, file=sys.stderr)
+                        sys.exit(1)
+                elif kind == "trial":
+                    if "verdict" not in rec:
+                        print("trial is missing a verdict field:", rec, file=sys.stderr)
+                        sys.exit(1)
+                    verdicts.append(rec["verdict"])
+
+        if not verdicts:
+            print("no trial lines in fuss -json output", file=sys.stderr)
+            sys.exit(1)
+        if any(v != expected for v in verdicts):
+            print("trial verdicts did not all equal expected-verdict %r:" % (expected,), file=sys.stderr)
+            print(verdicts, file=sys.stderr)
+            sys.exit(1)
+        print("all %d trials matched expected-verdict %s" % (len(verdicts), expected))
+        PY

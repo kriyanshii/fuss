@@ -37,3 +37,38 @@ jobs:
         files: ./coverage.txt
         flags: unittests
         name: codecov-umbrella
+
+  toykv:
+    name: toykv
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: '1.27'
+
+    - name: Build toykv
+      run: go build -o toykv ./examples/toykv
+
+    - name: Crash-test toykv (lost write)
+      uses: ./
+      with:
+        config: examples/toykv/toykv.yaml
+        target: ./toykv
+        seed: "1"
+        n: "10"
+        expected-verdict: "LOST WRITE"
+
+    - name: Crash-test toykv (fsync)
+      uses: ./
+      with:
+        config: examples/toykv/toykv-fsync.yaml
+        target: ./toykv
+        seed: "1"
+        n: "10"
+        expected-verdict: "PASS"

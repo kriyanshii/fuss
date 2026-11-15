@@ -12,8 +12,7 @@ supported targets:
 - **rqlite**: planned: example adapter exists, its check is not yet backed by a documented promise
 - **fake**: Test adapter for development and unit tests
 
-To add a new target, write `examples/<name>/<name>.yaml` (`-adapter=<name>`
-or `-target-config=path`) or implement the `Adapter` interface in `adapter.go`.
+A new target is a YAML file. See [Testing your own program](#testing-your-own-program).
 
 ## Five minutes
 
@@ -126,28 +125,17 @@ for the Dagu adapter, `rqlited` for rqlite), and stops with an error if not
 found. Either way it prints the binary it resolved to stderr at startup
 (`fuss: <target> = … (from …)`), so a run never silently uses the wrong one.
 
-## Adding a New Target
+## Testing your own program
 
-To add a new target adapter:
+Copy `examples/toykv/toykv.yaml`, edit it with `skills/fuss/CONFIG.md`, and run:
 
-1. **Create the adapter file** (e.g., `mytarget_adapter.go`)
-2. **Implement the `Adapter` interface** from `adapter.go`:
-   - `Name()` - target name
-   - `ResolveBinary()` - find the target binary
-   - `Init()` - set up a trial (create dirs, config files)
-   - `Start()` - launch the target process
-   - `Status()` - query target state
-   - `Settle()` - wait for target to stop reporting "running" after crash
-   - `Check()` - validate against target's promises
-   - `RunControl()` - run control checks
-   - `Controls()` - list available controls
-3. **Add to main.go** in the `runWithAdapter` switch statement
-4. **Write unit tests** using the fake adapter pattern
-5. **Write integration tests** that require the real binary
-6. **Update CI** in `.github/workflows/ci.yml` to install and test with the binary
+```bash
+./fuss -target-config yours.yaml -json
+```
 
-See `dagu_adapter.go` (complex, with multiple modes) and `rqlite_adapter.go`
-(simple, single-node durability) as examples.
+Or type `/fuss` in Claude Code and let it draft the config.
+
+Dagu and rqlite Go adapters (`dagu_adapter.go`, `rqlite_adapter.go`) remain as older examples.
 
 `notes/` holds predictions written down before each run, kept next to what the
 run actually showed, and the issue draft as it was before filing (the filed

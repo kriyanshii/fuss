@@ -26,9 +26,10 @@ A PUT that returns 200 survives a kill and restart.
 
 ## Bug
 
-Without `-fsync` (the default) the server returns 200 as soon as the key is
-in memory. The store file under `-data-dir` is flushed every 200ms. A kill
-before that flush drops acked keys.
+Without `-fsync` (the default) PUT returns 200 as soon as the key is in
+memory. The data reaches the store file under `-data-dir` only on a clean
+shutdown (SIGTERM or SIGINT). A SIGKILL cannot be caught, so every PUT
+acknowledged since startup is lost.
 
 `-fsync` writes and syncs the store before PUT returns 200.
 `toykv-fsync.yaml` passes that flag. `toykv.yaml` does not.

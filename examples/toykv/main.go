@@ -6,15 +6,18 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
 	"sync"
-	"time"
+	"syscall"
 )
 
 // toykv is a tiny key-value server with a planted durability bug:
-// PUT returns 200 before the write is on disk. The in-memory map is
-// flushed to <data-dir>/store every 200ms.
+// PUT returns 200 before the write is on disk. Without -fsync the
+// map is written to <data-dir>/store only on a clean shutdown
+// (SIGTERM or SIGINT). SIGKILL cannot be caught, so every PUT
+// acknowledged since startup is lost.
 
 func main() {
 	dataDir := flag.String("data-dir", "", "directory for the store file")
@@ -30,7 +33,7 @@ func main() {
 	s := &store{path: filepath.Join(*dataDir, "store"), fsync: *doFsync, m: map[string]string{}}
 	s.load()
 	if !s.fsync {
-		go s.flushLoop()
+		go s.shutdownOnSignal()
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/k/", func(w http.ResponseWriter, r *http.Request) {
@@ -109,11 +112,12 @@ func (s *store) writeLocked() error {
 	return os.Rename(tmp, s.path)
 }
 
-func (s *store) flushLoop() {
-	for {
-		time.Sleep(200 * time.Millisecond)
-		s.mu.Lock()
-		_ = s.writeLocked()
-		s.mu.Unlock()
-	}
+func (s *store) shutdownOnSignal() {
+	ch := make(chan os.Signal, 1)
+	signal.Notify(ch, syscall.SIGTERM, syscall.SIGINT)
+	<-ch
+	s.mu.Lock()
+	_ = s.writeLocked()
+	s.mu.Unlock()
+	os.Exit(0)
 }

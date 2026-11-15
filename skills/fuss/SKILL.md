@@ -49,9 +49,15 @@ These hold at every step. If a step would break one, stop and tell the person.
 
 Run the promise miner over the target's docs to list candidate promises, each
 quoted exactly with file and line. The miner is `promise-miner/mine_promises.py`
-(not yet in this repo; ask the person where it is). It calls an AI model, so
-show the person the list of files it will read and their total size, and wait
-for their OK before running it.
+(stdlib only). It calls an AI model, so show the person the list of files it
+will read and their total size, and wait for their OK before running it.
+
+From `promise-miner/`, set `ANTHROPIC_API_KEY`, then
+`python3 mine_promises.py --dry-run` (count tokens, estimate cost, no API
+calls), `python3 mine_promises.py` (model `claude-opus-5-5`), or
+`python3 mine_promises.py --model claude-fable-5-1` (deeper, pricier second
+pass). It writes `promises.jsonl` (one line per spec) and `promises.md`.
+Re-running skips specs already in `promises.jsonl`.
 
 Then **the person picks one promise.** Do not rank or filter the list for
 them unless asked, and never pick one yourself.
@@ -111,8 +117,9 @@ same `verdict` and same `label` in all 10. Then:
 
 - **10 of 10, same state, a written promise broken:** a bug.
 - **Fewer than 10 of 10, or labels differ:** "unknown". Report it as REPLAY
-  DIVERGED. Suggest a better trigger to the person (for example one tied to
-  an event the target writes, like `-kill-at=queued`), but do not report a bug.
+  DIVERGED. Suggest a better trigger to the person (for example a kill tied to
+  an event the target writes, `kill: at: file`, see `CONFIG.md`), but do not
+  report a bug.
 - **Clean replay, no promise broken:** not a bug, however odd it looks.
 
 Whether a finding holds across *different* faults is a separate claim. Make it

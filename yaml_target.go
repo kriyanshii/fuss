@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"math/rand"
@@ -116,8 +117,11 @@ type yamlCheck struct {
 }
 
 type yamlFileCount struct {
-	Glob string `yaml:"glob"`
-	As   string `yaml:"as"`
+	Glob      string `yaml:"glob"`
+	As        string `yaml:"as"`
+	Contains  string `yaml:"contains"`
+	JSONField string `yaml:"json_field"`
+	Equals    string `yaml:"equals"`
 }
 
 type yamlRecCount struct {
@@ -246,6 +250,7 @@ func (y *YAMLAdapter) vars(t *BaseTrial, n string) map[string]string {
 		"binary": t.BinaryPath(),
 		"n":      n,
 		"key":    "",
+		"name":   y.cfg.Name,
 	}
 	if y.cfg.Workload.Ack.Key != "" {
 		m["key"] = expandTemplates(y.cfg.Workload.Ack.Key, m)
@@ -256,7 +261,7 @@ func (y *YAMLAdapter) vars(t *BaseTrial, n string) map[string]string {
 }
 
 func expandTemplates(s string, vars map[string]string) string {
-	keys := []string{"run_id", "binary", "home", "addr", "seed", "dir", "key", "n"}
+	keys := []string{"run_id", "binary", "home", "addr", "seed", "dir", "key", "n", "name"}
 	for _, k := range keys {
 		s = strings.ReplaceAll(s, "${"+k+"}", vars[k])
 	}
@@ -588,8 +593,9 @@ func (y *YAMLAdapter) checkRules(t *BaseTrial) CheckResult {
 	evidence := 0
 	if y.cfg.Check.FileCount.Glob != "" {
 		g := expandTemplates(y.cfg.Check.FileCount.Glob, vars)
-		m, _ := filepath.Glob(g)
-		n := len(m)
+		contains := expandTemplates(y.cfg.Check.FileCount.Contains, vars)
+		equals := expandTemplates(y.cfg.Check.FileCount.Equals, vars)
+		n := countMatchingFiles(g, contains, y.cfg.Check.FileCount.JSONField, equals)
 		name := y.cfg.Check.FileCount.As
 		if name == "" {
 			name = "files"
@@ -647,6 +653,64 @@ func (y *YAMLAdapter) checkRules(t *BaseTrial) CheckResult {
 		}
 	}
 	return CheckResult{Verdict: "FAIL", Evidence: evidence, Problems: []error{fmt.Errorf("no rule matched %v", vals)}}
+}
+
+// countMatchingFiles is filepath.Glob, then optionally keeps only files whose
+// contents match. An empty contains and jsonField counts every glob hit, as
+// before. jsonField walks nested objects and arrays for a key of that name.
+func countMatchingFiles(glob, contains, jsonField, equals string) int {
+	m, _ := filepath.Glob(glob)
+	if contains == "" && jsonField == "" {
+		return len(m)
+	}
+	n := 0
+	for _, p := range m {
+		st, err := os.Stat(p)
+		if err != nil || st.IsDir() {
+			continue
+		}
+		b, err := os.ReadFile(p)
+		if err != nil {
+			continue
+		}
+		if contains != "" && !strings.Contains(string(b), contains) {
+			continue
+		}
+		if jsonField != "" && !jsonFieldEquals(b, jsonField, equals) {
+			continue
+		}
+		n++
+	}
+	return n
+}
+
+func jsonFieldEquals(b []byte, field, want string) bool {
+	var v any
+	if err := json.Unmarshal(b, &v); err != nil {
+		return false
+	}
+	return jsonHasFieldEquals(v, field, want)
+}
+
+func jsonHasFieldEquals(v any, field, want string) bool {
+	switch x := v.(type) {
+	case map[string]any:
+		if got, ok := x[field]; ok && fmt.Sprint(got) == want {
+			return true
+		}
+		for _, child := range x {
+			if jsonHasFieldEquals(child, field, want) {
+				return true
+			}
+		}
+	case []any:
+		for _, child := range x {
+			if jsonHasFieldEquals(child, field, want) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func matchYAMLRule(ifm map[string]any, vals map[string]any) bool {

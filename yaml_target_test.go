@@ -196,6 +196,50 @@ func TestYAMLPlantDirControl(t *testing.T) {
 	}
 }
 
+func TestCountMatchingFilesJSONFieldIgnoresFilename(t *testing.T) {
+	dir := t.TempDir()
+	q := filepath.Join(dir, "queue")
+	if err := os.MkdirAll(q, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Filename does not contain the id; nested JSON id does.
+	if err := os.WriteFile(filepath.Join(q, "item.json"), []byte(`{"dagRun":{"id":"abc-1"}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Filename contains the id; JSON id does not.
+	if err := os.WriteFile(filepath.Join(q, "item_abc-1.json"), []byte(`{"dagRun":{"id":"other"}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got := countMatchingFiles(filepath.Join(q, "*.json"), "", "id", "abc-1")
+	if got != 1 {
+		t.Fatalf("countMatchingFiles = %d, want 1", got)
+	}
+}
+
+func TestYAMLFileCountJSONFieldIgnoresFilename(t *testing.T) {
+	a, err := LoadYAMLTarget("testdata/yaml/filematch/target.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bin, _, err := a.ResolveBinary("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.RunControl("json-id", 1, bin); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestExpandTemplatesName(t *testing.T) {
+	got := expandTemplates("${dir}/${name}.yaml", map[string]string{
+		"dir":  "/tmp/t",
+		"name": "ht",
+	})
+	if got != "/tmp/t/ht.yaml" {
+		t.Fatalf("expandTemplates = %q", got)
+	}
+}
+
 func TestStartArgsReuseOnEmptyRestart(t *testing.T) {
 	a := &YAMLAdapter{cfg: yamlTarget{
 		Args:    []string{"-data-dir", "${home}"},

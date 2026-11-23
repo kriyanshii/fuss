@@ -1,0 +1,89 @@
+# Dagu human-task complete, killed when the run is queued.
+# Maps human.go (-dag=human -kill-at=queued). DAG name is ${name}.
+name: ht
+binary:
+  default: dagu
+  extra: ["./dagu"]
+env:
+  DAGU_HOME: "${home}"
+  DAGU_AUTH_MODE: none
+data_dir: "${home}"
+kill:
+  at: file
+  file:
+    glob: "${home}/data/dag-runs/${name}/dag-runs/*/*/*/dag-run_*_${run_id}/*/status.jsonl"
+    contains: queuedAt
+    poll: 1ms
+    offset_ms: 0
+    timeout: 13s
+steps:
+  - name: write-dag
+    command:
+      - /bin/sh
+      - -c
+      - |
+        cat > ${dir}/${name}.yaml << 'EOF'
+        steps:
+          - id: h
+            action: human.task
+            with:
+              prompt: Continue?
+          - id: after
+            depends: [h]
+            run: sh -c 'echo "start after $DAG_RUN_ID" >> ${dir}/runs.txt; sleep 1; echo "end after $DAG_RUN_ID" >> ${dir}/runs.txt'
+        EOF
+    wait_exit: true
+    timeout: 5s
+  - name: start
+    command: ["${binary}", "start", "--run-id=${run_id}", "${dir}/${name}.yaml"]
+    wait_exit: true
+    timeout: 13s
+  - name: complete
+    command: ["${binary}", "human-task", "complete", "--run-id=${run_id}", "--step=h", "${name}"]
+    kill:
+      at: file
+      file:
+        glob: "${home}/data/dag-runs/${name}/dag-runs/*/*/*/dag-run_*_${run_id}/*/status.jsonl"
+        contains: queuedAt
+        poll: 1ms
+        offset_ms: 0
+        timeout: 13s
+  - name: complete-again
+    command: ["${binary}", "human-task", "complete", "--run-id=${run_id}", "--step=h", "${name}"]
+    wait_exit: true
+    timeout: 45s
+  - name: scheduler
+    command: ["${binary}", "scheduler"]
+    run_for: 60s
+    stop: SIGTERM
+check:
+  file_count:
+    glob: "${home}/data/queue/*/*.json"
+    json_field: id
+    equals: "${run_id}"
+    as: items
+  record_count:
+    contains: "start after ${run_id}"
+    as: starts
+  command:
+    command:
+      - /bin/sh
+      - -c
+      - ${binary} status --run-id=${run_id} ${name} || ${binary} status --run-id=r1 ${name} || cat ${home}/status.txt
+    as: status
+    contains: Queued
+  rules:
+    - if: { starts_gte: 2 }
+      verdict: DOUBLE-RESUME
+    - if: { starts_eq: 1 }
+      verdict: PASS
+    - if: { status_contains: Queued, items_eq: 0 }
+      verdict: STRANDED
+    - else: NO-RESUME
+controls:
+  queue:
+    plant_dir: testdata/yaml/queued
+    expect_verdict: NO-RESUME
+  stranded:
+    plant_dir: testdata/stranded
+    expect_verdict: STRANDED

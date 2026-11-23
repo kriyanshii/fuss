@@ -11,8 +11,8 @@ purpose they do not have: `workload.until` and `kill.signal`.
 
 ## Template variables
 
-`expandTemplates` replaces these eight names, once, in this order: `run_id`,
-`binary`, `home`, `addr`, `seed`, `dir`, `key`, `n`. Text inserted for an
+`expandTemplates` replaces these nine names, once, in this order: `run_id`,
+`binary`, `home`, `addr`, `seed`, `dir`, `key`, `n`, `name`. Text inserted for an
 earlier name is still scanned for a later name. Any other `${...}` is left
 as written.
 
@@ -26,12 +26,14 @@ as written.
 | `${binary}` | `t.BinaryPath()` | Every expansion after `Init`. The resolved binary path. |
 | `${n}` | the string passed into `vars` | The workload request index (`0`, `1`, `2`, ...) while expanding `workload.http` url and body, `workload.ack.key`, and `workload.ack.record`. Empty on every other expansion. |
 | `${key}` | see below | During the workload, the expanded `workload.ack.key`, or `<seed>-<n>` when that field is empty and `${n}` is non-empty. During an ack check, each key parsed from an `ack ` line. Otherwise empty. |
+| `${name}` | `yamlTarget.Name` | Every expansion after `Init`. The YAML `name` field. Use it when a command must name a file or DAG after the target. |
 
 These strings are expanded: `data_dir`, `args`, `restart.args`, `env` values,
 `steps[].command`, `health.http.url`, `restart.health.http.url`,
 `workload.http.url`, `workload.http.body`, `workload.ack.key`,
 `workload.ack.record`, `kill.file.glob`, `kill.file.contains`, the same two
 fields on a step's `kill.file`, `check.file_count.glob`,
+`check.file_count.contains`, `check.file_count.equals`,
 `check.record_count.contains`, `check.command.command`,
 `check.command.contains`, and `check.http.url`.
 
@@ -276,11 +278,29 @@ is `PASS`. Example: `miss_verdict: "LOST WRITE"`
 ### Counts, command, and rules
 
 **`check.file_count.glob`** (string, default: empty). Expanded. The value is
-how many paths `filepath.Glob` returns. A non-empty glob selects rules mode.
+how many paths `filepath.Glob` returns, unless `contains` or `json_field` is
+set (see below). A non-empty glob selects rules mode.
 Example: `glob: "${home}/flag.txt"`
 
 **`check.file_count.as`** (string, default: `files`). Name of that count for
 `rules`. Example: `as: flags`
+
+**`check.file_count.contains`** (string, default: empty). Expanded. When
+non-empty, only files whose contents contain this substring are counted.
+Directories and unreadable paths are skipped. Example: `contains: "READY"`
+
+**`check.file_count.json_field`** (string, default: empty). When non-empty,
+each globbed file is parsed as JSON. The file counts if any object in it
+(nested objects and arrays included) has a key of this name whose value
+equals `equals`. The filename is not consulted. Invalid JSON does not count.
+Example: `json_field: id`
+
+**`check.file_count.equals`** (string, default: empty). Expanded. The value
+`json_field` is compared to, using `fmt.Sprint` of the JSON value.
+Example: `equals: "${run_id}"`
+
+When both `contains` and `json_field` are set, a file must pass both. When
+both are empty, the count is `len` of the glob result, including directories.
 
 **`check.record_count.contains`** (string, default: empty). Expanded. The
 value is `strings.Count` of this needle in the trial record. A non-empty

@@ -1,0 +1,19 @@
+name: filematch
+binary:
+  default: true
+  extra: ["/bin/true"]
+data_dir: "${home}"
+check:
+  file_count:
+    glob: "${home}/data/queue/*/*.json"
+    json_field: id
+    equals: want-id
+    as: items
+  rules:
+    - if: { items_eq: 1 }
+      verdict: PASS
+    - else: FAIL
+controls:
+  json-id:
+    plant_dir: testdata/yaml/filematch/fixture
+    expect_verdict: PASS

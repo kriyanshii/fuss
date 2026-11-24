@@ -9,10 +9,20 @@ supported targets:
 
 - **toykv**: demo KV in `examples/toykv` (YAML). Default loses acked writes; `-fsync` does not
 - **Dagu**: DAG workflow scheduler (original target) - tests zombie detection, retry, human tasks
-- **rqlite**: planned: example adapter exists, its check is not yet backed by a documented promise
+- **rqlite**: 3-node YAML fixture in `examples/rqlite` (pinned version; local `rqlited` on PATH)
 - **fake**: Test adapter for development and unit tests
 
 A new target is a YAML file. See [Testing your own program](#testing-your-own-program).
+
+## What Fuss has shown so far
+
+- repkv (a tiny 3-node KV fixture in examples/repkv): the correct mode passes 10/10. The bug mode, which acks before replicating, gives LOST WRITE 10/10 after the leader is isolated.
+- rqlite (pinned version in examples/rqlite/README.md): 3 real rqlited processes, one row written and acked, the leader paused and its inbound Raft traffic cut, a new leader elected, and the row read back at level=strong. PASS 10/10.
+
+Limits, stated plainly:
+- The rqlite fault is a leader pause plus an inbound cut, not a symmetric network partition. rqlite advertises one Raft address per node, so a userspace proxy can't cut only the leader's outbound links. Symmetric partitions via per-node loopback IPs (Linux, rootless) are planned.
+- A PASS confirms rqlite's documented guarantee for this one scenario. It does not prove rqlite correct.
+- No new bugs found yet.
 
 ## Five minutes
 

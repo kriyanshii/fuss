@@ -10,3 +10,5 @@ __pycache__/
 *.pyc
 claude_history/
 PROJECT_CONTEXT.md
+/examples/etcd/etcd
+/examples/etcd/etcdctl

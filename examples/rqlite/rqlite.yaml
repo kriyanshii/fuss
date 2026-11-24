@@ -1,4 +1,4 @@
-# rqlite v0: per_node Raft proxies + inbound isolate + pause of the bootstrap leader.
+# rqlite v10.7.4: per_node_owned Raft proxies, symmetric isolate of node_0, no pause.
 # Requires rqlited v10.7.4 on PATH. Not run in CI.
 name: rqlite
 binary:
@@ -9,7 +9,7 @@ topology:
   data_dir: "${dir}/node${i}"
   ports:
     base: 0
-  proxy_mode: per_node
+  proxy_mode: per_node_owned
   peers:
     port_name: raft
     via_proxy: true
@@ -78,7 +78,7 @@ topology:
           if [ "$code" != "200" ]; then finish UNKNOWN; fi
           echo "ack ${KEY}" >> "${DIR}/runs.txt"
           echo NOW > "$CUT"
-          # New leader must be node_1 or node_2 (not paused node_0), observed after cut.
+          # New leader must be node_1 or node_2 (not isolated node_0), observed after cut.
           NEW_HTTP=""
           NEW_NODE=""
           for _ in $(seq 1 100); do
@@ -97,7 +97,7 @@ topology:
             finish "LOST WRITE read_from=${NEW_NODE}"
           fi
         ) &
-        # exec so fault.pause SIGSTOP hits rqlited, not a waiting shell
+        # exec so the PID Fuss recorded is rqlited, which owns the Raft sockets
         exec ${binary} -node-id "node_${i}" \
           -http-addr "$HTTP" \
           -raft-addr "$RAFT" \
@@ -129,8 +129,7 @@ topology:
 fault:
   isolate:
     node: node_0
-    direction: inbound
-  pause: node_0
+    direction: both
   after:
     file:
       glob: "${dir}/cut_now"

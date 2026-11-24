@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -193,6 +194,117 @@ func TestYAMLPlantDirControl(t *testing.T) {
 	}
 	if err := a.RunControl("planted", 1, bin); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestCountMatchingFilesJSONFieldIgnoresFilename(t *testing.T) {
+	dir := t.TempDir()
+	q := filepath.Join(dir, "queue")
+	if err := os.MkdirAll(q, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Filename does not contain the id; nested JSON path does.
+	if err := os.WriteFile(filepath.Join(q, "item.json"), []byte(`{"dagRun":{"id":"abc-1"}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Filename contains the id; JSON path does not.
+	if err := os.WriteFile(filepath.Join(q, "item_abc-1.json"), []byte(`{"dagRun":{"id":"other"}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got := countMatchingFiles(filepath.Join(q, "*.json"), "", "dagRun.id", "abc-1")
+	if got != 1 {
+		t.Fatalf("countMatchingFiles = %d, want 1", got)
+	}
+	// Bare key name still finds a nested id.
+	if got := countMatchingFiles(filepath.Join(q, "*.json"), "", "id", "abc-1"); got != 1 {
+		t.Fatalf("bare id countMatchingFiles = %d, want 1", got)
+	}
+}
+
+func TestYAMLFileCountJSONFieldIgnoresFilename(t *testing.T) {
+	a, err := LoadYAMLTarget("testdata/yaml/filematch/target.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bin, _, err := a.ResolveBinary("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.RunControl("json-id", 1, bin); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestExpandTemplatesName(t *testing.T) {
+	got := expandTemplates("${dir}/${name}.yaml", map[string]string{
+		"dir":  "/tmp/t",
+		"name": "ht",
+	})
+	if got != "/tmp/t/ht.yaml" {
+		t.Fatalf("expandTemplates = %q", got)
+	}
+}
+
+func TestYAMLStepDelay(t *testing.T) {
+	dir := t.TempDir()
+	cfg := filepath.Join(dir, "delay.yaml")
+	marker := filepath.Join(dir, "after.txt")
+	body := fmt.Sprintf(`
+name: delay-step
+binary:
+  default: true
+  extra: ["/bin/true"]
+steps:
+  - name: live
+    command: ["/bin/sleep", "0.01"]
+  - name: wait
+    delay: 80ms
+  - name: mark
+    command: ["/bin/sh", "-c", "echo done > %s"]
+    wait_exit: true
+    timeout: 2s
+check:
+  command:
+    command: ["/bin/cat", "%s"]
+    as: out
+  rules:
+    - if: { out_contains: done }
+      verdict: PASS
+    - else: FAIL
+`, marker, marker)
+	if err := os.WriteFile(cfg, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	a, err := LoadYAMLTarget(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bin, _, err := a.ResolveBinary("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	trialDir := t.TempDir()
+	at, err := a.Init(1, trialDir, bin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	log, err := os.Create(filepath.Join(trialDir, "log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer log.Close()
+	start := time.Now()
+	cmd, err := a.Start(at, log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd.Wait()
+	cr := a.CheckNamed(at, true, "delay")
+	if cr.Verdict != "PASS" {
+		t.Fatalf("verdict %s problems %v", cr.Verdict, cr.Problems)
+	}
+	if elapsed := time.Since(start); elapsed < 80*time.Millisecond {
+		t.Fatalf("elapsed %v; step delay should have waited >= 80ms", elapsed)
 	}
 }
 

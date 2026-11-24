@@ -11,9 +11,9 @@ purpose they do not have: `workload.until` and `kill.signal`.
 
 ## Template variables
 
-`expandTemplates` replaces these thirteen names, once, in this order: `run_id`,
+`expandTemplates` replaces these fourteen names, once, in this order: `run_id`,
 `binary`, `home`, `addr`, `seed`, `dir`, `key`, `n`, `i`, `port`,
-`data_dir`, `peers`, `peers_via_proxy`. Then any `${peer_addr_<j>}` or
+`data_dir`, `peers`, `peers_via_proxy`, `name`. Then any `${peer_addr_<j>}` or
 `${node_proxy_addr_<k>}` present in `vars`. Text inserted for an earlier
 name is still scanned for a later name. Any other `${...}` is left as written.
 
@@ -34,6 +34,7 @@ name is still scanned for a later name. Any other `${...}` is left as written.
 | `${peers}` | comma-joined peer proxy addrs | Same; every `${peer_addr_<j>}` for `j != i`. |
 | `${node_proxy_addr_<k>}` | inbound proxy listen for node `k` | Topology expansion when `topology.proxy_mode` is `per_node` or `per_node_owned`. |
 | `${peers_via_proxy}` | same as `${peers}` | Set with `per_node` or `per_node_owned` (and `via_proxy`); convenient when the start line should name the shared inbound fronts. |
+| `${name}` | `yamlTarget.Name` | Every expansion after `Init`. The YAML `name` field. |
 
 These strings are expanded: `data_dir`, `args`, `restart.args`, `env` values,
 `steps[].command`, `topology.data_dir`, `topology.start`,
@@ -42,6 +43,7 @@ These strings are expanded: `data_dir`, `args`, `restart.args`, `env` values,
 `workload.http.url`, `workload.http.body`, `workload.ack.key`,
 `workload.ack.record`, `kill.file.glob`, `kill.file.contains`, the same two
 fields on a step's `kill.file`, `check.file_count.glob`,
+`check.file_count.contains`, `check.file_count.equals`,
 `check.record_count.contains`, `check.command.command`,
 `check.command.contains`, and `check.http.url`.
 
@@ -217,12 +219,12 @@ When `steps` has one or more entries, `Start` runs steps and does not launch
 The binary is still resolved so the run can name it.
 Each `command` is its own program: the first element is the executable.
 
-Walk order for each step: `run_for` if set, otherwise `wait_exit`, otherwise
-this step is the live process. Steps before the live one run during `Start`.
-The first live step is the process that gets killed. Steps after it are
-stored and run at the beginning of `Check`, logged to `after.log` in the
-trial directory. If every step exits, `Start` runs `/bin/true` as the live
-process.
+Walk order for each step: sleep `delay` if set, then `run_for` if set,
+otherwise `wait_exit`, otherwise this step is the live process. Steps before
+the live one run during `Start`. The first live step is the process that gets
+killed. Steps after it are stored and run at the beginning of `Check`, logged
+to `after.log` in the trial directory. If every step exits, `Start` runs
+`/bin/true` as the live process.
 
 After-steps ignore `wait_exit`. A step with `run_for` sleeps then signals.
 Any other after-step runs to completion inside `timeout`.
@@ -230,8 +232,13 @@ Any other after-step runs to completion inside `timeout`.
 **`steps[].name`** (string, default: empty). Used in error text.
 Example: `name: hold`
 
-**`steps[].command`** (list of strings, no default). Empty is an error.
-Example: `command: ["/bin/sh", "-c", "echo A >> ${dir}/seq.txt"]`
+**`steps[].command`** (list of strings, default: empty). Empty is an error
+unless `delay` is set (a pure wait). Example:
+`command: ["/bin/sh", "-c", "echo A >> ${dir}/seq.txt"]`
+
+**`steps[].delay`** (duration, default: empty). Sleep this long before the
+step's command (or alone, when `command` is empty). Unparseable values sleep
+zero. Example: `delay: 35s`
 
 **`steps[].wait_exit`** (bool, default: `false`). On the way to the live
 step, `true` waits for the command to finish. Example: `wait_exit: true`
@@ -252,10 +259,11 @@ error is ignored. Example: `stop: SIGTERM`
 
 **`steps[].kill`** (object, same fields as `kill`). On the live step, `at:
 file` saves `kill.file` and `WaitBeforeKill` uses that spec instead of the
-top-level `kill.file`. `signal` and `delay` on a step are accepted and not
-read. A step `at` other than `file` is not read. The top-level `kill.at` is
-still the one `LoadYAMLTarget` checks, and it is the fallback when no step
-stored a file spec. Example: `kill: { at: file, file: { glob: "${dir}/seq.txt", contains: B, poll: 5ms, timeout: 5s } }`
+top-level `kill.file`. `kill.signal` and `kill.delay` on a step are accepted
+and not read. A step `at` other than `file` is not read. The top-level
+`kill.at` is still the one `LoadYAMLTarget` checks, and it is the fallback
+when no step stored a file spec. Example:
+`kill: { at: file, file: { glob: "${dir}/seq.txt", contains: B, poll: 5ms, timeout: 5s } }`
 
 ## `topology`
 
@@ -411,11 +419,29 @@ is `PASS`. Example: `miss_verdict: "LOST WRITE"`
 ### Counts, command, and rules
 
 **`check.file_count.glob`** (string, default: empty). Expanded. The value is
-how many paths `filepath.Glob` returns. A non-empty glob selects rules mode.
+how many paths `filepath.Glob` returns, unless `contains` or `json_field` is
+set (see below). A non-empty glob selects rules mode.
 Example: `glob: "${home}/flag.txt"`
 
 **`check.file_count.as`** (string, default: `files`). Name of that count for
 `rules`. Example: `as: flags`
+
+**`check.file_count.contains`** (string, default: empty). Expanded. When
+non-empty, only files whose contents contain this substring are counted.
+Directories and unreadable paths are skipped. Example: `contains: "READY"`
+
+**`check.file_count.json_field`** (string, default: empty). When non-empty,
+each globbed file is parsed as JSON. A dotted path (`dagRun.id`) walks object
+keys in order. A bare name searches nested objects and arrays for a key of
+that name. The file counts if the matched value equals `equals`. The filename
+is not consulted. Invalid JSON does not count. Example: `json_field: dagRun.id`
+
+**`check.file_count.equals`** (string, default: empty). Expanded. The value
+`json_field` is compared to, using `fmt.Sprint` of the JSON value.
+Example: `equals: "${run_id}"`
+
+When both `contains` and `json_field` are set, a file must pass both. When
+both are empty, the count is `len` of the glob result, including directories.
 
 **`check.record_count.contains`** (string, default: empty). Expanded. The
 value is `strings.Count` of this needle in the trial record. A non-empty

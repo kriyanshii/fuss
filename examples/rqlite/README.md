@@ -20,7 +20,7 @@ CI does not install or run rqlite; this example is local-only.
 | Write ack | Non-queued `POST /db/execute` is accepted only after a **Raft majority commit** (do not use `?queue`) | [FAQ](https://rqlite.io/docs/faq/) · [Queued Writes](https://rqlite.io/docs/api/queued-writes/) |
 | Read level | **`level=strong`** for the post-isolate check (default is `weak`) | [Read Consistency](https://rqlite.io/docs/api/read-consistency/) |
 | Election defaults | Heartbeat **1s**, election **1s**, commit **50ms**; leader lease flag `0s` → Raft default **500ms**. Scenario waits up to **10s** for a new leader. | [flags.toml @ v10.7.4](https://github.com/rqlite/rqlite/blob/v10.7.4/cmd/rqlited/flags.toml) · [hashicorp/raft DefaultConfig](https://github.com/hashicorp/raft/blob/v1.8.0/config.go) |
-| Expected verdict | **PASS** — majority-committed row remains visible via `strong` read on the new leader after a symmetric isolate of node 0, with no pause | Derived from the sources above |
+| Expected verdict | **PASS**: majority-committed row remains visible via `strong` read on the new leader after a symmetric isolate of node 0, with no pause | Derived from the sources above |
 
 **v0 limits:** rqlite advertises one Raft address per node. `per_node_owned`
 still uses that one inbound proxy per node, and tags each accepted connection
@@ -34,7 +34,7 @@ and Fuss `topology.proxy_mode` / `fault.isolate.direction` in
 ## Scenario
 
 1. Node 0 bootstraps; nodes 1 and 2 `-join` its Raft/mux address
-   (`host:port` of node 0’s proxy — not an `http://` URL).
+   (`host:port` of node 0’s proxy, not an `http://` URL).
 2. Create a table; `POST` one row to node 0 **without** `?queue`; require HTTP 200.
 3. Isolate `node_0` with `direction: both`. No pause.
 4. Poll `/status` on nodes 1 and 2 for up to 10s until one reports

@@ -1,4 +1,4 @@
-# rqlite v0: per_node_owned Raft proxies, symmetric isolate of node_0, no pause.
+# rqlite v10.7.4: per_node_owned Raft proxies, symmetric isolate of node_0, no pause.
 # Requires rqlited v10.7.4 on PATH. Not run in CI.
 name: rqlite
 binary:

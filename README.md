@@ -18,6 +18,7 @@ A new target is a YAML file. See [Testing your own program](#testing-your-own-pr
 
 - repkv (a tiny 3-node KV fixture in examples/repkv): the correct mode passes 10/10. The bug mode, which acks before replicating, gives LOST WRITE 10/10 after the leader is isolated.
 - rqlite (pinned version in examples/rqlite/README.md): 3 real rqlited processes, one row written and acked, the leader isolated both ways (`per_node_owned`, no pause), a new leader elected, and the row read back at level=strong. PASS 10/10.
+- etcd v3.7.4, symmetric isolate of the leader, no pause, PASS 10/10.
 
 Limits, stated plainly:
 - The rqlite fault is a symmetric isolate of the leader. rqlite still advertises one Raft address per node; `per_node_owned` tags the source process, so node 0’s outbound heartbeats are refused and nodes 1 and 2 keep talking. There is no pause.

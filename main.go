@@ -330,6 +330,17 @@ func runAdapter(adapter Adapter, targetFlag string, seed int64, n int, doKill bo
 			say("  dir=%s\n", result.dir)
 		}
 
+		ev := map[string]any{
+			"delay_ms": ms(result.delay),
+			"killed":   result.killed,
+			"status":   result.status,
+			"exit":     result.exit,
+			"took_ms":  ms(result.took),
+			"acks":     result.acks,
+		}
+		if len(result.topology) > 0 {
+			ev["topology"] = result.topology
+		}
 		emit(map[string]any{
 			"type":     "trial",
 			"mode":     adapter.Name(),
@@ -338,14 +349,7 @@ func runAdapter(adapter Adapter, targetFlag string, seed int64, n int, doKill bo
 			"verdict":  result.verdict,
 			"dir":      result.dir,
 			"dir_kept": result.verdict != "PASS",
-			"evidence": map[string]any{
-				"delay_ms": ms(result.delay),
-				"killed":   result.killed,
-				"status":   result.status,
-				"exit":     result.exit,
-				"took_ms":  ms(result.took),
-				"acks":     result.acks,
-			},
+			"evidence": ev,
 		})
 
 		if result.verdict == "PASS" {
@@ -370,16 +374,17 @@ func runAdapter(adapter Adapter, targetFlag string, seed int64, n int, doKill bo
 }
 
 type adapterTrialResult struct {
-	dir      string
-	verdict  string
-	phase    string
-	killed   bool
-	delay    time.Duration
-	took     time.Duration
-	exit     int
-	status   string
-	problems []error
-	acks     int
+	dir       string
+	verdict   string
+	phase     string
+	killed    bool
+	delay     time.Duration
+	took      time.Duration
+	exit      int
+	status    string
+	problems  []error
+	acks      int
+	topology  []map[string]any
 }
 
 func runAdapterTrial(adapter Adapter, seed int64, binaryPath string, doKill bool) (*adapterTrialResult, error) {
@@ -477,6 +482,9 @@ func runAdapterTrial(adapter Adapter, seed int64, binaryPath string, doKill bool
 		} else {
 			result.verdict = "PASS"
 		}
+	}
+	if rt, ok := at.Data()["topology"].(*topologyRuntime); ok {
+		result.topology = rt.evidence()
 	}
 
 	return result, nil

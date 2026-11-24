@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"math/rand"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -11,6 +12,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -18,21 +20,46 @@ import (
 )
 
 type yamlTarget struct {
-	Name     string                 `yaml:"name"`
-	Binary   yamlBinary             `yaml:"binary"`
-	Args     []string               `yaml:"args"`
-	Env      map[string]string      `yaml:"env"`
-	DataDir  string                 `yaml:"data_dir"`
-	PortBase int                    `yaml:"port_base"`
-	PortMod  int                    `yaml:"port_mod"`
-	Start    yamlStart              `yaml:"start"`
-	Health   yamlHealth             `yaml:"health"`
-	Workload yamlWorkload           `yaml:"workload"`
-	Kill     yamlKill               `yaml:"kill"`
-	Restart  yamlRestart            `yaml:"restart"`
-	Steps    []yamlStep             `yaml:"steps"`
-	Check    yamlCheck              `yaml:"check"`
-	Controls map[string]yamlControl `yaml:"controls"`
+	Name      string                 `yaml:"name"`
+	Binary    yamlBinary             `yaml:"binary"`
+	Args      []string               `yaml:"args"`
+	Env       map[string]string      `yaml:"env"`
+	DataDir   string                 `yaml:"data_dir"`
+	PortBase  int                    `yaml:"port_base"`
+	PortMod   int                    `yaml:"port_mod"`
+	Start     yamlStart              `yaml:"start"`
+	Health    yamlHealth             `yaml:"health"`
+	Workload  yamlWorkload           `yaml:"workload"`
+	Kill      yamlKill               `yaml:"kill"`
+	Restart   yamlRestart            `yaml:"restart"`
+	Steps     []yamlStep             `yaml:"steps"`
+	Topology  yamlTopology           `yaml:"topology"`
+	Check     yamlCheck              `yaml:"check"`
+	Controls  map[string]yamlControl `yaml:"controls"`
+}
+
+// yamlTopology starts N peer processes for one trial. Empty Nodes means no topology.
+type yamlTopology struct {
+	Nodes     int           `yaml:"nodes"`
+	DataDir   string        `yaml:"data_dir"`
+	Ports     yamlTopoPorts `yaml:"ports"`
+	Start     []string      `yaml:"start"`
+	Ready     yamlTopoReady `yaml:"ready"`
+	StopGrace string        `yaml:"stop_grace"`
+}
+
+type yamlTopoPorts struct {
+	Base int `yaml:"base"` // 0 means pick a free port per node
+}
+
+// yamlTopoReady is a per-node readiness check. File (path exists, optional
+// contains) and command (stdout contains) are both accepted; file is tried
+// first when set.
+type yamlTopoReady struct {
+	File     string   `yaml:"file"`
+	Contains string   `yaml:"contains"`
+	Command  []string `yaml:"command"`
+	Timeout  string   `yaml:"timeout"`
 }
 
 type yamlBinary struct {
@@ -256,7 +283,7 @@ func (y *YAMLAdapter) vars(t *BaseTrial, n string) map[string]string {
 }
 
 func expandTemplates(s string, vars map[string]string) string {
-	keys := []string{"run_id", "binary", "home", "addr", "seed", "dir", "key", "n"}
+	keys := []string{"run_id", "binary", "home", "addr", "seed", "dir", "key", "n", "i", "port", "data_dir"}
 	for _, k := range keys {
 		s = strings.ReplaceAll(s, "${"+k+"}", vars[k])
 	}
@@ -286,6 +313,9 @@ func (y *YAMLAdapter) Start(at AdapterTrial, log *os.File) (*exec.Cmd, error) {
 	t, ok := at.(*BaseTrial)
 	if !ok {
 		return nil, fmt.Errorf("expected *BaseTrial, got %T", at)
+	}
+	if y.cfg.Topology.Nodes > 0 {
+		return y.startTopology(t, log)
 	}
 	if len(y.cfg.Steps) > 0 {
 		return y.startSteps(t, log)
@@ -400,6 +430,291 @@ func signalNamed(cmd *exec.Cmd, name string) error {
 		return cmd.Process.Kill()
 	default:
 		return fmt.Errorf("unknown stop signal %q", name)
+	}
+}
+
+// topologyNode is one peer process in a topology trial.
+type topologyNode struct {
+	Index      int
+	PID        int
+	Port       int
+	DataDir    string
+	StartTime  time.Time
+	ExitStatus *int
+	Ready      bool
+	StopHow    string // "SIGTERM", "SIGKILL", or empty if not stopped by us
+	cmd        *exec.Cmd
+	waitDone   chan struct{}
+}
+
+type topologyRuntime struct {
+	mu       sync.Mutex
+	Nodes    []*topologyNode
+	AllReady bool
+	Stopped  bool
+}
+
+func (rt *topologyRuntime) evidence() []map[string]any {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	out := make([]map[string]any, 0, len(rt.Nodes))
+	for _, n := range rt.Nodes {
+		if n == nil {
+			continue
+		}
+		m := map[string]any{
+			"i":          n.Index,
+			"pid":        n.PID,
+			"port":       n.Port,
+			"data_dir":   n.DataDir,
+			"start_time": n.StartTime.UTC().Format(time.RFC3339Nano),
+			"ready":      n.Ready,
+			"stop":       n.StopHow,
+		}
+		if n.ExitStatus != nil {
+			m["exit_status"] = *n.ExitStatus
+		} else {
+			m["exit_status"] = nil
+		}
+		out = append(out, m)
+	}
+	return out
+}
+
+func freePort() (int, error) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return 0, err
+	}
+	defer ln.Close()
+	return ln.Addr().(*net.TCPAddr).Port, nil
+}
+
+func (y *YAMLAdapter) startTopology(t *BaseTrial, log *os.File) (*exec.Cmd, error) {
+	topo := y.cfg.Topology
+	if len(topo.Start) == 0 {
+		return nil, fmt.Errorf("topology.start is required when topology.nodes > 0")
+	}
+	n := topo.Nodes
+	ports := make([]int, n)
+	for i := 0; i < n; i++ {
+		if topo.Ports.Base == 0 {
+			p, err := freePort()
+			if err != nil {
+				return nil, fmt.Errorf("topology: free port: %w", err)
+			}
+			ports[i] = p
+		} else {
+			ports[i] = topo.Ports.Base + i
+		}
+	}
+
+	rt := &topologyRuntime{Nodes: make([]*topologyNode, n)}
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	errs := make([]error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			base := y.vars(t, "")
+			base["i"] = strconv.Itoa(i)
+			dataDirTmpl := topo.DataDir
+			if dataDirTmpl == "" {
+				dataDirTmpl = "${dir}/node${i}"
+			}
+			dataDir := expandTemplates(dataDirTmpl, base)
+			if err := os.MkdirAll(dataDir, 0o755); err != nil {
+				errs[i] = err
+				return
+			}
+			vars := y.vars(t, "")
+			vars["i"] = strconv.Itoa(i)
+			vars["data_dir"] = dataDir
+			vars["port"] = strconv.Itoa(ports[i])
+			args := y.expandSlice(topo.Start, vars)
+			if len(args) == 0 {
+				errs[i] = fmt.Errorf("topology.start expanded empty for node %d", i)
+				return
+			}
+			cmd := exec.Command(args[0], args[1:]...)
+			cmd.Stdout = log
+			cmd.Stderr = log
+			y.applyEnv(cmd, vars)
+			startTime := time.Now()
+			if err := cmd.Start(); err != nil {
+				errs[i] = fmt.Errorf("topology node %d: %w", i, err)
+				return
+			}
+			node := &topologyNode{
+				Index:     i,
+				PID:       cmd.Process.Pid,
+				Port:      ports[i],
+				DataDir:   dataDir,
+				StartTime: startTime,
+				cmd:       cmd,
+				waitDone:  make(chan struct{}),
+			}
+			go func() {
+				_ = cmd.Wait()
+				mu.Lock()
+				code := -1
+				if cmd.ProcessState != nil {
+					code = cmd.ProcessState.ExitCode()
+				}
+				node.ExitStatus = &code
+				mu.Unlock()
+				close(node.waitDone)
+			}()
+			mu.Lock()
+			rt.Nodes[i] = node
+			mu.Unlock()
+		}(i)
+	}
+	wg.Wait()
+	for _, err := range errs {
+		if err != nil {
+			y.stopTopology(rt)
+			return nil, err
+		}
+	}
+
+	readyTo := parseYAMLDuration(topo.Ready.Timeout, 5*time.Second)
+	allReady := true
+	var readyWG sync.WaitGroup
+	for i := 0; i < n; i++ {
+		readyWG.Add(1)
+		go func(i int) {
+			defer readyWG.Done()
+			node := rt.Nodes[i]
+			vars := y.vars(t, "")
+			vars["i"] = strconv.Itoa(i)
+			vars["data_dir"] = node.DataDir
+			vars["port"] = strconv.Itoa(node.Port)
+			if err := y.waitTopologyReady(node, vars, readyTo); err != nil {
+				mu.Lock()
+				allReady = false
+				mu.Unlock()
+				return
+			}
+			mu.Lock()
+			node.Ready = true
+			mu.Unlock()
+		}(i)
+	}
+	readyWG.Wait()
+	rt.AllReady = allReady
+	t.Data()["topology"] = rt
+
+	hold := exec.Command("sleep", "3600")
+	hold.Stdout = log
+	hold.Stderr = log
+	if err := hold.Start(); err != nil {
+		y.stopTopology(rt)
+		return nil, err
+	}
+	return hold, nil
+}
+
+func (y *YAMLAdapter) waitTopologyReady(node *topologyNode, vars map[string]string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		select {
+		case <-node.waitDone:
+			return fmt.Errorf("topology node %d exited before ready", node.Index)
+		default:
+		}
+		if y.topologyReadyOnce(vars) {
+			return nil
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return fmt.Errorf("topology node %d not ready in %v", node.Index, timeout)
+}
+
+func (y *YAMLAdapter) topologyReadyOnce(vars map[string]string) bool {
+	r := y.cfg.Topology.Ready
+	if r.File != "" {
+		p := expandTemplates(r.File, vars)
+		b, err := os.ReadFile(p)
+		if err != nil {
+			return false
+		}
+		if r.Contains == "" || strings.Contains(string(b), expandTemplates(r.Contains, vars)) {
+			return true
+		}
+		return false
+	}
+	if len(r.Command) > 0 {
+		args := y.expandSlice(r.Command, vars)
+		cmd := exec.Command(args[0], args[1:]...)
+		y.applyEnv(cmd, vars)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			return false
+		}
+		if r.Contains == "" {
+			return len(out) > 0
+		}
+		return strings.Contains(string(out), expandTemplates(r.Contains, vars))
+	}
+	// No ready check configured: treat as ready once started.
+	return true
+}
+
+func (y *YAMLAdapter) stopTopology(rt *topologyRuntime) {
+	if rt == nil {
+		return
+	}
+	rt.mu.Lock()
+	if rt.Stopped {
+		rt.mu.Unlock()
+		return
+	}
+	rt.Stopped = true
+	nodes := append([]*topologyNode(nil), rt.Nodes...)
+	rt.mu.Unlock()
+
+	grace := parseYAMLDuration(y.cfg.Topology.StopGrace, 2*time.Second)
+	for _, n := range nodes {
+		if n == nil || n.cmd == nil || n.cmd.Process == nil {
+			continue
+		}
+		_ = n.cmd.Process.Signal(syscall.SIGTERM)
+	}
+	deadline := time.Now().Add(grace)
+	for _, n := range nodes {
+		if n == nil || n.waitDone == nil {
+			continue
+		}
+		remaining := time.Until(deadline)
+		if remaining < 0 {
+			remaining = 0
+		}
+		select {
+		case <-n.waitDone:
+			rt.mu.Lock()
+			if n.StopHow == "" {
+				n.StopHow = "SIGTERM"
+			}
+			rt.mu.Unlock()
+		case <-time.After(remaining):
+		}
+	}
+	for _, n := range nodes {
+		if n == nil || n.cmd == nil || n.cmd.Process == nil {
+			continue
+		}
+		select {
+		case <-n.waitDone:
+			continue
+		default:
+		}
+		_ = n.cmd.Process.Kill()
+		<-n.waitDone
+		rt.mu.Lock()
+		n.StopHow = "SIGKILL"
+		rt.mu.Unlock()
 	}
 }
 
@@ -537,6 +852,16 @@ func (y *YAMLAdapter) CheckNamed(at AdapterTrial, killed bool, phase string) Che
 	t, ok := at.(*BaseTrial)
 	if !ok {
 		return CheckResult{Verdict: "FAIL", Problems: []error{fmt.Errorf("expected *BaseTrial, got %T", at)}}
+	}
+	if rt, ok := t.Data()["topology"].(*topologyRuntime); ok {
+		defer y.stopTopology(rt)
+		if !rt.AllReady {
+			return CheckResult{
+				Verdict:  "UNKNOWN",
+				Evidence: 1,
+				Problems: []error{fmt.Errorf("topology: a node was not ready in time")},
+			}
+		}
 	}
 	if after, ok := t.Data()["after_steps"].([]yamlStep); ok {
 		if err := y.runAfterSteps(t, after); err != nil {

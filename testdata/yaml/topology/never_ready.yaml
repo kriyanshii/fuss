@@ -1,0 +1,23 @@
+name: topology-never
+binary:
+  default: hold
+  extra: ["./testdata/yaml/topology/hold"]
+topology:
+  nodes: 2
+  data_dir: "${dir}/node${i}"
+  ports:
+    base: 0
+  start: ["${binary}", "${data_dir}", "never"]
+  ready:
+    file: "${data_dir}/ready"
+    contains: READY
+    timeout: 200ms
+  stop_grace: 200ms
+check:
+  file_count:
+    glob: "${dir}/node*/ready"
+    as: ready_files
+  rules:
+    - if: { ready_files_eq: 2 }
+      verdict: PASS
+    - else: FAIL

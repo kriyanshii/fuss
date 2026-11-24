@@ -1,6 +1,7 @@
 package main
 
 import (
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -675,6 +676,212 @@ func TestYAMLTopologyPauseNode0(t *testing.T) {
 		if pidAlive(pid) {
 			t.Fatalf("stray pid %d after teardown", pid)
 		}
+	}
+}
+
+func TestYAMLTopologyPerNodeOwnedIsolate(t *testing.T) {
+	a, at, rt, hold, dir := startPerNodeOwnedTrial(t)
+	if len(rt.Links) != 3 {
+		t.Fatalf("links=%d want 3 (one inbound proxy per node)", len(rt.Links))
+	}
+
+	for i := 0; i < 3; i++ {
+		waitFileHas(t, filepath.Join(rt.Nodes[i].DataDir, "ping_ok"), "OK", 5*time.Second)
+	}
+	proxy := proxyByDest(rt)
+	if err := os.WriteFile(filepath.Join(dir, "cut_now"), []byte("NOW\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	waitIsolateFired(t, rt)
+
+	if !pidAlive(rt.Nodes[0].PID) {
+		t.Fatal("node 0 died after isolate")
+	}
+	deadline := time.Now().Add(8 * time.Second)
+	for {
+		p0 := readPings(rt.Nodes[0].DataDir)
+		p1 := readPings(rt.Nodes[1].DataDir)
+		p2 := readPings(rt.Nodes[2].DataDir)
+		n0fail := !p0[proxy[1]] && !p0[proxy[2]]
+		keep := !p1[proxy[0]] && p1[proxy[2]] && !p2[proxy[0]] && p2[proxy[1]]
+		if n0fail && keep {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("post-cut pings: n0=%v n1=%v n2=%v", p0, p1, p2)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	ev := rt.isolateEvidence()
+	if ev["proxy_mode"] != "per_node_owned" || ev["direction"] != "both" {
+		t.Fatalf("evidence mode/dir = %v %v", ev["proxy_mode"], ev["direction"])
+	}
+	if ev["links_cut"] != 4 || ev["links_total"] != 6 {
+		t.Fatalf("links_cut=%v links_total=%v", ev["links_cut"], ev["links_total"])
+	}
+	links, _ := ev["links"].([]map[string]any)
+	if len(links) != 6 {
+		t.Fatalf("evidence links=%d", len(links))
+	}
+	unk, _ := ev["unknown_owners"].([]map[string]any)
+	if len(unk) != 0 {
+		t.Fatalf("unknown owners %#v", unk)
+	}
+	by := map[[2]int]map[string]any{}
+	for _, L := range links {
+		from, _ := L["from"].(int)
+		to, _ := L["to"].(int)
+		by[[2]int{from, to}] = L
+	}
+	keptRefused := statField(by[[2]int{1, 2}], "refused_while_cut") + statField(by[[2]int{2, 1}], "refused_while_cut")
+	keptClosed := statField(by[[2]int{1, 2}], "closed_by_cut") + statField(by[[2]int{2, 1}], "closed_by_cut")
+	if keptRefused != 0 || keptClosed != 0 {
+		t.Fatalf("kept 1↔2 counters refused=%d closed=%d; links=%v", keptRefused, keptClosed, links)
+	}
+	if statField(by[[2]int{0, 1}], "refused_while_cut") == 0 || statField(by[[2]int{0, 2}], "refused_while_cut") == 0 {
+		t.Fatalf("cut sources did not record their own refuses: %v", links)
+	}
+
+	_ = hold.Process.Kill()
+	_ = hold.Wait()
+	cr := a.CheckNamed(at, true, "topology")
+	if cr.Verdict != "PASS" {
+		t.Fatalf("verdict %s problems %v", cr.Verdict, cr.Problems)
+	}
+}
+
+func TestYAMLTopologyPerNodeOwnedUnknown(t *testing.T) {
+	a, at, rt, hold, dir := startPerNodeOwnedTrial(t)
+	for i := 0; i < 3; i++ {
+		waitFileHas(t, filepath.Join(rt.Nodes[i].DataDir, "ping_ok"), "OK", 5*time.Second)
+	}
+	proxy := proxyByDest(rt)
+	c, err := net.DialTimeout("tcp", proxy[0], time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		ev := rt.isolateEvidence()
+		unk, _ := ev["unknown_owners"].([]map[string]any)
+		if len(unk) > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for unknown owner")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "cut_now"), []byte("NOW\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	waitIsolateFired(t, rt)
+	deadline = time.Now().Add(3 * time.Second)
+	for {
+		ev := rt.isolateEvidence()
+		unk, _ := ev["unknown_owners"].([]map[string]any)
+		cutUnk := false
+		for _, u := range unk {
+			if u["cut"] == true && u["to"] == 0 {
+				cutUnk = true
+			}
+		}
+		if cutUnk && ev["links_cut"] == 4 && ev["links_total"] == 6 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("evidence after cut: %#v", ev)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	_ = hold.Process.Kill()
+	_ = hold.Wait()
+	cr := a.CheckNamed(at, true, "topology")
+	if cr.Verdict != "UNKNOWN" {
+		t.Fatalf("verdict %s want UNKNOWN problems %v", cr.Verdict, cr.Problems)
+	}
+}
+
+func startPerNodeOwnedTrial(t *testing.T) (*YAMLAdapter, AdapterTrial, *topologyRuntime, *exec.Cmd, string) {
+	t.Helper()
+	buildTopologyHold(t)
+	a, err := LoadYAMLTarget("testdata/yaml/topology/isolate_per_node_owned.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bin, _, err := a.ResolveBinary("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	at, err := a.Init(1, dir, bin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	log, err := os.Create(filepath.Join(dir, "log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { log.Close() })
+
+	hold, err := a.Start(at, log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rt := at.Data()["topology"].(*topologyRuntime)
+	t.Cleanup(func() {
+		a.stopTopology(rt)
+		if hold.Process != nil {
+			_ = hold.Process.Kill()
+			_ = hold.Wait()
+		}
+	})
+	if !rt.AllReady {
+		t.Fatal("expected all ready")
+	}
+	return a, at, rt, hold, dir
+}
+
+func proxyByDest(rt *topologyRuntime) map[int]string {
+	out := map[int]string{}
+	for _, l := range rt.Links {
+		out[l.To] = l.Listen
+	}
+	return out
+}
+
+func statField(link map[string]any, field string) int64 {
+	if link == nil {
+		return -1
+	}
+	after, _ := link["stats_after"].(map[string]any)
+	switch n := after[field].(type) {
+	case int64:
+		return n
+	case int:
+		return int64(n)
+	default:
+		return -1
+	}
+}
+
+func waitIsolateFired(t *testing.T, rt *topologyRuntime) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		rt.mu.Lock()
+		fired := rt.Isolate != nil && rt.Isolate.TriggerFired
+		rt.mu.Unlock()
+		if fired {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("isolate trigger did not fire")
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }
 

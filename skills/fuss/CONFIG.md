@@ -32,8 +32,8 @@ name is still scanned for a later name. Any other `${...}` is left as written.
 | `${data_dir}` | that node's data directory | Same topology expansion. The expanded `topology.data_dir`. |
 | `${peer_addr_<j>}` | proxy listen addr to node `j` | Topology expansion when `topology.peers.via_proxy` is true. Empty for `j == i`. In `per_node` mode every peer uses the same inbound proxy for `j`. |
 | `${peers}` | comma-joined peer proxy addrs | Same; every `${peer_addr_<j>}` for `j != i`. |
-| `${node_proxy_addr_<k>}` | inbound proxy listen for node `k` | Topology expansion when `topology.proxy_mode` is `per_node`. |
-| `${peers_via_proxy}` | same as `${peers}` | Set with `per_node` (and `via_proxy`); convenient when the start line should name the shared inbound fronts. |
+| `${node_proxy_addr_<k>}` | inbound proxy listen for node `k` | Topology expansion when `topology.proxy_mode` is `per_node` or `per_node_owned`. |
+| `${peers_via_proxy}` | same as `${peers}` | Set with `per_node` or `per_node_owned` (and `via_proxy`); convenient when the start line should name the shared inbound fronts. |
 
 These strings are expanded: `data_dir`, `args`, `restart.args`, `env` values,
 `steps[].command`, `topology.data_dir`, `topology.start`,
@@ -319,11 +319,15 @@ shaped when `via_proxy` is true:
 
 - `per_pair` — one `proxy.Link` per ordered pair `(i, j)`. Node `i` dials a
   distinct listen addr to reach `j`. This is the historical default.
-- `per_node` — one inbound `proxy.Link` per node. Every peer dials the same
+- `per_node`: one inbound `proxy.Link` per node. Every peer dials the same
   listen addr to reach that node. Exposes `${node_proxy_addr_k}` and
   `${peers_via_proxy}`. Requires `via_proxy: true`.
+- `per_node_owned`: one inbound proxy per node, same addresses as `per_node`.
+  On accept, Fuss calls `OwnerPID` and tags the connection with the source
+  node. A connection whose owner is not one of the topology PIDs is kept and
+  recorded as an unknown owner. Requires `via_proxy: true`.
 
-Example: `proxy_mode: per_node`
+Example: `proxy_mode: per_node_owned`
 
 ## `fault`
 
@@ -337,13 +341,21 @@ one node and leaves the process running.
 
 **`fault.isolate.direction`** (string, default: `both`). Which links to cut:
 
-- `both` — every link into or out of the node (`per_pair` only).
-- `inbound` — only links whose destination is the node.
+- `both`: every link into or out of the node. Allowed for `per_pair` and
+  `per_node_owned`.
+- `inbound`: only links whose destination is the node.
 
 With `topology.proxy_mode: per_node`, only `inbound` is allowed. Load rejects
 `direction: both` because a shared inbound proxy cannot separate one node's
 outbound flows from another's. Example:
 `isolate: { node: node_0, direction: inbound }`
+
+With `per_node_owned`, `both` cuts and refuses every connection whose source
+or destination is the isolated node and keeps every other connection. Evidence
+counts directed pairs (`links_cut` out of `links_total`, 6 for three nodes),
+and `accepted`, `refused_while_cut`, and `closed_by_cut` are counted per source
+node. An unknown owner on a cut link makes the trial `UNKNOWN`, not `PASS`.
+The process Fuss starts must own the peer sockets (`exec` the node binary); a shell wrapper's child is an unknown owner, and that correctly gives `UNKNOWN`.
 
 **`fault.pause`** (string or object, default: empty). Sends `SIGSTOP` to one
 topology node's process after the same `fault.after` trigger as isolate.
@@ -366,7 +378,8 @@ isolate and/or pause. When the trigger never fires, or after `Cut` no link
 reports `closed_by_cut` or `refused_while_cut` growth, the check verdict is
 `UNKNOWN` (never `PASS`). Trial JSON `evidence.isolate` records
 `proxy_mode`, `direction`, `links_cut`, `links_total`, `trigger_fired`,
-`cut_time`, and per-link `stats_before` / `stats_after`.
+`cut_time`, and per-link `stats_before` / `stats_after`. `per_node_owned` also
+records `unknown_owners`.
 Example: `after: { file: { glob: "${dir}/cut_now", contains: NOW, poll: 10ms, timeout: 5s } }`
 
 ## `check`

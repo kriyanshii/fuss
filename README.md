@@ -111,13 +111,12 @@ go build -o fuss .
 # Test Dagu (requires Dagu binary)
 ./fuss -adapter=dagu -dag=one -target=/path/to/dagu -n=10
 
-# Test rqlite (requires rqlited binary)
-./fuss -adapter=rqlite -target=/path/to/rqlited -n=10
+# Test rqlite (YAML fixture; needs rqlited v10.7.4 on PATH — local only)
+./fuss -target-config=examples/rqlite/rqlite.yaml -n=10 -seed=1 -json
 
 # Run tests
 go test ./...                          # Unit tests (no external binaries needed)
 go test -run TestDaguIntegration       # Dagu integration tests (needs dagu)
-go test -run TestRqliteIntegration     # rqlite integration tests (needs rqlited)
 
 # Old Dagu mode (backward compatible, no -adapter flag)
 ./fuss -target=/path/to/dagu -dag=one -n=2
@@ -131,9 +130,10 @@ To run the loop through an agent, see `skills/fuss/SKILL.md` and
 `skills/fuss/INSTALL.md` (Claude Code: `/fuss <target and what to test>`).
 
 Without `-target`, Fuss uses the default binary name from `PATH` (e.g., `dagu`
-for the Dagu adapter, `rqlited` for rqlite), and stops with an error if not
-found. Either way it prints the binary it resolved to stderr at startup
-(`fuss: <target> = … (from …)`), so a run never silently uses the wrong one.
+for the Dagu adapter, `rqlited` for the YAML rqlite example), and stops with
+an error if not found. Either way it prints the binary it resolved to stderr
+at startup (`fuss: <target> = … (from …)`), so a run never silently uses the
+wrong one.
 
 ## Testing your own program
 
@@ -145,7 +145,11 @@ Copy `examples/toykv/toykv.yaml`, edit it with `skills/fuss/CONFIG.md`, and run:
 
 Or type `/fuss` in Claude Code and let it draft the config.
 
-Dagu and rqlite Go adapters (`dagu_adapter.go`, `rqlite_adapter.go`) remain as older examples.
+`kill.signal` is accepted in YAML and not read yet — kills stay SIGKILL
+(see `skills/fuss/CONFIG.md`). The Dagu Go adapter (`dagu_adapter.go`) remains
+as an older example. The old rqlite Go adapter (`rqlite_adapter.go`,
+`-adapter=rqlite`) does nothing useful now that `examples/rqlite/rqlite.yaml`
+exists; use the YAML fixture.
 
 `notes/` holds predictions written down before each run, kept next to what the
 run actually showed, and the issue draft as it was before filing (the filed

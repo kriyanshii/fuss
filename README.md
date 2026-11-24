@@ -111,7 +111,7 @@ go build -o fuss .
 # Test Dagu (requires Dagu binary)
 ./fuss -adapter=dagu -dag=one -target=/path/to/dagu -n=10
 
-# Test rqlite (YAML fixture; needs rqlited v10.7.4 on PATH — local only)
+# Test rqlite (YAML fixture; needs rqlited v10.7.4 on PATH, local only)
 ./fuss -target-config=examples/rqlite/rqlite.yaml -n=10 -seed=1 -json
 
 # Run tests
@@ -145,7 +145,7 @@ Copy `examples/toykv/toykv.yaml`, edit it with `skills/fuss/CONFIG.md`, and run:
 
 Or type `/fuss` in Claude Code and let it draft the config.
 
-`kill.signal` is accepted in YAML and not read yet — kills stay SIGKILL
+`kill.signal` is accepted in YAML and not read yet. Kills stay SIGKILL
 (see `skills/fuss/CONFIG.md`). The Dagu Go adapter (`dagu_adapter.go`) remains
 as an older example. The old rqlite Go adapter (`rqlite_adapter.go`,
 `-adapter=rqlite`) does nothing useful now that `examples/rqlite/rqlite.yaml`

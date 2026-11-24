@@ -345,9 +345,25 @@ With `topology.proxy_mode: per_node`, only `inbound` is allowed. Load rejects
 outbound flows from another's. Example:
 `isolate: { node: node_0, direction: inbound }`
 
+**`fault.pause`** (string or object, default: empty). Sends `SIGSTOP` to one
+topology node's process after the same `fault.after` trigger as isolate.
+Allowed alongside `fault.isolate`.
+
+- String form: `pause: node_0` (resume defaults to `end`).
+- Object form: `pause: { node: node_0, resume: never }`.
+
+**`fault.pause.resume`** (string, default: `end`):
+
+- `end` — send `SIGCONT` before topology teardown.
+- `never` — leave the process stopped; teardown still `SIGKILL`s it.
+
+Trial JSON `evidence.pause` records `pause_time`, `target`, `resume`,
+`trigger_fired`, and `paused`. When the trigger never pauses a node, the
+check verdict is `UNKNOWN` (never `PASS`).
+
 **`fault.after.file`** (object, same fields as `kill.file`). Trigger for the
-isolate. When the trigger never fires, or after `Cut` no link reports
-`closed_by_cut` or `refused_while_cut` growth, the check verdict is
+isolate and/or pause. When the trigger never fires, or after `Cut` no link
+reports `closed_by_cut` or `refused_while_cut` growth, the check verdict is
 `UNKNOWN` (never `PASS`). Trial JSON `evidence.isolate` records
 `proxy_mode`, `direction`, `links_cut`, `links_total`, `trigger_fired`,
 `cut_time`, and per-link `stats_before` / `stats_after`.

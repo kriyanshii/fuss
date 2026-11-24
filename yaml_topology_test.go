@@ -542,3 +542,162 @@ func TestYAMLTopologyIsolateTriggerNeverUNKNOWN(t *testing.T) {
 		t.Fatalf("trigger_fired=%v", ev["trigger_fired"])
 	}
 }
+
+func TestYAMLTopologyPauseNode0(t *testing.T) {
+	buildTopologyHold(t)
+	a, err := LoadYAMLTarget("testdata/yaml/topology/pause.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bin, _, err := a.ResolveBinary("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	at, err := a.Init(1, dir, bin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	log, err := os.Create(filepath.Join(dir, "log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer log.Close()
+
+	hold, err := a.Start(at, log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rt := at.Data()["topology"].(*topologyRuntime)
+	pids := make([]int, 0, 3)
+	for _, n := range rt.Nodes {
+		pids = append(pids, n.PID)
+	}
+	t.Cleanup(func() {
+		a.stopTopology(rt)
+		if hold.Process != nil {
+			_ = hold.Process.Kill()
+			_ = hold.Wait()
+		}
+		for _, pid := range pids {
+			if pidAlive(pid) {
+				_ = syscall.Kill(pid, syscall.SIGKILL)
+			}
+		}
+	})
+	if !rt.AllReady {
+		t.Fatal("expected all ready")
+	}
+	for i := 0; i < 3; i++ {
+		waitFileHas(t, filepath.Join(rt.Nodes[i].DataDir, "ping_ok"), "OK", 3*time.Second)
+	}
+
+	if err := os.WriteFile(filepath.Join(dir, "cut_now"), []byte("NOW\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		rt.mu.Lock()
+		paused := rt.Pause != nil && rt.Pause.Paused
+		rt.mu.Unlock()
+		if paused {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("pause did not fire")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	if !pidAlive(rt.Nodes[0].PID) {
+		t.Fatal("paused node 0 died")
+	}
+	for _, i := range []int{1, 2} {
+		if !pidAlive(rt.Nodes[i].PID) {
+			t.Fatalf("node %d died after pause", i)
+		}
+	}
+
+	// Node 0 stopped answering; 1↔2 still exchange pings.
+	deadline = time.Now().Add(3 * time.Second)
+	for {
+		p1 := readPings(rt.Nodes[1].DataDir)
+		p2 := readPings(rt.Nodes[2].DataDir)
+		n1to0fail := false
+		n2to0fail := false
+		n1to2ok := false
+		n2to1ok := false
+		for addr, ok := range p1 {
+			for _, l := range rt.Links {
+				if l.From == 1 && l.To == 0 && l.Listen == addr {
+					n1to0fail = !ok
+				}
+				if l.From == 1 && l.To == 2 && l.Listen == addr {
+					n1to2ok = ok
+				}
+			}
+		}
+		for addr, ok := range p2 {
+			for _, l := range rt.Links {
+				if l.From == 2 && l.To == 0 && l.Listen == addr {
+					n2to0fail = !ok
+				}
+				if l.From == 2 && l.To == 1 && l.Listen == addr {
+					n2to1ok = ok
+				}
+			}
+		}
+		if n1to0fail && n2to0fail && n1to2ok && n2to1ok {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("pause ping shape: p1=%v p2=%v", p1, p2)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	ev := rt.pauseEvidence()
+	if ev["target"] != "node_0" || ev["resume"] != "end" || ev["paused"] != true {
+		t.Fatalf("pause evidence %#v", ev)
+	}
+	if _, ok := ev["pause_time"].(string); !ok {
+		t.Fatalf("pause_time missing in %#v", ev)
+	}
+
+	_ = hold.Process.Kill()
+	_ = hold.Wait()
+	cr := a.CheckNamed(at, true, "topology")
+	if cr.Verdict != "PASS" {
+		t.Fatalf("verdict %s problems %v", cr.Verdict, cr.Problems)
+	}
+	for _, pid := range pids {
+		if pidAlive(pid) {
+			t.Fatalf("stray pid %d after teardown", pid)
+		}
+	}
+}
+
+func TestLoadYAMLPauseResumeReject(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "bad.yaml")
+	body := []byte(`
+name: bad-pause
+binary: { default: true }
+topology:
+  nodes: 1
+  start: ["true"]
+fault:
+  pause: { node: node_0, resume: sometimes }
+  after: { file: { glob: "${dir}/x", contains: X } }
+check:
+  rules: [{ else: PASS }]
+`)
+	if err := os.WriteFile(path, body, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := LoadYAMLTarget(path)
+	if err == nil || !strings.Contains(err.Error(), "resume") {
+		t.Fatalf("want resume reject, got %v", err)
+	}
+}

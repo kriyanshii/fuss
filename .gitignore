@@ -1,6 +1,7 @@
 # The compiled binary embeds local build paths.
 /fuss
 /toykv
+/examples/repkv/repkv
 
 __pycache__/
 *.pyc

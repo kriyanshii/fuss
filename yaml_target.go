@@ -47,6 +47,7 @@ type yamlTopology struct {
 	DataDir   string        `yaml:"data_dir"`
 	Ports     yamlTopoPorts `yaml:"ports"`
 	Peers     yamlTopoPeers `yaml:"peers"`
+	ProxyMode string        `yaml:"proxy_mode"` // "per_pair" (default) or "per_node"
 	Start     []string      `yaml:"start"`
 	Ready     yamlTopoReady `yaml:"ready"`
 	StopGrace string        `yaml:"stop_grace"`
@@ -58,10 +59,52 @@ type yamlTopoPeers struct {
 	ViaProxy bool   `yaml:"via_proxy"`
 }
 
+// yamlFaultIsolate is fault.isolate: a string "node_0", or {node, direction}.
+type yamlFaultIsolate struct {
+	Node      string `yaml:"node"`
+	Direction string `yaml:"direction"` // "both" (default) or "inbound"
+}
+
+func (f *yamlFaultIsolate) UnmarshalYAML(value *yaml.Node) error {
+	switch value.Kind {
+	case yaml.ScalarNode:
+		f.Node = value.Value
+		return nil
+	case yaml.MappingNode:
+		var raw struct {
+			Node      string `yaml:"node"`
+			Direction string `yaml:"direction"`
+		}
+		if err := value.Decode(&raw); err != nil {
+			return err
+		}
+		f.Node = raw.Node
+		f.Direction = raw.Direction
+		return nil
+	case yaml.AliasNode:
+		if value.Alias == nil {
+			return fmt.Errorf("fault.isolate: empty alias")
+		}
+		return f.UnmarshalYAML(value.Alias)
+	default:
+		return fmt.Errorf("fault.isolate: want string or {node, direction}")
+	}
+}
+
+func (f yamlFaultIsolate) active() bool { return strings.TrimSpace(f.Node) != "" }
+
+func (f yamlFaultIsolate) direction() string {
+	d := strings.TrimSpace(f.Direction)
+	if d == "" {
+		return "both"
+	}
+	return d
+}
+
 // yamlFault injects a live fault while topology nodes keep running.
 type yamlFault struct {
-	Isolate string         `yaml:"isolate"` // "node_0" (leader later)
-	After   yamlFaultAfter `yaml:"after"`
+	Isolate yamlFaultIsolate `yaml:"isolate"`
+	After   yamlFaultAfter   `yaml:"after"`
 }
 
 type yamlFaultAfter struct {
@@ -219,6 +262,33 @@ func LoadYAMLTarget(path string) (*YAMLAdapter, error) {
 	if cfg.PortBase <= 0 {
 		cfg.PortBase = 18700
 	}
+	mode := strings.TrimSpace(cfg.Topology.ProxyMode)
+	if mode == "" {
+		mode = "per_pair"
+	}
+	switch mode {
+	case "per_pair", "per_node":
+	default:
+		return nil, fmt.Errorf("target-config %s: topology.proxy_mode %q not supported (per_pair or per_node)", path, cfg.Topology.ProxyMode)
+	}
+	if mode == "per_node" && !cfg.Topology.Peers.ViaProxy {
+		return nil, fmt.Errorf("target-config %s: topology.proxy_mode per_node requires topology.peers.via_proxy", path)
+	}
+	cfg.Topology.ProxyMode = mode
+
+	dir := cfg.Fault.Isolate.direction()
+	switch dir {
+	case "both", "inbound":
+	default:
+		return nil, fmt.Errorf("target-config %s: fault.isolate direction %q not supported (both or inbound)", path, cfg.Fault.Isolate.Direction)
+	}
+	cfg.Fault.Isolate.Direction = dir
+	if mode == "per_node" && cfg.Fault.Isolate.active() && dir == "both" {
+		return nil, fmt.Errorf("target-config %s: topology.proxy_mode per_node cannot use fault.isolate direction both; per_node proxies can't separate one node's outbound links (use direction: inbound)", path)
+	}
+	if cfg.Fault.Isolate.active() && cfg.Fault.Isolate.Node == "" {
+		return nil, fmt.Errorf("target-config %s: fault.isolate.node is required", path)
+	}
 	return &YAMLAdapter{path: path, cfg: cfg}, nil
 }
 
@@ -303,12 +373,12 @@ func (y *YAMLAdapter) vars(t *BaseTrial, n string) map[string]string {
 }
 
 func expandTemplates(s string, vars map[string]string) string {
-	keys := []string{"run_id", "binary", "home", "addr", "seed", "dir", "key", "n", "i", "port", "data_dir", "peers"}
+	keys := []string{"run_id", "binary", "home", "addr", "seed", "dir", "key", "n", "i", "port", "data_dir", "peers", "peers_via_proxy"}
 	for _, k := range keys {
 		s = strings.ReplaceAll(s, "${"+k+"}", vars[k])
 	}
 	for k, v := range vars {
-		if strings.HasPrefix(k, "peer_addr_") {
+		if strings.HasPrefix(k, "peer_addr_") || strings.HasPrefix(k, "node_proxy_addr_") {
 			s = strings.ReplaceAll(s, "${"+k+"}", v)
 		}
 	}
@@ -486,18 +556,20 @@ type topologyLink struct {
 
 type isolateState struct {
 	Target       string
+	Direction    string
 	TriggerFired bool
 	CutTime      time.Time
 	Done         bool // waiter finished (fired or timed out)
 }
 
 type topologyRuntime struct {
-	mu       sync.Mutex
-	Nodes    []*topologyNode
-	Links    []*topologyLink
-	Isolate  *isolateState
-	AllReady bool
-	Stopped  bool
+	mu        sync.Mutex
+	ProxyMode string
+	Nodes     []*topologyNode
+	Links     []*topologyLink
+	Isolate   *isolateState
+	AllReady  bool
+	Stopped   bool
 }
 
 func (rt *topologyRuntime) evidence() []map[string]any {
@@ -550,12 +622,16 @@ func (rt *topologyRuntime) isolateEvidence() map[string]any {
 		return nil
 	}
 	links := make([]map[string]any, 0, len(rt.Links))
+	cutN := 0
+	total := 0
 	for _, l := range rt.Links {
 		if l == nil || l.Link == nil {
 			continue
 		}
+		total++
 		after := l.StatsAfter
 		if l.cut {
+			cutN++
 			after = l.Link.Stats()
 			l.StatsAfter = after
 		}
@@ -572,9 +648,21 @@ func (rt *topologyRuntime) isolateEvidence() map[string]any {
 		}
 		links = append(links, m)
 	}
+	dir := rt.Isolate.Direction
+	if dir == "" {
+		dir = "both"
+	}
+	mode := rt.ProxyMode
+	if mode == "" {
+		mode = "per_pair"
+	}
 	out := map[string]any{
 		"target":        rt.Isolate.Target,
 		"trigger_fired": rt.Isolate.TriggerFired,
+		"proxy_mode":    mode,
+		"direction":     dir,
+		"links_cut":     cutN,
+		"links_total":   total,
 		"links":         links,
 	}
 	if !rt.Isolate.CutTime.IsZero() {
@@ -627,31 +715,61 @@ func (y *YAMLAdapter) startTopology(t *BaseTrial, log *os.File) (*exec.Cmd, erro
 		}
 	}
 
-	rt := &topologyRuntime{Nodes: make([]*topologyNode, n)}
+	rt := &topologyRuntime{Nodes: make([]*topologyNode, n), ProxyMode: topo.ProxyMode}
 	peerAddrs := make([][]string, n) // peerAddrs[i][j] = addr node i uses to reach j
+	var nodeProxies []string         // per_node: inbound proxy listen for node k
 	if topo.Peers.ViaProxy {
 		for i := 0; i < n; i++ {
 			peerAddrs[i] = make([]string, n)
 		}
-		for i := 0; i < n; i++ {
+		switch topo.ProxyMode {
+		case "per_node":
+			nodeProxies = make([]string, n)
 			for j := 0; j < n; j++ {
-				if i == j {
-					continue
-				}
 				upstream := "127.0.0.1:" + strconv.Itoa(ports[j])
 				link, err := proxy.New("127.0.0.1:0", upstream)
 				if err != nil {
 					y.stopTopology(rt)
-					return nil, fmt.Errorf("topology proxy %d->%d: %w", i, j, err)
+					return nil, fmt.Errorf("topology proxy node %d: %w", j, err)
 				}
 				if err := link.Start(); err != nil {
 					y.stopTopology(rt)
-					return nil, fmt.Errorf("topology proxy %d->%d start: %w", i, j, err)
+					return nil, fmt.Errorf("topology proxy node %d start: %w", j, err)
 				}
 				addr := link.Addr().String()
-				tl := &topologyLink{From: i, To: j, Link: link, Listen: addr}
-				rt.Links = append(rt.Links, tl)
-				peerAddrs[i][j] = addr
+				// From=-1: shared inbound proxy; every peer dials this listen addr.
+				rt.Links = append(rt.Links, &topologyLink{From: -1, To: j, Link: link, Listen: addr})
+				nodeProxies[j] = addr
+			}
+			for i := 0; i < n; i++ {
+				for j := 0; j < n; j++ {
+					if i == j {
+						continue
+					}
+					peerAddrs[i][j] = nodeProxies[j]
+				}
+			}
+		default: // per_pair
+			for i := 0; i < n; i++ {
+				for j := 0; j < n; j++ {
+					if i == j {
+						continue
+					}
+					upstream := "127.0.0.1:" + strconv.Itoa(ports[j])
+					link, err := proxy.New("127.0.0.1:0", upstream)
+					if err != nil {
+						y.stopTopology(rt)
+						return nil, fmt.Errorf("topology proxy %d->%d: %w", i, j, err)
+					}
+					if err := link.Start(); err != nil {
+						y.stopTopology(rt)
+						return nil, fmt.Errorf("topology proxy %d->%d start: %w", i, j, err)
+					}
+					addr := link.Addr().String()
+					tl := &topologyLink{From: i, To: j, Link: link, Listen: addr}
+					rt.Links = append(rt.Links, tl)
+					peerAddrs[i][j] = addr
+				}
 			}
 		}
 	}
@@ -678,7 +796,7 @@ func (y *YAMLAdapter) startTopology(t *BaseTrial, log *os.File) (*exec.Cmd, erro
 			vars["i"] = strconv.Itoa(i)
 			vars["data_dir"] = dataDir
 			vars["port"] = strconv.Itoa(ports[i])
-			y.addPeerVars(vars, peerAddrs, i)
+			y.addPeerVars(vars, peerAddrs, nodeProxies, i)
 			args := y.expandSlice(topo.Start, vars)
 			if len(args) == 0 {
 				errs[i] = fmt.Errorf("topology.start expanded empty for node %d", i)
@@ -738,7 +856,7 @@ func (y *YAMLAdapter) startTopology(t *BaseTrial, log *os.File) (*exec.Cmd, erro
 			vars["i"] = strconv.Itoa(i)
 			vars["data_dir"] = node.DataDir
 			vars["port"] = strconv.Itoa(node.Port)
-			y.addPeerVars(vars, peerAddrs, i)
+			y.addPeerVars(vars, peerAddrs, nodeProxies, i)
 			if err := y.waitTopologyReady(node, vars, readyTo); err != nil {
 				mu.Lock()
 				allReady = false
@@ -754,8 +872,11 @@ func (y *YAMLAdapter) startTopology(t *BaseTrial, log *os.File) (*exec.Cmd, erro
 	rt.AllReady = allReady
 	t.Data()["topology"] = rt
 
-	if y.cfg.Fault.Isolate != "" {
-		rt.Isolate = &isolateState{Target: y.cfg.Fault.Isolate}
+	if y.cfg.Fault.Isolate.active() {
+		rt.Isolate = &isolateState{
+			Target:    y.cfg.Fault.Isolate.Node,
+			Direction: y.cfg.Fault.Isolate.direction(),
+		}
 		go y.watchIsolate(t, rt)
 	}
 
@@ -769,7 +890,7 @@ func (y *YAMLAdapter) startTopology(t *BaseTrial, log *os.File) (*exec.Cmd, erro
 	return hold, nil
 }
 
-func (y *YAMLAdapter) addPeerVars(vars map[string]string, peerAddrs [][]string, i int) {
+func (y *YAMLAdapter) addPeerVars(vars map[string]string, peerAddrs [][]string, nodeProxies []string, i int) {
 	if len(peerAddrs) == 0 {
 		return
 	}
@@ -782,6 +903,12 @@ func (y *YAMLAdapter) addPeerVars(vars map[string]string, peerAddrs [][]string, 
 		}
 	}
 	vars["peers"] = strings.Join(peers, ",")
+	if len(nodeProxies) > 0 {
+		for k, addr := range nodeProxies {
+			vars["node_proxy_addr_"+strconv.Itoa(k)] = addr
+		}
+		vars["peers_via_proxy"] = vars["peers"]
+	}
 }
 
 func parseIsolateNode(s string) (int, error) {
@@ -812,30 +939,40 @@ func (y *YAMLAdapter) watchIsolate(t *BaseTrial, rt *topologyRuntime) {
 		return
 	}
 	rt.Isolate.TriggerFired = true
-	target := expandTemplates(y.cfg.Fault.Isolate, vars)
+	target := expandTemplates(y.cfg.Fault.Isolate.Node, vars)
 	rt.Isolate.Target = target
+	direction := y.cfg.Fault.Isolate.direction()
+	rt.Isolate.Direction = direction
 	rt.mu.Unlock()
 
 	idx, perr := parseIsolateNode(target)
 	if perr != nil {
 		return
 	}
-	y.cutIsolate(rt, idx)
+	y.cutIsolate(rt, idx, direction)
 }
 
-func (y *YAMLAdapter) cutIsolate(rt *topologyRuntime, nodeIdx int) {
+func (y *YAMLAdapter) cutIsolate(rt *topologyRuntime, nodeIdx int, direction string) {
 	rt.mu.Lock()
 	cutAt := time.Now()
 	if rt.Isolate != nil {
 		rt.Isolate.CutTime = cutAt
+		rt.Isolate.Direction = direction
 	}
 	var toCut []*topologyLink
 	for _, l := range rt.Links {
 		if l == nil || l.Link == nil {
 			continue
 		}
-		if l.From == nodeIdx || l.To == nodeIdx {
-			toCut = append(toCut, l)
+		switch direction {
+		case "inbound":
+			if l.To == nodeIdx {
+				toCut = append(toCut, l)
+			}
+		default: // both
+			if l.From == nodeIdx || l.To == nodeIdx {
+				toCut = append(toCut, l)
+			}
 		}
 	}
 	rt.mu.Unlock()
@@ -1149,7 +1286,7 @@ func (y *YAMLAdapter) CheckNamed(at AdapterTrial, killed bool, phase string) Che
 				Problems: []error{fmt.Errorf("topology: a node was not ready in time")},
 			}
 		}
-		if y.cfg.Fault.Isolate != "" {
+		if y.cfg.Fault.Isolate.active() {
 			if cr := y.checkIsolate(rt); cr.Verdict != "" {
 				return cr
 			}

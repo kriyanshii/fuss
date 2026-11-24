@@ -332,9 +332,161 @@ func TestYAMLTopologyIsolateNode0(t *testing.T) {
 	if ev["trigger_fired"] != true {
 		t.Fatalf("evidence trigger_fired=%v", ev["trigger_fired"])
 	}
+	if ev["proxy_mode"] != "per_pair" {
+		t.Fatalf("proxy_mode=%v want per_pair", ev["proxy_mode"])
+	}
+	if ev["direction"] != "both" {
+		t.Fatalf("direction=%v want both", ev["direction"])
+	}
+	if ev["links_cut"] != 4 {
+		t.Fatalf("links_cut=%v want 4", ev["links_cut"])
+	}
+	if ev["links_total"] != 6 {
+		t.Fatalf("links_total=%v want 6", ev["links_total"])
+	}
 	links, _ := ev["links"].([]map[string]any)
 	if len(links) != 6 {
 		t.Fatalf("evidence links=%d", len(links))
+	}
+
+	_ = hold.Process.Kill()
+	_ = hold.Wait()
+	cr := a.CheckNamed(at, true, "topology")
+	if cr.Verdict != "PASS" {
+		t.Fatalf("verdict %s problems %v", cr.Verdict, cr.Problems)
+	}
+}
+
+func TestYAMLTopologyPerNodeBothRejected(t *testing.T) {
+	_, err := LoadYAMLTarget("testdata/yaml/topology/isolate_per_node_both.yaml")
+	if err == nil {
+		t.Fatal("expected load error for per_node + direction both")
+	}
+	if !strings.Contains(err.Error(), "per_node proxies can't separate") {
+		t.Fatalf("error=%v", err)
+	}
+}
+
+func TestYAMLTopologyPerNodeInboundIsolate(t *testing.T) {
+	buildTopologyHold(t)
+	a, err := LoadYAMLTarget("testdata/yaml/topology/isolate_per_node.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bin, _, err := a.ResolveBinary("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	at, err := a.Init(1, dir, bin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	log, err := os.Create(filepath.Join(dir, "log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer log.Close()
+
+	hold, err := a.Start(at, log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rt := at.Data()["topology"].(*topologyRuntime)
+	t.Cleanup(func() {
+		a.stopTopology(rt)
+		if hold.Process != nil {
+			_ = hold.Process.Kill()
+			_ = hold.Wait()
+		}
+	})
+	if !rt.AllReady {
+		t.Fatal("expected all ready")
+	}
+	if len(rt.Links) != 3 {
+		t.Fatalf("links=%d want 3 (one inbound proxy per node)", len(rt.Links))
+	}
+	if rt.ProxyMode != "per_node" {
+		t.Fatalf("ProxyMode=%q", rt.ProxyMode)
+	}
+
+	for i := 0; i < 3; i++ {
+		waitFileHas(t, filepath.Join(rt.Nodes[i].DataDir, "ping_ok"), "OK", 3*time.Second)
+	}
+
+	if err := os.WriteFile(filepath.Join(dir, "cut_now"), []byte("NOW\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		rt.mu.Lock()
+		fired := rt.Isolate != nil && rt.Isolate.TriggerFired
+		rt.mu.Unlock()
+		if fired {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("isolate trigger did not fire")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	if !pidAlive(rt.Nodes[0].PID) {
+		t.Fatal("node 0 died after isolate")
+	}
+
+	var proxy0, proxy1, proxy2 string
+	for _, l := range rt.Links {
+		switch l.To {
+		case 0:
+			proxy0 = l.Listen
+		case 1:
+			proxy1 = l.Listen
+		case 2:
+			proxy2 = l.Listen
+		}
+	}
+	if proxy0 == "" || proxy1 == "" || proxy2 == "" {
+		t.Fatalf("missing proxies: %q %q %q", proxy0, proxy1, proxy2)
+	}
+
+	// Inbound-only: 1↔2 still work; dials to node 0's proxy fail; node 0 may
+	// still dial out through survivors' proxies (asymmetric partition).
+	deadline = time.Now().Add(3 * time.Second)
+	for {
+		p1 := readPings(rt.Nodes[1].DataDir)
+		p2 := readPings(rt.Nodes[2].DataDir)
+		to0fail := !p1[proxy0] && !p2[proxy0]
+		s12ok := p1[proxy2] && p2[proxy1]
+		if to0fail && s12ok {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("post-cut pings: n1=%v n2=%v (want to0 fail, 1↔2 ok)", p1, p2)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	cutCount := 0
+	for _, l := range rt.Links {
+		if l.cut {
+			cutCount++
+			if l.To != 0 {
+				t.Fatalf("unexpected cut on proxy to node %d", l.To)
+			}
+		}
+	}
+	if cutCount != 1 {
+		t.Fatalf("cutCount=%d want 1", cutCount)
+	}
+
+	ev := rt.isolateEvidence()
+	if ev["proxy_mode"] != "per_node" || ev["direction"] != "inbound" {
+		t.Fatalf("evidence mode/dir = %v %v", ev["proxy_mode"], ev["direction"])
+	}
+	if ev["links_cut"] != 1 || ev["links_total"] != 3 {
+		t.Fatalf("links_cut=%v links_total=%v", ev["links_cut"], ev["links_total"])
 	}
 
 	_ = hold.Process.Kill()

@@ -47,6 +47,7 @@ type yamlTopology struct {
 	DataDir   string        `yaml:"data_dir"`
 	Ports     yamlTopoPorts `yaml:"ports"`
 	Peers     yamlTopoPeers `yaml:"peers"`
+	ProxyMode string        `yaml:"proxy_mode"` // "per_pair" (default) or "per_node"
 	Start     []string      `yaml:"start"`
 	Ready     yamlTopoReady `yaml:"ready"`
 	StopGrace string        `yaml:"stop_grace"`
@@ -58,10 +59,95 @@ type yamlTopoPeers struct {
 	ViaProxy bool   `yaml:"via_proxy"`
 }
 
+// yamlFaultIsolate is fault.isolate: a string "node_0", or {node, direction}.
+type yamlFaultIsolate struct {
+	Node      string `yaml:"node"`
+	Direction string `yaml:"direction"` // "both" (default) or "inbound"
+}
+
+func (f *yamlFaultIsolate) UnmarshalYAML(value *yaml.Node) error {
+	switch value.Kind {
+	case yaml.ScalarNode:
+		f.Node = value.Value
+		return nil
+	case yaml.MappingNode:
+		var raw struct {
+			Node      string `yaml:"node"`
+			Direction string `yaml:"direction"`
+		}
+		if err := value.Decode(&raw); err != nil {
+			return err
+		}
+		f.Node = raw.Node
+		f.Direction = raw.Direction
+		return nil
+	case yaml.AliasNode:
+		if value.Alias == nil {
+			return fmt.Errorf("fault.isolate: empty alias")
+		}
+		return f.UnmarshalYAML(value.Alias)
+	default:
+		return fmt.Errorf("fault.isolate: want string or {node, direction}")
+	}
+}
+
+func (f yamlFaultIsolate) active() bool { return strings.TrimSpace(f.Node) != "" }
+
+func (f yamlFaultIsolate) direction() string {
+	d := strings.TrimSpace(f.Direction)
+	if d == "" {
+		return "both"
+	}
+	return d
+}
+
+// yamlFaultPause is fault.pause: a string "node_0", or {node, resume}.
+type yamlFaultPause struct {
+	Node   string `yaml:"node"`
+	Resume string `yaml:"resume"` // "end" (default) or "never"
+}
+
+func (f *yamlFaultPause) UnmarshalYAML(value *yaml.Node) error {
+	switch value.Kind {
+	case yaml.ScalarNode:
+		f.Node = value.Value
+		return nil
+	case yaml.MappingNode:
+		var raw struct {
+			Node   string `yaml:"node"`
+			Resume string `yaml:"resume"`
+		}
+		if err := value.Decode(&raw); err != nil {
+			return err
+		}
+		f.Node = raw.Node
+		f.Resume = raw.Resume
+		return nil
+	case yaml.AliasNode:
+		if value.Alias == nil {
+			return fmt.Errorf("fault.pause: empty alias")
+		}
+		return f.UnmarshalYAML(value.Alias)
+	default:
+		return fmt.Errorf("fault.pause: want string or {node, resume}")
+	}
+}
+
+func (f yamlFaultPause) active() bool { return strings.TrimSpace(f.Node) != "" }
+
+func (f yamlFaultPause) resume() string {
+	r := strings.TrimSpace(f.Resume)
+	if r == "" {
+		return "end"
+	}
+	return r
+}
+
 // yamlFault injects a live fault while topology nodes keep running.
 type yamlFault struct {
-	Isolate string         `yaml:"isolate"` // "node_0" (leader later)
-	After   yamlFaultAfter `yaml:"after"`
+	Isolate yamlFaultIsolate `yaml:"isolate"`
+	Pause   yamlFaultPause   `yaml:"pause"`
+	After   yamlFaultAfter   `yaml:"after"`
 }
 
 type yamlFaultAfter struct {
@@ -219,6 +305,43 @@ func LoadYAMLTarget(path string) (*YAMLAdapter, error) {
 	if cfg.PortBase <= 0 {
 		cfg.PortBase = 18700
 	}
+	mode := strings.TrimSpace(cfg.Topology.ProxyMode)
+	if mode == "" {
+		mode = "per_pair"
+	}
+	switch mode {
+	case "per_pair", "per_node":
+	default:
+		return nil, fmt.Errorf("target-config %s: topology.proxy_mode %q not supported (per_pair or per_node)", path, cfg.Topology.ProxyMode)
+	}
+	if mode == "per_node" && !cfg.Topology.Peers.ViaProxy {
+		return nil, fmt.Errorf("target-config %s: topology.proxy_mode per_node requires topology.peers.via_proxy", path)
+	}
+	cfg.Topology.ProxyMode = mode
+
+	dir := cfg.Fault.Isolate.direction()
+	switch dir {
+	case "both", "inbound":
+	default:
+		return nil, fmt.Errorf("target-config %s: fault.isolate direction %q not supported (both or inbound)", path, cfg.Fault.Isolate.Direction)
+	}
+	cfg.Fault.Isolate.Direction = dir
+	if mode == "per_node" && cfg.Fault.Isolate.active() && dir == "both" {
+		return nil, fmt.Errorf("target-config %s: topology.proxy_mode per_node cannot use fault.isolate direction both; per_node proxies can't separate one node's outbound links (use direction: inbound)", path)
+	}
+	if cfg.Fault.Isolate.active() && cfg.Fault.Isolate.Node == "" {
+		return nil, fmt.Errorf("target-config %s: fault.isolate.node is required", path)
+	}
+	resume := cfg.Fault.Pause.resume()
+	switch resume {
+	case "end", "never":
+	default:
+		return nil, fmt.Errorf("target-config %s: fault.pause resume %q not supported (end or never)", path, cfg.Fault.Pause.Resume)
+	}
+	cfg.Fault.Pause.Resume = resume
+	if cfg.Fault.Pause.active() && cfg.Fault.Pause.Node == "" {
+		return nil, fmt.Errorf("target-config %s: fault.pause.node is required", path)
+	}
 	return &YAMLAdapter{path: path, cfg: cfg}, nil
 }
 
@@ -303,12 +426,12 @@ func (y *YAMLAdapter) vars(t *BaseTrial, n string) map[string]string {
 }
 
 func expandTemplates(s string, vars map[string]string) string {
-	keys := []string{"run_id", "binary", "home", "addr", "seed", "dir", "key", "n", "i", "port", "data_dir", "peers"}
+	keys := []string{"run_id", "binary", "home", "addr", "seed", "dir", "key", "n", "i", "port", "data_dir", "peers", "peers_via_proxy"}
 	for _, k := range keys {
 		s = strings.ReplaceAll(s, "${"+k+"}", vars[k])
 	}
 	for k, v := range vars {
-		if strings.HasPrefix(k, "peer_addr_") {
+		if strings.HasPrefix(k, "peer_addr_") || strings.HasPrefix(k, "node_proxy_addr_") {
 			s = strings.ReplaceAll(s, "${"+k+"}", v)
 		}
 	}
@@ -486,18 +609,30 @@ type topologyLink struct {
 
 type isolateState struct {
 	Target       string
+	Direction    string
 	TriggerFired bool
 	CutTime      time.Time
 	Done         bool // waiter finished (fired or timed out)
 }
 
+type pauseState struct {
+	Target       string
+	Resume       string // "end" or "never"
+	TriggerFired bool
+	PauseTime    time.Time
+	Paused       bool // SIGSTOP was sent
+	Done         bool // waiter finished (fired or timed out)
+}
+
 type topologyRuntime struct {
-	mu       sync.Mutex
-	Nodes    []*topologyNode
-	Links    []*topologyLink
-	Isolate  *isolateState
-	AllReady bool
-	Stopped  bool
+	mu        sync.Mutex
+	ProxyMode string
+	Nodes     []*topologyNode
+	Links     []*topologyLink
+	Isolate   *isolateState
+	Pause     *pauseState
+	AllReady  bool
+	Stopped   bool
 }
 
 func (rt *topologyRuntime) evidence() []map[string]any {
@@ -550,12 +685,16 @@ func (rt *topologyRuntime) isolateEvidence() map[string]any {
 		return nil
 	}
 	links := make([]map[string]any, 0, len(rt.Links))
+	cutN := 0
+	total := 0
 	for _, l := range rt.Links {
 		if l == nil || l.Link == nil {
 			continue
 		}
+		total++
 		after := l.StatsAfter
 		if l.cut {
+			cutN++
 			after = l.Link.Stats()
 			l.StatsAfter = after
 		}
@@ -572,13 +711,43 @@ func (rt *topologyRuntime) isolateEvidence() map[string]any {
 		}
 		links = append(links, m)
 	}
+	dir := rt.Isolate.Direction
+	if dir == "" {
+		dir = "both"
+	}
+	mode := rt.ProxyMode
+	if mode == "" {
+		mode = "per_pair"
+	}
 	out := map[string]any{
 		"target":        rt.Isolate.Target,
 		"trigger_fired": rt.Isolate.TriggerFired,
+		"proxy_mode":    mode,
+		"direction":     dir,
+		"links_cut":     cutN,
+		"links_total":   total,
 		"links":         links,
 	}
 	if !rt.Isolate.CutTime.IsZero() {
 		out["cut_time"] = rt.Isolate.CutTime.UTC().Format(time.RFC3339Nano)
+	}
+	return out
+}
+
+func (rt *topologyRuntime) pauseEvidence() map[string]any {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	if rt.Pause == nil {
+		return nil
+	}
+	out := map[string]any{
+		"target":        rt.Pause.Target,
+		"resume":        rt.Pause.Resume,
+		"trigger_fired": rt.Pause.TriggerFired,
+		"paused":        rt.Pause.Paused,
+	}
+	if !rt.Pause.PauseTime.IsZero() {
+		out["pause_time"] = rt.Pause.PauseTime.UTC().Format(time.RFC3339Nano)
 	}
 	return out
 }
@@ -627,31 +796,61 @@ func (y *YAMLAdapter) startTopology(t *BaseTrial, log *os.File) (*exec.Cmd, erro
 		}
 	}
 
-	rt := &topologyRuntime{Nodes: make([]*topologyNode, n)}
+	rt := &topologyRuntime{Nodes: make([]*topologyNode, n), ProxyMode: topo.ProxyMode}
 	peerAddrs := make([][]string, n) // peerAddrs[i][j] = addr node i uses to reach j
+	var nodeProxies []string         // per_node: inbound proxy listen for node k
 	if topo.Peers.ViaProxy {
 		for i := 0; i < n; i++ {
 			peerAddrs[i] = make([]string, n)
 		}
-		for i := 0; i < n; i++ {
+		switch topo.ProxyMode {
+		case "per_node":
+			nodeProxies = make([]string, n)
 			for j := 0; j < n; j++ {
-				if i == j {
-					continue
-				}
 				upstream := "127.0.0.1:" + strconv.Itoa(ports[j])
 				link, err := proxy.New("127.0.0.1:0", upstream)
 				if err != nil {
 					y.stopTopology(rt)
-					return nil, fmt.Errorf("topology proxy %d->%d: %w", i, j, err)
+					return nil, fmt.Errorf("topology proxy node %d: %w", j, err)
 				}
 				if err := link.Start(); err != nil {
 					y.stopTopology(rt)
-					return nil, fmt.Errorf("topology proxy %d->%d start: %w", i, j, err)
+					return nil, fmt.Errorf("topology proxy node %d start: %w", j, err)
 				}
 				addr := link.Addr().String()
-				tl := &topologyLink{From: i, To: j, Link: link, Listen: addr}
-				rt.Links = append(rt.Links, tl)
-				peerAddrs[i][j] = addr
+				// From=-1: shared inbound proxy; every peer dials this listen addr.
+				rt.Links = append(rt.Links, &topologyLink{From: -1, To: j, Link: link, Listen: addr})
+				nodeProxies[j] = addr
+			}
+			for i := 0; i < n; i++ {
+				for j := 0; j < n; j++ {
+					if i == j {
+						continue
+					}
+					peerAddrs[i][j] = nodeProxies[j]
+				}
+			}
+		default: // per_pair
+			for i := 0; i < n; i++ {
+				for j := 0; j < n; j++ {
+					if i == j {
+						continue
+					}
+					upstream := "127.0.0.1:" + strconv.Itoa(ports[j])
+					link, err := proxy.New("127.0.0.1:0", upstream)
+					if err != nil {
+						y.stopTopology(rt)
+						return nil, fmt.Errorf("topology proxy %d->%d: %w", i, j, err)
+					}
+					if err := link.Start(); err != nil {
+						y.stopTopology(rt)
+						return nil, fmt.Errorf("topology proxy %d->%d start: %w", i, j, err)
+					}
+					addr := link.Addr().String()
+					tl := &topologyLink{From: i, To: j, Link: link, Listen: addr}
+					rt.Links = append(rt.Links, tl)
+					peerAddrs[i][j] = addr
+				}
 			}
 		}
 	}
@@ -678,7 +877,7 @@ func (y *YAMLAdapter) startTopology(t *BaseTrial, log *os.File) (*exec.Cmd, erro
 			vars["i"] = strconv.Itoa(i)
 			vars["data_dir"] = dataDir
 			vars["port"] = strconv.Itoa(ports[i])
-			y.addPeerVars(vars, peerAddrs, i)
+			y.addPeerVars(vars, peerAddrs, nodeProxies, i)
 			args := y.expandSlice(topo.Start, vars)
 			if len(args) == 0 {
 				errs[i] = fmt.Errorf("topology.start expanded empty for node %d", i)
@@ -738,7 +937,7 @@ func (y *YAMLAdapter) startTopology(t *BaseTrial, log *os.File) (*exec.Cmd, erro
 			vars["i"] = strconv.Itoa(i)
 			vars["data_dir"] = node.DataDir
 			vars["port"] = strconv.Itoa(node.Port)
-			y.addPeerVars(vars, peerAddrs, i)
+			y.addPeerVars(vars, peerAddrs, nodeProxies, i)
 			if err := y.waitTopologyReady(node, vars, readyTo); err != nil {
 				mu.Lock()
 				allReady = false
@@ -754,9 +953,19 @@ func (y *YAMLAdapter) startTopology(t *BaseTrial, log *os.File) (*exec.Cmd, erro
 	rt.AllReady = allReady
 	t.Data()["topology"] = rt
 
-	if y.cfg.Fault.Isolate != "" {
-		rt.Isolate = &isolateState{Target: y.cfg.Fault.Isolate}
+	if y.cfg.Fault.Isolate.active() {
+		rt.Isolate = &isolateState{
+			Target:    y.cfg.Fault.Isolate.Node,
+			Direction: y.cfg.Fault.Isolate.direction(),
+		}
 		go y.watchIsolate(t, rt)
+	}
+	if y.cfg.Fault.Pause.active() {
+		rt.Pause = &pauseState{
+			Target: y.cfg.Fault.Pause.Node,
+			Resume: y.cfg.Fault.Pause.resume(),
+		}
+		go y.watchPause(t, rt)
 	}
 
 	hold := exec.Command("sleep", "3600")
@@ -769,7 +978,7 @@ func (y *YAMLAdapter) startTopology(t *BaseTrial, log *os.File) (*exec.Cmd, erro
 	return hold, nil
 }
 
-func (y *YAMLAdapter) addPeerVars(vars map[string]string, peerAddrs [][]string, i int) {
+func (y *YAMLAdapter) addPeerVars(vars map[string]string, peerAddrs [][]string, nodeProxies []string, i int) {
 	if len(peerAddrs) == 0 {
 		return
 	}
@@ -782,24 +991,35 @@ func (y *YAMLAdapter) addPeerVars(vars map[string]string, peerAddrs [][]string, 
 		}
 	}
 	vars["peers"] = strings.Join(peers, ",")
+	if len(nodeProxies) > 0 {
+		for k, addr := range nodeProxies {
+			vars["node_proxy_addr_"+strconv.Itoa(k)] = addr
+		}
+		vars["peers_via_proxy"] = vars["peers"]
+	}
 }
 
 func parseIsolateNode(s string) (int, error) {
 	s = strings.TrimSpace(s)
 	if !strings.HasPrefix(s, "node_") {
-		return -1, fmt.Errorf("fault.isolate %q: want node_<index>", s)
+		return -1, fmt.Errorf("fault node %q: want node_<index>", s)
 	}
 	return strconv.Atoi(strings.TrimPrefix(s, "node_"))
 }
 
-func (y *YAMLAdapter) watchIsolate(t *BaseTrial, rt *topologyRuntime) {
+func (y *YAMLAdapter) watchFaultTrigger(t *BaseTrial) error {
 	spec := y.cfg.Fault.After.File
 	vars := y.vars(t, "")
 	glob := expandTemplates(spec.Glob, vars)
 	contains := expandTemplates(spec.Contains, vars)
 	poll := parseYAMLDuration(spec.Poll, time.Millisecond)
 	timeout := parseYAMLDuration(spec.Timeout, 30*time.Second)
-	err := waitFileContains(glob, contains, poll, timeout)
+	return waitFileContains(glob, contains, poll, timeout)
+}
+
+func (y *YAMLAdapter) watchIsolate(t *BaseTrial, rt *topologyRuntime) {
+	err := y.watchFaultTrigger(t)
+	vars := y.vars(t, "")
 
 	rt.mu.Lock()
 	if rt.Isolate == nil {
@@ -812,30 +1032,89 @@ func (y *YAMLAdapter) watchIsolate(t *BaseTrial, rt *topologyRuntime) {
 		return
 	}
 	rt.Isolate.TriggerFired = true
-	target := expandTemplates(y.cfg.Fault.Isolate, vars)
+	target := expandTemplates(y.cfg.Fault.Isolate.Node, vars)
 	rt.Isolate.Target = target
+	direction := y.cfg.Fault.Isolate.direction()
+	rt.Isolate.Direction = direction
 	rt.mu.Unlock()
 
 	idx, perr := parseIsolateNode(target)
 	if perr != nil {
 		return
 	}
-	y.cutIsolate(rt, idx)
+	y.cutIsolate(rt, idx, direction)
 }
 
-func (y *YAMLAdapter) cutIsolate(rt *topologyRuntime, nodeIdx int) {
+func (y *YAMLAdapter) watchPause(t *BaseTrial, rt *topologyRuntime) {
+	err := y.watchFaultTrigger(t)
+	vars := y.vars(t, "")
+
+	rt.mu.Lock()
+	if rt.Pause == nil {
+		rt.mu.Unlock()
+		return
+	}
+	rt.Pause.Done = true
+	if err != nil {
+		rt.mu.Unlock()
+		return
+	}
+	rt.Pause.TriggerFired = true
+	target := expandTemplates(y.cfg.Fault.Pause.Node, vars)
+	rt.Pause.Target = target
+	resume := y.cfg.Fault.Pause.resume()
+	rt.Pause.Resume = resume
+	rt.mu.Unlock()
+
+	idx, perr := parseIsolateNode(target)
+	if perr != nil {
+		return
+	}
+	y.pauseNode(rt, idx)
+}
+
+func (y *YAMLAdapter) pauseNode(rt *topologyRuntime, nodeIdx int) {
+	rt.mu.Lock()
+	var n *topologyNode
+	if nodeIdx >= 0 && nodeIdx < len(rt.Nodes) {
+		n = rt.Nodes[nodeIdx]
+	}
+	rt.mu.Unlock()
+	if n == nil || n.cmd == nil || n.cmd.Process == nil {
+		return
+	}
+	if err := n.cmd.Process.Signal(syscall.SIGSTOP); err != nil {
+		return
+	}
+	rt.mu.Lock()
+	if rt.Pause != nil {
+		rt.Pause.PauseTime = time.Now()
+		rt.Pause.Paused = true
+	}
+	rt.mu.Unlock()
+}
+
+func (y *YAMLAdapter) cutIsolate(rt *topologyRuntime, nodeIdx int, direction string) {
 	rt.mu.Lock()
 	cutAt := time.Now()
 	if rt.Isolate != nil {
 		rt.Isolate.CutTime = cutAt
+		rt.Isolate.Direction = direction
 	}
 	var toCut []*topologyLink
 	for _, l := range rt.Links {
 		if l == nil || l.Link == nil {
 			continue
 		}
-		if l.From == nodeIdx || l.To == nodeIdx {
-			toCut = append(toCut, l)
+		switch direction {
+		case "inbound":
+			if l.To == nodeIdx {
+				toCut = append(toCut, l)
+			}
+		default: // both
+			if l.From == nodeIdx || l.To == nodeIdx {
+				toCut = append(toCut, l)
+			}
 		}
 	}
 	rt.mu.Unlock()
@@ -893,6 +1172,37 @@ func (y *YAMLAdapter) checkIsolate(rt *topologyRuntime) CheckResult {
 			}
 		}
 		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// checkPause returns a non-empty Verdict when the pause fault cannot be proven.
+func (y *YAMLAdapter) checkPause(rt *topologyRuntime) CheckResult {
+	wait := parseYAMLDuration(y.cfg.Fault.After.File.Timeout, 30*time.Second) + 2*time.Second
+	deadline := time.Now().Add(wait)
+	for {
+		rt.mu.Lock()
+		done := rt.Pause != nil && rt.Pause.Done
+		fired := rt.Pause != nil && rt.Pause.TriggerFired
+		paused := rt.Pause != nil && rt.Pause.Paused
+		rt.mu.Unlock()
+		if done {
+			if !fired || !paused {
+				return CheckResult{
+					Verdict:  "UNKNOWN",
+					Evidence: 1,
+					Problems: []error{fmt.Errorf("fault.pause: trigger did not pause a node")},
+				}
+			}
+			return CheckResult{}
+		}
+		if time.Now().After(deadline) {
+			return CheckResult{
+				Verdict:  "UNKNOWN",
+				Evidence: 1,
+				Problems: []error{fmt.Errorf("fault.pause: trigger did not pause a node")},
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
@@ -954,6 +1264,16 @@ func (y *YAMLAdapter) stopTopology(rt *topologyRuntime) {
 	rt.Stopped = true
 	nodes := append([]*topologyNode(nil), rt.Nodes...)
 	links := append([]*topologyLink(nil), rt.Links...)
+	pausedIdx := -1
+	resume := "end"
+	paused := false
+	if rt.Pause != nil && rt.Pause.Paused {
+		paused = true
+		resume = rt.Pause.Resume
+		if idx, err := parseIsolateNode(rt.Pause.Target); err == nil {
+			pausedIdx = idx
+		}
+	}
 	rt.mu.Unlock()
 
 	for _, l := range links {
@@ -962,9 +1282,21 @@ func (y *YAMLAdapter) stopTopology(rt *topologyRuntime) {
 		}
 	}
 
+	// A SIGSTOP'd process ignores SIGTERM until continued. resume:end sends
+	// SIGCONT first; resume:never leaves it stopped and relies on SIGKILL.
+	if paused && resume == "end" && pausedIdx >= 0 && pausedIdx < len(nodes) {
+		if n := nodes[pausedIdx]; n != nil && n.cmd != nil && n.cmd.Process != nil {
+			_ = n.cmd.Process.Signal(syscall.SIGCONT)
+		}
+	}
+
 	grace := parseYAMLDuration(y.cfg.Topology.StopGrace, 2*time.Second)
-	for _, n := range nodes {
+	for i, n := range nodes {
 		if n == nil || n.cmd == nil || n.cmd.Process == nil {
+			continue
+		}
+		// Still-stopped nodes (resume:never) skip SIGTERM; SIGKILL reaps them.
+		if paused && resume == "never" && i == pausedIdx {
 			continue
 		}
 		_ = n.cmd.Process.Signal(syscall.SIGTERM)
@@ -1149,8 +1481,13 @@ func (y *YAMLAdapter) CheckNamed(at AdapterTrial, killed bool, phase string) Che
 				Problems: []error{fmt.Errorf("topology: a node was not ready in time")},
 			}
 		}
-		if y.cfg.Fault.Isolate != "" {
+		if y.cfg.Fault.Isolate.active() {
 			if cr := y.checkIsolate(rt); cr.Verdict != "" {
+				return cr
+			}
+		}
+		if y.cfg.Fault.Pause.active() {
+			if cr := y.checkPause(rt); cr.Verdict != "" {
 				return cr
 			}
 		}
@@ -1251,6 +1588,8 @@ func (y *YAMLAdapter) checkRules(t *BaseTrial) CheckResult {
 	if evidence == 0 {
 		evidence = 1
 	}
+	// Surface check vals (e.g. command stdout) in trial JSON evidence.check.
+	t.Data()["check_vals"] = vals
 	for _, r := range y.cfg.Check.Rules {
 		if r.Else != "" && len(r.If) == 0 {
 			return CheckResult{Verdict: r.Else, Evidence: evidence}

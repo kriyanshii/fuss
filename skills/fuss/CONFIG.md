@@ -11,11 +11,11 @@ purpose they do not have: `workload.until` and `kill.signal`.
 
 ## Template variables
 
-`expandTemplates` replaces these twelve names, once, in this order: `run_id`,
+`expandTemplates` replaces these thirteen names, once, in this order: `run_id`,
 `binary`, `home`, `addr`, `seed`, `dir`, `key`, `n`, `i`, `port`,
-`data_dir`, `peers`. Then any `${peer_addr_<j>}` present in `vars`. Text
-inserted for an earlier name is still scanned for a later name. Any other
-`${...}` is left as written.
+`data_dir`, `peers`, `peers_via_proxy`. Then any `${peer_addr_<j>}` or
+`${node_proxy_addr_<k>}` present in `vars`. Text inserted for an earlier
+name is still scanned for a later name. Any other `${...}` is left as written.
 
 | Variable | Value in `vars` | When it is set |
 |---|---|---|
@@ -30,8 +30,10 @@ inserted for an earlier name is still scanned for a later name. Any other
 | `${i}` | node index as decimal | While expanding topology fields for one node (`0` .. `nodes-1`). Empty on every other expansion. |
 | `${port}` | that node's listen port | Same topology expansion. From `topology.ports.base`, or a free port when that base is `0`. |
 | `${data_dir}` | that node's data directory | Same topology expansion. The expanded `topology.data_dir`. |
-| `${peer_addr_<j>}` | proxy listen addr to node `j` | Topology expansion when `topology.peers.via_proxy` is true. Empty for `j == i`. |
+| `${peer_addr_<j>}` | proxy listen addr to node `j` | Topology expansion when `topology.peers.via_proxy` is true. Empty for `j == i`. In `per_node` mode every peer uses the same inbound proxy for `j`. |
 | `${peers}` | comma-joined peer proxy addrs | Same; every `${peer_addr_<j>}` for `j != i`. |
+| `${node_proxy_addr_<k>}` | inbound proxy listen for node `k` | Topology expansion when `topology.proxy_mode` is `per_node`. |
+| `${peers_via_proxy}` | same as `${peers}` | Set with `per_node` (and `via_proxy`); convenient when the start line should name the shared inbound fronts. |
 
 These strings are expanded: `data_dir`, `args`, `restart.args`, `env` values,
 `steps[].command`, `topology.data_dir`, `topology.start`,
@@ -307,25 +309,64 @@ this long before `SIGKILL`. Example: `stop_grace: 500ms`
 port is the peer port. With the single topology `${port}`, that port is the
 peer port; client ports stay direct. Example: `port_name: raft`
 
-**`topology.peers.via_proxy`** (bool, default: `false`). When true, for every
-ordered pair of nodes `(i, j)` with `i != j`, Fuss starts a `proxy.Link` that
-listens locally and forwards to node `j`'s real peer port. Node `i`'s start
-template gets `${peer_addr_j}` and `${peers}` pointing at those proxies so
-peer traffic goes through Fuss. Example: `via_proxy: true`
+**`topology.peers.via_proxy`** (bool, default: `false`). When true, Fuss starts
+`proxy.Link`s for peer traffic (see `proxy_mode`). Node start templates get
+`${peer_addr_j}` and `${peers}` pointing at those proxies. Example:
+`via_proxy: true`
+
+**`topology.proxy_mode`** (string, default: `per_pair`). How peer proxies are
+shaped when `via_proxy` is true:
+
+- `per_pair` — one `proxy.Link` per ordered pair `(i, j)`. Node `i` dials a
+  distinct listen addr to reach `j`. This is the historical default.
+- `per_node` — one inbound `proxy.Link` per node. Every peer dials the same
+  listen addr to reach that node. Exposes `${node_proxy_addr_k}` and
+  `${peers_via_proxy}`. Requires `via_proxy: true`.
+
+Example: `proxy_mode: per_node`
 
 ## `fault`
 
 Live fault while topology nodes keep running. Empty `isolate` disables it.
 
-**`fault.isolate`** (string, default: empty). `node_<index>` cuts every proxy
-link into and out of that node and leaves the process running. Example:
-`isolate: node_0`
+**`fault.isolate`** (string or object, default: empty). Cuts proxy links for
+one node and leaves the process running.
+
+- String form: `isolate: node_0` (direction defaults to `both`).
+- Object form: `isolate: { node: node_0, direction: inbound }`.
+
+**`fault.isolate.direction`** (string, default: `both`). Which links to cut:
+
+- `both` — every link into or out of the node (`per_pair` only).
+- `inbound` — only links whose destination is the node.
+
+With `topology.proxy_mode: per_node`, only `inbound` is allowed. Load rejects
+`direction: both` because a shared inbound proxy cannot separate one node's
+outbound flows from another's. Example:
+`isolate: { node: node_0, direction: inbound }`
+
+**`fault.pause`** (string or object, default: empty). Sends `SIGSTOP` to one
+topology node's process after the same `fault.after` trigger as isolate.
+Allowed alongside `fault.isolate`.
+
+- String form: `pause: node_0` (resume defaults to `end`).
+- Object form: `pause: { node: node_0, resume: never }`.
+
+**`fault.pause.resume`** (string, default: `end`):
+
+- `end` — send `SIGCONT` before topology teardown.
+- `never` — leave the process stopped; teardown still `SIGKILL`s it.
+
+Trial JSON `evidence.pause` records `pause_time`, `target`, `resume`,
+`trigger_fired`, and `paused`. When the trigger never pauses a node, the
+check verdict is `UNKNOWN` (never `PASS`).
 
 **`fault.after.file`** (object, same fields as `kill.file`). Trigger for the
-isolate. When the trigger never fires, or after `Cut` no link reports
-`closed_by_cut` or `refused_while_cut` growth, the check verdict is
+isolate and/or pause. When the trigger never fires, or after `Cut` no link
+reports `closed_by_cut` or `refused_while_cut` growth, the check verdict is
 `UNKNOWN` (never `PASS`). Trial JSON `evidence.isolate` records
-`trigger_fired`, `cut_time`, and per-link `stats_before` / `stats_after`.
+`proxy_mode`, `direction`, `links_cut`, `links_total`, `trigger_fired`,
+`cut_time`, and per-link `stats_before` / `stats_after`.
 Example: `after: { file: { glob: "${dir}/cut_now", contains: NOW, poll: 10ms, timeout: 5s } }`
 
 ## `check`

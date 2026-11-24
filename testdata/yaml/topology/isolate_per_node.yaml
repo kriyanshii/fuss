@@ -1,0 +1,37 @@
+name: topology-isolate-per-node
+binary:
+  default: hold
+  extra: ["./testdata/yaml/topology/hold"]
+topology:
+  nodes: 3
+  data_dir: "${dir}/node${i}"
+  ports:
+    base: 0
+  proxy_mode: per_node
+  peers:
+    port_name: raft
+    via_proxy: true
+  start: ["${binary}", "${data_dir}", "${port}", "${peers_via_proxy}"]
+  ready:
+    file: "${data_dir}/ready"
+    contains: READY
+    timeout: 2s
+  stop_grace: 500ms
+fault:
+  isolate:
+    node: node_0
+    direction: inbound
+  after:
+    file:
+      glob: "${dir}/cut_now"
+      contains: NOW
+      poll: 10ms
+      timeout: 5s
+check:
+  file_count:
+    glob: "${dir}/node*/ready"
+    as: ready_files
+  rules:
+    - if: { ready_files_eq: 3 }
+      verdict: PASS
+    - else: FAIL

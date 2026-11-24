@@ -344,6 +344,12 @@ func runAdapter(adapter Adapter, targetFlag string, seed int64, n int, doKill bo
 		if result.isolate != nil {
 			ev["isolate"] = result.isolate
 		}
+		if result.pause != nil {
+			ev["pause"] = result.pause
+		}
+		if result.check != nil {
+			ev["check"] = result.check
+		}
 		emit(map[string]any{
 			"type":     "trial",
 			"mode":     adapter.Name(),
@@ -389,6 +395,8 @@ type adapterTrialResult struct {
 	acks      int
 	topology  []map[string]any
 	isolate   map[string]any
+	pause     map[string]any
+	check     map[string]any
 }
 
 func runAdapterTrial(adapter Adapter, seed int64, binaryPath string, doKill bool) (*adapterTrialResult, error) {
@@ -490,6 +498,10 @@ func runAdapterTrial(adapter Adapter, seed int64, binaryPath string, doKill bool
 	if rt, ok := at.Data()["topology"].(*topologyRuntime); ok {
 		result.topology = rt.evidence()
 		result.isolate = rt.isolateEvidence()
+		result.pause = rt.pauseEvidence()
+	}
+	if cv, ok := at.Data()["check_vals"].(map[string]any); ok && len(cv) > 0 {
+		result.check = cv
 	}
 
 	return result, nil

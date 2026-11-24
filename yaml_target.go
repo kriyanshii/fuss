@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"math/rand"
@@ -233,6 +234,7 @@ type yamlStep struct {
 	Command  []string `yaml:"command"`
 	WaitExit bool     `yaml:"wait_exit"`
 	Timeout  string   `yaml:"timeout"`
+	Delay    string   `yaml:"delay"`
 	RunFor   string   `yaml:"run_for"`
 	Stop     string   `yaml:"stop"`
 	Kill     yamlKill `yaml:"kill"`
@@ -249,8 +251,11 @@ type yamlCheck struct {
 }
 
 type yamlFileCount struct {
-	Glob string `yaml:"glob"`
-	As   string `yaml:"as"`
+	Glob      string `yaml:"glob"`
+	As        string `yaml:"as"`
+	Contains  string `yaml:"contains"`
+	JSONField string `yaml:"json_field"`
+	Equals    string `yaml:"equals"`
 }
 
 type yamlRecCount struct {
@@ -342,6 +347,14 @@ func LoadYAMLTarget(path string) (*YAMLAdapter, error) {
 	if cfg.Fault.Pause.active() && cfg.Fault.Pause.Node == "" {
 		return nil, fmt.Errorf("target-config %s: fault.pause.node is required", path)
 	}
+	for _, st := range cfg.Steps {
+		if strings.TrimSpace(st.Delay) == "" {
+			continue
+		}
+		if _, err := time.ParseDuration(st.Delay); err != nil {
+			return nil, fmt.Errorf("target-config %s: steps[%q].delay %q: %w", path, st.Name, st.Delay, err)
+		}
+	}
 	return &YAMLAdapter{path: path, cfg: cfg}, nil
 }
 
@@ -416,6 +429,7 @@ func (y *YAMLAdapter) vars(t *BaseTrial, n string) map[string]string {
 		"binary": t.BinaryPath(),
 		"n":      n,
 		"key":    "",
+		"name":   y.cfg.Name,
 	}
 	if y.cfg.Workload.Ack.Key != "" {
 		m["key"] = expandTemplates(y.cfg.Workload.Ack.Key, m)
@@ -426,7 +440,7 @@ func (y *YAMLAdapter) vars(t *BaseTrial, n string) map[string]string {
 }
 
 func expandTemplates(s string, vars map[string]string) string {
-	keys := []string{"run_id", "binary", "home", "addr", "seed", "dir", "key", "n", "i", "port", "data_dir", "peers", "peers_via_proxy"}
+	keys := []string{"run_id", "binary", "home", "addr", "seed", "dir", "key", "n", "i", "port", "data_dir", "peers", "peers_via_proxy", "name"}
 	for _, k := range keys {
 		s = strings.ReplaceAll(s, "${"+k+"}", vars[k])
 	}
@@ -514,8 +528,15 @@ func (y *YAMLAdapter) startSteps(t *BaseTrial, log *os.File) (*exec.Cmd, error) 
 		if sawLive {
 			break
 		}
+		if st.Delay != "" {
+			// Validated non-empty at load; zero only if empty (skipped above).
+			time.Sleep(mustYAMLDuration(st.Delay))
+		}
 		args := y.expandSlice(st.Command, vars)
 		if len(args) == 0 {
+			if st.Delay != "" {
+				continue
+			}
 			return nil, fmt.Errorf("step %q: empty command", st.Name)
 		}
 		cmd := exec.Command(args[0], args[1:]...)
@@ -1626,6 +1647,15 @@ func parseYAMLDuration(s string, def time.Duration) time.Duration {
 	return d
 }
 
+// mustYAMLDuration parses a duration that LoadYAMLTarget already validated.
+func mustYAMLDuration(s string) time.Duration {
+	d, err := time.ParseDuration(s)
+	if err != nil {
+		return 0
+	}
+	return d
+}
+
 func (y *YAMLAdapter) Status(at AdapterTrial) (AdapterStatus, error) {
 	t, ok := at.(*BaseTrial)
 	if !ok {
@@ -1725,8 +1755,14 @@ func (y *YAMLAdapter) runAfterSteps(t *BaseTrial, steps []yamlStep) error {
 	}
 	defer log.Close()
 	for _, st := range steps {
+		if st.Delay != "" {
+			time.Sleep(mustYAMLDuration(st.Delay))
+		}
 		args := y.expandSlice(st.Command, vars)
 		if len(args) == 0 {
+			if st.Delay != "" {
+				continue
+			}
 			return fmt.Errorf("step %q: empty command", st.Name)
 		}
 		cmd := exec.Command(args[0], args[1:]...)
@@ -1756,8 +1792,9 @@ func (y *YAMLAdapter) checkRules(t *BaseTrial) CheckResult {
 	evidence := 0
 	if y.cfg.Check.FileCount.Glob != "" {
 		g := expandTemplates(y.cfg.Check.FileCount.Glob, vars)
-		m, _ := filepath.Glob(g)
-		n := len(m)
+		contains := expandTemplates(y.cfg.Check.FileCount.Contains, vars)
+		equals := expandTemplates(y.cfg.Check.FileCount.Equals, vars)
+		n := countMatchingFiles(g, contains, y.cfg.Check.FileCount.JSONField, equals)
 		name := y.cfg.Check.FileCount.As
 		if name == "" {
 			name = "files"
@@ -1817,6 +1854,83 @@ func (y *YAMLAdapter) checkRules(t *BaseTrial) CheckResult {
 		}
 	}
 	return CheckResult{Verdict: "FAIL", Evidence: evidence, Problems: []error{fmt.Errorf("no rule matched %v", vals)}}
+}
+
+// countMatchingFiles is filepath.Glob, then optionally keeps only files whose
+// contents match. An empty contains and jsonField counts every glob hit, as
+// before. jsonField is either a dotted path (dagRun.id) or a bare key name
+// searched recursively through objects and arrays.
+func countMatchingFiles(glob, contains, jsonField, equals string) int {
+	m, _ := filepath.Glob(glob)
+	if contains == "" && jsonField == "" {
+		return len(m)
+	}
+	n := 0
+	for _, p := range m {
+		st, err := os.Stat(p)
+		if err != nil || st.IsDir() {
+			continue
+		}
+		b, err := os.ReadFile(p)
+		if err != nil {
+			continue
+		}
+		if contains != "" && !strings.Contains(string(b), contains) {
+			continue
+		}
+		if jsonField != "" && !jsonFieldEquals(b, jsonField, equals) {
+			continue
+		}
+		n++
+	}
+	return n
+}
+
+func jsonFieldEquals(b []byte, field, want string) bool {
+	var v any
+	if err := json.Unmarshal(b, &v); err != nil {
+		return false
+	}
+	if strings.Contains(field, ".") {
+		return jsonPathEquals(v, strings.Split(field, "."), want)
+	}
+	return jsonHasFieldEquals(v, field, want)
+}
+
+func jsonPathEquals(v any, path []string, want string) bool {
+	cur := v
+	for _, p := range path {
+		m, ok := cur.(map[string]any)
+		if !ok {
+			return false
+		}
+		cur, ok = m[p]
+		if !ok {
+			return false
+		}
+	}
+	return fmt.Sprint(cur) == want
+}
+
+func jsonHasFieldEquals(v any, field, want string) bool {
+	switch x := v.(type) {
+	case map[string]any:
+		if got, ok := x[field]; ok && fmt.Sprint(got) == want {
+			return true
+		}
+		for _, child := range x {
+			if jsonHasFieldEquals(child, field, want) {
+				return true
+			}
+		}
+	case []any:
+		for _, child := range x {
+			if jsonHasFieldEquals(child, field, want) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func matchYAMLRule(ifm map[string]any, vals map[string]any) bool {

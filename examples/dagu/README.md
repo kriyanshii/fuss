@@ -20,13 +20,22 @@ short of the rules.
 
 ## Reproduce
 
-From the repo root, after `go build -o fuss .`:
+YAML fixture (preferred). Needs a Dagu binary on `PATH` (or `./dagu`):
+
+```bash
+./fuss -target-config=examples/dagu/human.yaml -seed=1 -n=10 -json
+```
+
+`complete-again` waits 35s past Dagu's stale lock window, then retries.
+Queue items are counted by nested `dagRun.id`, not the filename.
+
+Older Go path (`-dag=human`):
 
 ```bash
 ./fuss -target=<path to dagu> -dag=human -kill-at=queued -seed=1 -n=10 -json
 ```
 
-Expected result: STRANDED 10 of 10.
+Expected result on current Dagu: STRANDED when the kill leaves no queue item.
 
 Older shape (no `-adapter` flag):
 

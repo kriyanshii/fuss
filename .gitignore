@@ -2,6 +2,9 @@
 /fuss
 /toykv
 /examples/repkv/repkv
+/examples/rqlite/rqlited
+/examples/rqlite/rqlite
+/examples/rqlite/rqbench
 
 __pycache__/
 *.pyc

@@ -23,23 +23,23 @@ import (
 )
 
 type yamlTarget struct {
-	Name     string                 `yaml:"name"`
-	Binary   yamlBinary             `yaml:"binary"`
-	Args     []string               `yaml:"args"`
-	Env      map[string]string      `yaml:"env"`
-	DataDir  string                 `yaml:"data_dir"`
-	PortBase int                    `yaml:"port_base"`
-	PortMod  int                    `yaml:"port_mod"`
-	Start    yamlStart              `yaml:"start"`
-	Health   yamlHealth             `yaml:"health"`
-	Workload yamlWorkload           `yaml:"workload"`
-	Kill     yamlKill               `yaml:"kill"`
-	Restart  yamlRestart            `yaml:"restart"`
-	Steps    []yamlStep             `yaml:"steps"`
-	Topology yamlTopology           `yaml:"topology"`
-	Fault    yamlFault              `yaml:"fault"`
-	Check    yamlCheck              `yaml:"check"`
-	Controls map[string]yamlControl `yaml:"controls"`
+	Name      string                 `yaml:"name"`
+	Binary    yamlBinary             `yaml:"binary"`
+	Args      []string               `yaml:"args"`
+	Env       map[string]string      `yaml:"env"`
+	DataDir   string                 `yaml:"data_dir"`
+	PortBase  int                    `yaml:"port_base"`
+	PortMod   int                    `yaml:"port_mod"`
+	Start     yamlStart              `yaml:"start"`
+	Health    yamlHealth             `yaml:"health"`
+	Workload  yamlWorkload           `yaml:"workload"`
+	Kill      yamlKill               `yaml:"kill"`
+	Restart   yamlRestart            `yaml:"restart"`
+	Steps     []yamlStep             `yaml:"steps"`
+	Topology  yamlTopology           `yaml:"topology"`
+	Fault     yamlFault              `yaml:"fault"`
+	Check     yamlCheck              `yaml:"check"`
+	Controls  map[string]yamlControl `yaml:"controls"`
 }
 
 // yamlTopology starts N peer processes for one trial. Empty Nodes means no topology.
@@ -48,7 +48,7 @@ type yamlTopology struct {
 	DataDir   string        `yaml:"data_dir"`
 	Ports     yamlTopoPorts `yaml:"ports"`
 	Peers     yamlTopoPeers `yaml:"peers"`
-	ProxyMode string        `yaml:"proxy_mode"` // "per_pair" (default), "per_node", or "per_node_owned"
+	ProxyMode string        `yaml:"proxy_mode"` // "per_pair" (default) or "per_node"
 	Start     []string      `yaml:"start"`
 	Ready     yamlTopoReady `yaml:"ready"`
 	StopGrace string        `yaml:"stop_grace"`
@@ -315,12 +315,12 @@ func LoadYAMLTarget(path string) (*YAMLAdapter, error) {
 		mode = "per_pair"
 	}
 	switch mode {
-	case "per_pair", "per_node", "per_node_owned":
+	case "per_pair", "per_node":
 	default:
-		return nil, fmt.Errorf("target-config %s: topology.proxy_mode %q not supported (per_pair, per_node, or per_node_owned)", path, cfg.Topology.ProxyMode)
+		return nil, fmt.Errorf("target-config %s: topology.proxy_mode %q not supported (per_pair or per_node)", path, cfg.Topology.ProxyMode)
 	}
-	if (mode == "per_node" || mode == "per_node_owned") && !cfg.Topology.Peers.ViaProxy {
-		return nil, fmt.Errorf("target-config %s: topology.proxy_mode %s requires topology.peers.via_proxy", path, mode)
+	if mode == "per_node" && !cfg.Topology.Peers.ViaProxy {
+		return nil, fmt.Errorf("target-config %s: topology.proxy_mode per_node requires topology.peers.via_proxy", path)
 	}
 	cfg.Topology.ProxyMode = mode
 
@@ -347,12 +347,12 @@ func LoadYAMLTarget(path string) (*YAMLAdapter, error) {
 	if cfg.Fault.Pause.active() && cfg.Fault.Pause.Node == "" {
 		return nil, fmt.Errorf("target-config %s: fault.pause.node is required", path)
 	}
-	for _, st := range cfg.Steps {
-		if strings.TrimSpace(st.Delay) == "" {
+	for i, st := range cfg.Steps {
+		if st.Delay == "" {
 			continue
 		}
 		if _, err := time.ParseDuration(st.Delay); err != nil {
-			return nil, fmt.Errorf("target-config %s: steps[%q].delay %q: %w", path, st.Name, st.Delay, err)
+			return nil, fmt.Errorf("target-config %s: steps[%d].delay: %w", path, i, err)
 		}
 	}
 	return &YAMLAdapter{path: path, cfg: cfg}, nil
@@ -529,7 +529,6 @@ func (y *YAMLAdapter) startSteps(t *BaseTrial, log *os.File) (*exec.Cmd, error) 
 			break
 		}
 		if st.Delay != "" {
-			// Validated non-empty at load; zero only if empty (skipped above).
 			time.Sleep(mustYAMLDuration(st.Delay))
 		}
 		args := y.expandSlice(st.Command, vars)
@@ -627,15 +626,6 @@ type topologyLink struct {
 	tagBefore   map[int]proxy.Stats // per source, snapshotted at cut
 	CutTime     time.Time
 	cut         bool
-	cutFrom     map[int]struct{} // per_node_owned: sources cut on this inbound proxy
-}
-
-// unknownOwner is a connection whose socket owner was not one of the topology PIDs.
-type unknownOwner struct {
-	To     int
-	Listen string
-	Remote string
-	Cut    bool
 }
 
 type isolateState struct {
@@ -660,7 +650,6 @@ type topologyRuntime struct {
 	ProxyMode string
 	Nodes     []*topologyNode
 	Links     []*topologyLink
-	Unknown   []unknownOwner
 	Isolate   *isolateState
 	Pause     *pauseState
 	AllReady  bool
@@ -715,9 +704,6 @@ func (rt *topologyRuntime) isolateEvidence() map[string]any {
 	defer rt.mu.Unlock()
 	if rt.Isolate == nil {
 		return nil
-	}
-	if rt.ProxyMode == "per_node_owned" {
-		return rt.ownedIsolateEvidence()
 	}
 	links := make([]map[string]any, 0, len(rt.Links))
 	cutN := 0
@@ -882,7 +868,7 @@ func (rt *topologyRuntime) cutObserved() bool {
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
 	for _, l := range rt.Links {
-		if l == nil || l.Link == nil || (!l.cut && len(l.cutFrom) == 0) {
+		if l == nil || !l.cut || l.Link == nil {
 			continue
 		}
 		st := l.Link.Stats()
@@ -930,7 +916,7 @@ func (y *YAMLAdapter) startTopology(t *BaseTrial, log *os.File) (*exec.Cmd, erro
 			peerAddrs[i] = make([]string, n)
 		}
 		switch topo.ProxyMode {
-		case "per_node", "per_node_owned":
+		case "per_node":
 			nodeProxies = make([]string, n)
 			for j := 0; j < n; j++ {
 				upstream := "127.0.0.1:" + strconv.Itoa(ports[j])
@@ -1048,14 +1034,6 @@ func (y *YAMLAdapter) startTopology(t *BaseTrial, log *os.File) (*exec.Cmd, erro
 		if err != nil {
 			y.stopTopology(rt)
 			return nil, err
-		}
-	}
-	if topo.ProxyMode == "per_node_owned" {
-		for _, l := range rt.Links {
-			if l == nil || l.Link == nil {
-				continue
-			}
-			l.Link.SetTagger(y.ownedTagger(rt, l.To, l.Listen))
 		}
 	}
 
@@ -1235,33 +1213,25 @@ func (y *YAMLAdapter) cutIsolate(rt *topologyRuntime, nodeIdx int, direction str
 		rt.Isolate.CutTime = cutAt
 		rt.Isolate.Direction = direction
 	}
-	mode := rt.ProxyMode
-	type cutOp struct {
-		link    *topologyLink
-		partial bool // cut one source on a shared inbound proxy
-	}
-	var ops []cutOp
+	var toCut []*topologyLink
 	for _, l := range rt.Links {
 		if l == nil || l.Link == nil {
 			continue
 		}
-		switch {
-		case direction == "inbound" && l.To == nodeIdx:
-			ops = append(ops, cutOp{link: l})
-		case direction != "inbound" && mode == "per_node_owned" && l.From < 0:
+		switch direction {
+		case "inbound":
 			if l.To == nodeIdx {
-				ops = append(ops, cutOp{link: l})
-			} else {
-				ops = append(ops, cutOp{link: l, partial: true})
+				toCut = append(toCut, l)
 			}
-		case direction != "inbound" && (l.From == nodeIdx || l.To == nodeIdx):
-			ops = append(ops, cutOp{link: l})
+		default: // both
+			if l.From == nodeIdx || l.To == nodeIdx {
+				toCut = append(toCut, l)
+			}
 		}
 	}
 	rt.mu.Unlock()
 
-	for _, op := range ops {
-		l := op.link
+	for _, l := range toCut {
 		before := l.Link.Stats()
 		tagBefore := l.Link.AllTagStats()
 		if op.partial {
@@ -1276,87 +1246,10 @@ func (y *YAMLAdapter) cutIsolate(rt *topologyRuntime, nodeIdx int, direction str
 		l.StatsBefore = before
 		l.tagBefore = tagBefore
 		l.CutTime = cutAt
+		l.cut = true
 		l.StatsAfter = l.Link.Stats()
-		if op.partial {
-			if l.cutFrom == nil {
-				l.cutFrom = map[int]struct{}{}
-			}
-			l.cutFrom[nodeIdx] = struct{}{}
-		} else {
-			l.cut = true
-			for i := range rt.Unknown {
-				if rt.Unknown[i].Listen == l.Listen {
-					rt.Unknown[i].Cut = true
-				}
-			}
-		}
 		rt.mu.Unlock()
 	}
-}
-
-// ownedTagger maps an accepted client socket to the topology node that owns it.
-func (y *YAMLAdapter) ownedTagger(rt *topologyRuntime, to int, listen string) func(net.Addr) (int, bool) {
-	return func(remote net.Addr) (int, bool) {
-		if remote == nil {
-			rt.addUnknown(unknownOwner{To: to, Listen: listen})
-			return 0, false
-		}
-		for attempt := 0; attempt < 3; attempt++ {
-			pids, by := rt.nodePIDs()
-			if len(pids) == 0 {
-				return -1, true
-			}
-			pid, err := proxy.OwnerPID(remote, pids)
-			if err == nil {
-				if idx, ok := by[pid]; ok {
-					return idx, true
-				}
-			}
-			if attempt+1 < 3 {
-				time.Sleep(15 * time.Millisecond)
-			}
-		}
-		rt.addUnknown(unknownOwner{To: to, Listen: listen, Remote: remote.String()})
-		return 0, false
-	}
-}
-
-func (rt *topologyRuntime) nodePIDs() ([]int, map[int]int) {
-	rt.mu.Lock()
-	defer rt.mu.Unlock()
-	pids := make([]int, 0, len(rt.Nodes))
-	by := make(map[int]int, len(rt.Nodes))
-	for _, n := range rt.Nodes {
-		if n == nil || n.PID <= 0 {
-			continue
-		}
-		pids = append(pids, n.PID)
-		by[n.PID] = n.Index
-	}
-	return pids, by
-}
-
-func (rt *topologyRuntime) addUnknown(u unknownOwner) {
-	rt.mu.Lock()
-	defer rt.mu.Unlock()
-	for _, l := range rt.Links {
-		if l != nil && l.Listen == u.Listen && l.cut {
-			u.Cut = true
-			break
-		}
-	}
-	rt.Unknown = append(rt.Unknown, u)
-}
-
-func (rt *topologyRuntime) unknownOnCutLink() bool {
-	rt.mu.Lock()
-	defer rt.mu.Unlock()
-	for _, u := range rt.Unknown {
-		if u.Cut {
-			return true
-		}
-	}
-	return false
 }
 
 // checkIsolate returns a non-empty Verdict when the isolate fault cannot be proven.
@@ -1390,13 +1283,6 @@ func (y *YAMLAdapter) checkIsolate(rt *topologyRuntime) CheckResult {
 	obsDeadline := time.Now().Add(2 * time.Second)
 	for {
 		if rt.cutObserved() {
-			if rt.unknownOnCutLink() {
-				return CheckResult{
-					Verdict:  "UNKNOWN",
-					Evidence: 1,
-					Problems: []error{fmt.Errorf("fault.isolate: unknown owner on a cut link")},
-				}
-			}
 			return CheckResult{}
 		}
 		if time.Now().After(obsDeadline) {
@@ -1636,6 +1522,15 @@ func (y *YAMLAdapter) putUntilDead(t *BaseTrial) {
 	}
 }
 
+// mustYAMLDuration parses a duration that LoadYAMLTarget already validated.
+func mustYAMLDuration(s string) time.Duration {
+	d, err := time.ParseDuration(s)
+	if err != nil {
+		panic(err)
+	}
+	return d
+}
+
 func parseYAMLDuration(s string, def time.Duration) time.Duration {
 	if s == "" {
 		return def
@@ -1643,15 +1538,6 @@ func parseYAMLDuration(s string, def time.Duration) time.Duration {
 	d, err := time.ParseDuration(s)
 	if err != nil {
 		return def
-	}
-	return d
-}
-
-// mustYAMLDuration parses a duration that LoadYAMLTarget already validated.
-func mustYAMLDuration(s string) time.Duration {
-	d, err := time.ParseDuration(s)
-	if err != nil {
-		return 0
 	}
 	return d
 }

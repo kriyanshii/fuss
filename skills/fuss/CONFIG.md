@@ -32,8 +32,8 @@ name is still scanned for a later name. Any other `${...}` is left as written.
 | `${data_dir}` | that node's data directory | Same topology expansion. The expanded `topology.data_dir`. |
 | `${peer_addr_<j>}` | proxy listen addr to node `j` | Topology expansion when `topology.peers.via_proxy` is true. Empty for `j == i`. In `per_node` mode every peer uses the same inbound proxy for `j`. |
 | `${peers}` | comma-joined peer proxy addrs | Same; every `${peer_addr_<j>}` for `j != i`. |
-| `${node_proxy_addr_<k>}` | inbound proxy listen for node `k` | Topology expansion when `topology.proxy_mode` is `per_node` or `per_node_owned`. |
-| `${peers_via_proxy}` | same as `${peers}` | Set with `per_node` or `per_node_owned` (and `via_proxy`); convenient when the start line should name the shared inbound fronts. |
+| `${node_proxy_addr_<k>}` | inbound proxy listen for node `k` | Topology expansion when `topology.proxy_mode` is `per_node`. |
+| `${peers_via_proxy}` | same as `${peers}` | Set with `per_node` (and `via_proxy`); convenient when the start line should name the shared inbound fronts. |
 | `${name}` | `yamlTarget.Name` | Every expansion after `Init`. The YAML `name` field. |
 
 These strings are expanded: `data_dir`, `args`, `restart.args`, `env` values,
@@ -237,9 +237,8 @@ unless `delay` is set (a pure wait). Example:
 `command: ["/bin/sh", "-c", "echo A >> ${dir}/seq.txt"]`
 
 **`steps[].delay`** (duration, default: empty). Sleep this long before the
-step's command (or alone, when `command` is empty). A non-empty value that
-`time.ParseDuration` rejects is a load error (so `35` without a unit does not
-silently become no wait). Example: `delay: 35s`
+step's command (or alone, when `command` is empty). `LoadYAMLTarget` rejects
+an unparseable value. Example: `delay: 35s`
 
 **`steps[].wait_exit`** (bool, default: `false`). On the way to the live
 step, `true` waits for the command to finish. Example: `wait_exit: true`
@@ -336,7 +335,7 @@ shaped when `via_proxy` is true:
   node. A connection whose owner is not one of the topology PIDs is kept and
   recorded as an unknown owner. Requires `via_proxy: true`.
 
-Example: `proxy_mode: per_node_owned`
+Example: `proxy_mode: per_node`
 
 ## `fault`
 
@@ -387,8 +386,7 @@ isolate and/or pause. When the trigger never fires, or after `Cut` no link
 reports `closed_by_cut` or `refused_while_cut` growth, the check verdict is
 `UNKNOWN` (never `PASS`). Trial JSON `evidence.isolate` records
 `proxy_mode`, `direction`, `links_cut`, `links_total`, `trigger_fired`,
-`cut_time`, and per-link `stats_before` / `stats_after`. `per_node_owned` also
-records `unknown_owners`.
+`cut_time`, and per-link `stats_before` / `stats_after`.
 Example: `after: { file: { glob: "${dir}/cut_now", contains: NOW, poll: 10ms, timeout: 5s } }`
 
 ## `check`
@@ -432,12 +430,11 @@ non-empty, only files whose contents contain this substring are counted.
 Directories and unreadable paths are skipped. Example: `contains: "READY"`
 
 **`check.file_count.json_field`** (string, default: empty). When non-empty,
-each globbed file is parsed as JSON. Prefer a dotted path (`dagRun.id`), which
-walks object keys in order. A bare name (no dots) matches a key of that name
-at any depth in nested objects and arrays, so it can hit the wrong field if
-the document has more than one; use a path when the shape is nested. The file
-counts if the matched value equals `equals`. The filename is not consulted.
-Invalid JSON does not count. Example: `json_field: dagRun.id`
+each globbed file is parsed as JSON. A dotted path (`dagRun.id`) walks object
+keys in order. A bare key (no dots) matches that key at any depth; prefer a
+dotted path when the document may contain the same key nested elsewhere. The
+file counts if the matched value equals `equals`. The filename is not
+consulted. Invalid JSON does not count. Example: `json_field: dagRun.id`
 
 **`check.file_count.equals`** (string, default: empty). Expanded. The value
 `json_field` is compared to, using `fmt.Sprint` of the JSON value.

@@ -235,16 +235,6 @@ func TestYAMLFileCountJSONFieldIgnoresFilename(t *testing.T) {
 	}
 }
 
-func TestExpandTemplatesName(t *testing.T) {
-	got := expandTemplates("${dir}/${name}.yaml", map[string]string{
-		"dir":  "/tmp/t",
-		"name": "ht",
-	})
-	if got != "/tmp/t/ht.yaml" {
-		t.Fatalf("expandTemplates = %q", got)
-	}
-}
-
 func TestLoadYAMLStepDelayReject(t *testing.T) {
 	dir := t.TempDir()
 	cfg := filepath.Join(dir, "bad-delay.yaml")
@@ -264,6 +254,16 @@ steps:
 	}
 	if _, err := LoadYAMLTarget(cfg); err == nil {
 		t.Fatal("expected load error for delay without unit")
+	}
+}
+
+func TestExpandTemplatesName(t *testing.T) {
+	got := expandTemplates("${dir}/${name}.yaml", map[string]string{
+		"dir":  "/tmp/t",
+		"name": "ht",
+	})
+	if got != "/tmp/t/ht.yaml" {
+		t.Fatalf("expandTemplates = %q", got)
 	}
 }
 

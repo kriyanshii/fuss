@@ -1,0 +1,34 @@
+name: topology-isolate
+binary:
+  default: hold
+  extra: ["./testdata/yaml/topology/hold"]
+topology:
+  nodes: 3
+  data_dir: "${dir}/node${i}"
+  ports:
+    base: 0
+  peers:
+    port_name: raft
+    via_proxy: true
+  start: ["${binary}", "${data_dir}", "${port}", "${peers}"]
+  ready:
+    file: "${data_dir}/ready"
+    contains: READY
+    timeout: 2s
+  stop_grace: 500ms
+fault:
+  isolate: node_0
+  after:
+    file:
+      glob: "${dir}/cut_now"
+      contains: NOW
+      poll: 10ms
+      timeout: 5s
+check:
+  file_count:
+    glob: "${dir}/node*/ready"
+    as: ready_files
+  rules:
+    - if: { ready_files_eq: 3 }
+      verdict: PASS
+    - else: FAIL

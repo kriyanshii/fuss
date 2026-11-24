@@ -16,6 +16,8 @@ import (
 	"syscall"
 	"time"
 
+	"fuss/proxy"
+
 	"gopkg.in/yaml.v3"
 )
 
@@ -34,6 +36,7 @@ type yamlTarget struct {
 	Restart   yamlRestart            `yaml:"restart"`
 	Steps     []yamlStep             `yaml:"steps"`
 	Topology  yamlTopology           `yaml:"topology"`
+	Fault     yamlFault              `yaml:"fault"`
 	Check     yamlCheck              `yaml:"check"`
 	Controls  map[string]yamlControl `yaml:"controls"`
 }
@@ -43,9 +46,26 @@ type yamlTopology struct {
 	Nodes     int           `yaml:"nodes"`
 	DataDir   string        `yaml:"data_dir"`
 	Ports     yamlTopoPorts `yaml:"ports"`
+	Peers     yamlTopoPeers `yaml:"peers"`
 	Start     []string      `yaml:"start"`
 	Ready     yamlTopoReady `yaml:"ready"`
 	StopGrace string        `yaml:"stop_grace"`
+}
+
+// yamlTopoPeers routes peer traffic through Fuss proxy.Link when ViaProxy is set.
+type yamlTopoPeers struct {
+	PortName string `yaml:"port_name"` // which per-node port is the peer port (the topology ${port})
+	ViaProxy bool   `yaml:"via_proxy"`
+}
+
+// yamlFault injects a live fault while topology nodes keep running.
+type yamlFault struct {
+	Isolate string         `yaml:"isolate"` // "node_0" (leader later)
+	After   yamlFaultAfter `yaml:"after"`
+}
+
+type yamlFaultAfter struct {
+	File yamlKillFile `yaml:"file"`
 }
 
 type yamlTopoPorts struct {
@@ -283,9 +303,14 @@ func (y *YAMLAdapter) vars(t *BaseTrial, n string) map[string]string {
 }
 
 func expandTemplates(s string, vars map[string]string) string {
-	keys := []string{"run_id", "binary", "home", "addr", "seed", "dir", "key", "n", "i", "port", "data_dir"}
+	keys := []string{"run_id", "binary", "home", "addr", "seed", "dir", "key", "n", "i", "port", "data_dir", "peers"}
 	for _, k := range keys {
 		s = strings.ReplaceAll(s, "${"+k+"}", vars[k])
+	}
+	for k, v := range vars {
+		if strings.HasPrefix(k, "peer_addr_") {
+			s = strings.ReplaceAll(s, "${"+k+"}", v)
+		}
 	}
 	return s
 }
@@ -447,9 +472,30 @@ type topologyNode struct {
 	waitDone   chan struct{}
 }
 
+// topologyLink is one directed proxy.Link from node From to node To's peer port.
+type topologyLink struct {
+	From        int
+	To          int
+	Link        *proxy.Link
+	Listen      string
+	StatsBefore proxy.Stats
+	StatsAfter  proxy.Stats
+	CutTime     time.Time
+	cut         bool
+}
+
+type isolateState struct {
+	Target       string
+	TriggerFired bool
+	CutTime      time.Time
+	Done         bool // waiter finished (fired or timed out)
+}
+
 type topologyRuntime struct {
 	mu       sync.Mutex
 	Nodes    []*topologyNode
+	Links    []*topologyLink
+	Isolate  *isolateState
 	AllReady bool
 	Stopped  bool
 }
@@ -481,6 +527,78 @@ func (rt *topologyRuntime) evidence() []map[string]any {
 	return out
 }
 
+func statsMap(s proxy.Stats) map[string]any {
+	m := map[string]any{
+		"open":              s.Open,
+		"accepted":          s.Accepted,
+		"closed_by_cut":     s.ClosedByCut,
+		"refused_while_cut": s.RefusedWhileCut,
+	}
+	if !s.LastCut.IsZero() {
+		m["last_cut"] = s.LastCut.UTC().Format(time.RFC3339Nano)
+	}
+	if !s.LastHeal.IsZero() {
+		m["last_heal"] = s.LastHeal.UTC().Format(time.RFC3339Nano)
+	}
+	return m
+}
+
+func (rt *topologyRuntime) isolateEvidence() map[string]any {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	if rt.Isolate == nil {
+		return nil
+	}
+	links := make([]map[string]any, 0, len(rt.Links))
+	for _, l := range rt.Links {
+		if l == nil || l.Link == nil {
+			continue
+		}
+		after := l.StatsAfter
+		if l.cut {
+			after = l.Link.Stats()
+			l.StatsAfter = after
+		}
+		m := map[string]any{
+			"from":         l.From,
+			"to":           l.To,
+			"listen":       l.Listen,
+			"cut":          l.cut,
+			"stats_before": statsMap(l.StatsBefore),
+			"stats_after":  statsMap(after),
+		}
+		if !l.CutTime.IsZero() {
+			m["cut_time"] = l.CutTime.UTC().Format(time.RFC3339Nano)
+		}
+		links = append(links, m)
+	}
+	out := map[string]any{
+		"target":        rt.Isolate.Target,
+		"trigger_fired": rt.Isolate.TriggerFired,
+		"links":         links,
+	}
+	if !rt.Isolate.CutTime.IsZero() {
+		out["cut_time"] = rt.Isolate.CutTime.UTC().Format(time.RFC3339Nano)
+	}
+	return out
+}
+
+func (rt *topologyRuntime) cutObserved() bool {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	for _, l := range rt.Links {
+		if l == nil || !l.cut || l.Link == nil {
+			continue
+		}
+		st := l.Link.Stats()
+		l.StatsAfter = st
+		if st.ClosedByCut > l.StatsBefore.ClosedByCut || st.RefusedWhileCut > l.StatsBefore.RefusedWhileCut {
+			return true
+		}
+	}
+	return false
+}
+
 func freePort() (int, error) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -510,6 +628,34 @@ func (y *YAMLAdapter) startTopology(t *BaseTrial, log *os.File) (*exec.Cmd, erro
 	}
 
 	rt := &topologyRuntime{Nodes: make([]*topologyNode, n)}
+	peerAddrs := make([][]string, n) // peerAddrs[i][j] = addr node i uses to reach j
+	if topo.Peers.ViaProxy {
+		for i := 0; i < n; i++ {
+			peerAddrs[i] = make([]string, n)
+		}
+		for i := 0; i < n; i++ {
+			for j := 0; j < n; j++ {
+				if i == j {
+					continue
+				}
+				upstream := "127.0.0.1:" + strconv.Itoa(ports[j])
+				link, err := proxy.New("127.0.0.1:0", upstream)
+				if err != nil {
+					y.stopTopology(rt)
+					return nil, fmt.Errorf("topology proxy %d->%d: %w", i, j, err)
+				}
+				if err := link.Start(); err != nil {
+					y.stopTopology(rt)
+					return nil, fmt.Errorf("topology proxy %d->%d start: %w", i, j, err)
+				}
+				addr := link.Addr().String()
+				tl := &topologyLink{From: i, To: j, Link: link, Listen: addr}
+				rt.Links = append(rt.Links, tl)
+				peerAddrs[i][j] = addr
+			}
+		}
+	}
+
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 	errs := make([]error, n)
@@ -532,6 +678,7 @@ func (y *YAMLAdapter) startTopology(t *BaseTrial, log *os.File) (*exec.Cmd, erro
 			vars["i"] = strconv.Itoa(i)
 			vars["data_dir"] = dataDir
 			vars["port"] = strconv.Itoa(ports[i])
+			y.addPeerVars(vars, peerAddrs, i)
 			args := y.expandSlice(topo.Start, vars)
 			if len(args) == 0 {
 				errs[i] = fmt.Errorf("topology.start expanded empty for node %d", i)
@@ -591,6 +738,7 @@ func (y *YAMLAdapter) startTopology(t *BaseTrial, log *os.File) (*exec.Cmd, erro
 			vars["i"] = strconv.Itoa(i)
 			vars["data_dir"] = node.DataDir
 			vars["port"] = strconv.Itoa(node.Port)
+			y.addPeerVars(vars, peerAddrs, i)
 			if err := y.waitTopologyReady(node, vars, readyTo); err != nil {
 				mu.Lock()
 				allReady = false
@@ -606,6 +754,11 @@ func (y *YAMLAdapter) startTopology(t *BaseTrial, log *os.File) (*exec.Cmd, erro
 	rt.AllReady = allReady
 	t.Data()["topology"] = rt
 
+	if y.cfg.Fault.Isolate != "" {
+		rt.Isolate = &isolateState{Target: y.cfg.Fault.Isolate}
+		go y.watchIsolate(t, rt)
+	}
+
 	hold := exec.Command("sleep", "3600")
 	hold.Stdout = log
 	hold.Stderr = log
@@ -614,6 +767,133 @@ func (y *YAMLAdapter) startTopology(t *BaseTrial, log *os.File) (*exec.Cmd, erro
 		return nil, err
 	}
 	return hold, nil
+}
+
+func (y *YAMLAdapter) addPeerVars(vars map[string]string, peerAddrs [][]string, i int) {
+	if len(peerAddrs) == 0 {
+		return
+	}
+	var peers []string
+	for j, addr := range peerAddrs[i] {
+		key := "peer_addr_" + strconv.Itoa(j)
+		vars[key] = addr
+		if addr != "" {
+			peers = append(peers, addr)
+		}
+	}
+	vars["peers"] = strings.Join(peers, ",")
+}
+
+func parseIsolateNode(s string) (int, error) {
+	s = strings.TrimSpace(s)
+	if !strings.HasPrefix(s, "node_") {
+		return -1, fmt.Errorf("fault.isolate %q: want node_<index>", s)
+	}
+	return strconv.Atoi(strings.TrimPrefix(s, "node_"))
+}
+
+func (y *YAMLAdapter) watchIsolate(t *BaseTrial, rt *topologyRuntime) {
+	spec := y.cfg.Fault.After.File
+	vars := y.vars(t, "")
+	glob := expandTemplates(spec.Glob, vars)
+	contains := expandTemplates(spec.Contains, vars)
+	poll := parseYAMLDuration(spec.Poll, time.Millisecond)
+	timeout := parseYAMLDuration(spec.Timeout, 30*time.Second)
+	err := waitFileContains(glob, contains, poll, timeout)
+
+	rt.mu.Lock()
+	if rt.Isolate == nil {
+		rt.mu.Unlock()
+		return
+	}
+	rt.Isolate.Done = true
+	if err != nil {
+		rt.mu.Unlock()
+		return
+	}
+	rt.Isolate.TriggerFired = true
+	target := expandTemplates(y.cfg.Fault.Isolate, vars)
+	rt.Isolate.Target = target
+	rt.mu.Unlock()
+
+	idx, perr := parseIsolateNode(target)
+	if perr != nil {
+		return
+	}
+	y.cutIsolate(rt, idx)
+}
+
+func (y *YAMLAdapter) cutIsolate(rt *topologyRuntime, nodeIdx int) {
+	rt.mu.Lock()
+	cutAt := time.Now()
+	if rt.Isolate != nil {
+		rt.Isolate.CutTime = cutAt
+	}
+	var toCut []*topologyLink
+	for _, l := range rt.Links {
+		if l == nil || l.Link == nil {
+			continue
+		}
+		if l.From == nodeIdx || l.To == nodeIdx {
+			toCut = append(toCut, l)
+		}
+	}
+	rt.mu.Unlock()
+
+	for _, l := range toCut {
+		before := l.Link.Stats()
+		l.Link.Cut()
+		rt.mu.Lock()
+		l.StatsBefore = before
+		l.CutTime = cutAt
+		l.cut = true
+		l.StatsAfter = l.Link.Stats()
+		rt.mu.Unlock()
+	}
+}
+
+// checkIsolate returns a non-empty Verdict when the isolate fault cannot be proven.
+func (y *YAMLAdapter) checkIsolate(rt *topologyRuntime) CheckResult {
+	wait := parseYAMLDuration(y.cfg.Fault.After.File.Timeout, 30*time.Second) + 2*time.Second
+	deadline := time.Now().Add(wait)
+	for {
+		rt.mu.Lock()
+		done := rt.Isolate != nil && rt.Isolate.Done
+		fired := rt.Isolate != nil && rt.Isolate.TriggerFired
+		rt.mu.Unlock()
+		if done {
+			if !fired {
+				return CheckResult{
+					Verdict:  "UNKNOWN",
+					Evidence: 1,
+					Problems: []error{fmt.Errorf("fault.isolate: trigger did not fire")},
+				}
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			return CheckResult{
+				Verdict:  "UNKNOWN",
+				Evidence: 1,
+				Problems: []error{fmt.Errorf("fault.isolate: trigger did not fire")},
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	obsDeadline := time.Now().Add(2 * time.Second)
+	for {
+		if rt.cutObserved() {
+			return CheckResult{}
+		}
+		if time.Now().After(obsDeadline) {
+			return CheckResult{
+				Verdict:  "UNKNOWN",
+				Evidence: 1,
+				Problems: []error{fmt.Errorf("fault.isolate: no link closed or refused after cut")},
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 }
 
 func (y *YAMLAdapter) waitTopologyReady(node *topologyNode, vars map[string]string, timeout time.Duration) error {
@@ -673,7 +953,14 @@ func (y *YAMLAdapter) stopTopology(rt *topologyRuntime) {
 	}
 	rt.Stopped = true
 	nodes := append([]*topologyNode(nil), rt.Nodes...)
+	links := append([]*topologyLink(nil), rt.Links...)
 	rt.mu.Unlock()
+
+	for _, l := range links {
+		if l != nil && l.Link != nil {
+			_ = l.Link.Close()
+		}
+	}
 
 	grace := parseYAMLDuration(y.cfg.Topology.StopGrace, 2*time.Second)
 	for _, n := range nodes {
@@ -860,6 +1147,11 @@ func (y *YAMLAdapter) CheckNamed(at AdapterTrial, killed bool, phase string) Che
 				Verdict:  "UNKNOWN",
 				Evidence: 1,
 				Problems: []error{fmt.Errorf("topology: a node was not ready in time")},
+			}
+		}
+		if y.cfg.Fault.Isolate != "" {
+			if cr := y.checkIsolate(rt); cr.Verdict != "" {
+				return cr
 			}
 		}
 	}

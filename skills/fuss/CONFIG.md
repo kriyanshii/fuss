@@ -11,10 +11,11 @@ purpose they do not have: `workload.until` and `kill.signal`.
 
 ## Template variables
 
-`expandTemplates` replaces these eleven names, once, in this order: `run_id`,
+`expandTemplates` replaces these twelve names, once, in this order: `run_id`,
 `binary`, `home`, `addr`, `seed`, `dir`, `key`, `n`, `i`, `port`,
-`data_dir`. Text inserted for an earlier name is still scanned for a later
-name. Any other `${...}` is left as written.
+`data_dir`, `peers`. Then any `${peer_addr_<j>}` present in `vars`. Text
+inserted for an earlier name is still scanned for a later name. Any other
+`${...}` is left as written.
 
 | Variable | Value in `vars` | When it is set |
 |---|---|---|
@@ -29,6 +30,8 @@ name. Any other `${...}` is left as written.
 | `${i}` | node index as decimal | While expanding topology fields for one node (`0` .. `nodes-1`). Empty on every other expansion. |
 | `${port}` | that node's listen port | Same topology expansion. From `topology.ports.base`, or a free port when that base is `0`. |
 | `${data_dir}` | that node's data directory | Same topology expansion. The expanded `topology.data_dir`. |
+| `${peer_addr_<j>}` | proxy listen addr to node `j` | Topology expansion when `topology.peers.via_proxy` is true. Empty for `j == i`. |
+| `${peers}` | comma-joined peer proxy addrs | Same; every `${peer_addr_<j>}` for `j != i`. |
 
 These strings are expanded: `data_dir`, `args`, `restart.args`, `env` values,
 `steps[].command`, `topology.data_dir`, `topology.start`,
@@ -299,6 +302,31 @@ Example: `timeout: 2s`
 
 **`topology.stop_grace`** (duration, default: `2s`). After `SIGTERM`, wait
 this long before `SIGKILL`. Example: `stop_grace: 500ms`
+
+**`topology.peers.port_name`** (string, default: empty). Names which per-node
+port is the peer port. With the single topology `${port}`, that port is the
+peer port; client ports stay direct. Example: `port_name: raft`
+
+**`topology.peers.via_proxy`** (bool, default: `false`). When true, for every
+ordered pair of nodes `(i, j)` with `i != j`, Fuss starts a `proxy.Link` that
+listens locally and forwards to node `j`'s real peer port. Node `i`'s start
+template gets `${peer_addr_j}` and `${peers}` pointing at those proxies so
+peer traffic goes through Fuss. Example: `via_proxy: true`
+
+## `fault`
+
+Live fault while topology nodes keep running. Empty `isolate` disables it.
+
+**`fault.isolate`** (string, default: empty). `node_<index>` cuts every proxy
+link into and out of that node and leaves the process running. Example:
+`isolate: node_0`
+
+**`fault.after.file`** (object, same fields as `kill.file`). Trigger for the
+isolate. When the trigger never fires, or after `Cut` no link reports
+`closed_by_cut` or `refused_while_cut` growth, the check verdict is
+`UNKNOWN` (never `PASS`). Trial JSON `evidence.isolate` records
+`trigger_fired`, `cut_time`, and per-link `stats_before` / `stats_after`.
+Example: `after: { file: { glob: "${dir}/cut_now", contains: NOW, poll: 10ms, timeout: 5s } }`
 
 ## `check`
 

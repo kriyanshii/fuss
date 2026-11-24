@@ -1,0 +1,23 @@
+name: topology
+binary:
+  default: hold
+  extra: ["./testdata/yaml/topology/hold"]
+topology:
+  nodes: 3
+  data_dir: "${dir}/node${i}"
+  ports:
+    base: 0
+  start: ["${binary}", "${data_dir}"]
+  ready:
+    file: "${data_dir}/ready"
+    contains: READY
+    timeout: 2s
+  stop_grace: 500ms
+check:
+  file_count:
+    glob: "${dir}/node*/ready"
+    as: ready_files
+  rules:
+    - if: { ready_files_eq: 3 }
+      verdict: PASS
+    - else: FAIL

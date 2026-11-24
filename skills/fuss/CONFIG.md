@@ -11,10 +11,10 @@ purpose they do not have: `workload.until` and `kill.signal`.
 
 ## Template variables
 
-`expandTemplates` replaces these eight names, once, in this order: `run_id`,
-`binary`, `home`, `addr`, `seed`, `dir`, `key`, `n`. Text inserted for an
-earlier name is still scanned for a later name. Any other `${...}` is left
-as written.
+`expandTemplates` replaces these eleven names, once, in this order: `run_id`,
+`binary`, `home`, `addr`, `seed`, `dir`, `key`, `n`, `i`, `port`,
+`data_dir`. Text inserted for an earlier name is still scanned for a later
+name. Any other `${...}` is left as written.
 
 | Variable | Value in `vars` | When it is set |
 |---|---|---|
@@ -26,9 +26,14 @@ as written.
 | `${binary}` | `t.BinaryPath()` | Every expansion after `Init`. The resolved binary path. |
 | `${n}` | the string passed into `vars` | The workload request index (`0`, `1`, `2`, ...) while expanding `workload.http` url and body, `workload.ack.key`, and `workload.ack.record`. Empty on every other expansion. |
 | `${key}` | see below | During the workload, the expanded `workload.ack.key`, or `<seed>-<n>` when that field is empty and `${n}` is non-empty. During an ack check, each key parsed from an `ack ` line. Otherwise empty. |
+| `${i}` | node index as decimal | While expanding topology fields for one node (`0` .. `nodes-1`). Empty on every other expansion. |
+| `${port}` | that node's listen port | Same topology expansion. From `topology.ports.base`, or a free port when that base is `0`. |
+| `${data_dir}` | that node's data directory | Same topology expansion. The expanded `topology.data_dir`. |
 
 These strings are expanded: `data_dir`, `args`, `restart.args`, `env` values,
-`steps[].command`, `health.http.url`, `restart.health.http.url`,
+`steps[].command`, `topology.data_dir`, `topology.start`,
+`topology.ready.file`, `topology.ready.contains`, `topology.ready.command`,
+`health.http.url`, `restart.health.http.url`,
 `workload.http.url`, `workload.http.body`, `workload.ack.key`,
 `workload.ack.record`, `kill.file.glob`, `kill.file.contains`, the same two
 fields on a step's `kill.file`, `check.file_count.glob`,
@@ -246,6 +251,54 @@ top-level `kill.file`. `signal` and `delay` on a step are accepted and not
 read. A step `at` other than `file` is not read. The top-level `kill.at` is
 still the one `LoadYAMLTarget` checks, and it is the fallback when no step
 stored a file spec. Example: `kill: { at: file, file: { glob: "${dir}/seq.txt", contains: B, poll: 5ms, timeout: 5s } }`
+
+## `topology`
+
+When `topology.nodes` is greater than zero, `Start` launches that many peer
+processes at the same time instead of `binary` plus `args`, and instead of
+`steps`. Each node is its own process with its own data directory and port.
+They stay up for the trial. `Start` also returns a `sleep` holder process so
+the usual kill path still has one command to wait on. Configs with
+`topology.nodes` unset or `0` behave as before.
+
+If any node is not ready within `topology.ready.timeout`, the check verdict
+is `UNKNOWN` (never `PASS`). At the end of `CheckNamed`, every node gets
+`SIGTERM`, then `SIGKILL` after `topology.stop_grace`. Trial JSON evidence
+includes `topology`: each node's `i`, `pid`, `port`, `data_dir`,
+`start_time`, `ready`, `stop`, and `exit_status`.
+
+**`topology.nodes`** (int, default: `0`). Count of peer processes. `0` or
+absent disables topology. Example: `nodes: 3`
+
+**`topology.data_dir`** (string, default: `${dir}/node${i}`). Expanded per
+node and created before start. Example: `data_dir: "${dir}/node${i}"`
+
+**`topology.ports.base`** (int, default: `0`). When `0`, each node gets a
+free `127.0.0.1` port. When greater than zero, node `i` uses `base + i`.
+Example: `ports: { base: 0 }`
+
+**`topology.start`** (list of strings, required when `nodes > 0`). Command
+for each node. The first element is the executable. Expanded with `${i}`,
+`${data_dir}`, `${port}`, and the usual variables. Example:
+`start: ["${binary}", "${data_dir}"]`
+
+**`topology.ready.file`** (string, default: empty). Expanded path that must
+exist (and match `contains` when that is set) for the node to be ready.
+Example: `file: "${data_dir}/ready"`
+
+**`topology.ready.contains`** (string, default: empty). Substring required
+in the ready file, or in ready-command stdout when `file` is empty.
+Example: `contains: READY`
+
+**`topology.ready.command`** (list of strings, default: empty). Used when
+`file` is empty. Combined output must be non-empty, or contain `contains`
+when that is set. Example: `command: ["/bin/cat", "${data_dir}/ready"]`
+
+**`topology.ready.timeout`** (duration, default: `5s`). Per-node ready wait.
+Example: `timeout: 2s`
+
+**`topology.stop_grace`** (duration, default: `2s`). After `SIGTERM`, wait
+this long before `SIGKILL`. Example: `stop_grace: 500ms`
 
 ## `check`
 

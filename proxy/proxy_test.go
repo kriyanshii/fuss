@@ -3,6 +3,7 @@ package proxy_test
 import (
 	"io"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
@@ -166,4 +167,104 @@ func TestRefuseWhileCutThenHeal(t *testing.T) {
 	}
 
 	echoRoundTrip(t, link.Addr().String(), []byte("after-heal"))
+}
+
+func TestCutWhereKeepsOtherTag(t *testing.T) {
+	up, closeUp := startEcho(t)
+	defer closeUp()
+	link := startLink(t, up)
+
+	var mu sync.Mutex
+	owners := map[string]int{}
+	link.SetTagger(func(a net.Addr) (int, bool) {
+		if a == nil {
+			return 0, false
+		}
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			mu.Lock()
+			tag, ok := owners[a.String()]
+			mu.Unlock()
+			if ok {
+				if tag < 0 {
+					return 0, false
+				}
+				return tag, true
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		return 0, false
+	})
+
+	dialTagged := func(tag int) net.Conn {
+		t.Helper()
+		c, err := net.DialTimeout("tcp", link.Addr().String(), time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		mu.Lock()
+		owners[c.LocalAddr().String()] = tag
+		mu.Unlock()
+		return c
+	}
+	waitOpen := func(n int) {
+		t.Helper()
+		deadline := time.Now().Add(2 * time.Second)
+		for link.Stats().Open < n {
+			if time.Now().After(deadline) {
+				t.Fatalf("open=%d want >= %d", link.Stats().Open, n)
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+
+	c0 := dialTagged(0)
+	defer c0.Close()
+	c1 := dialTagged(1)
+	defer c1.Close()
+	unknown := dialTagged(-1)
+	defer unknown.Close()
+	waitOpen(3)
+
+	link.CutWhere(func(tag int, known bool) bool { return known && tag == 0 })
+
+	buf := make([]byte, 1)
+	_ = c0.SetReadDeadline(time.Now().Add(time.Second))
+	if _, err := c0.Read(buf); err == nil {
+		t.Fatal("tag 0 connection still open after CutWhere")
+	}
+	if _, err := c1.Write([]byte("ping")); err != nil {
+		t.Fatalf("kept tag write: %v", err)
+	}
+	got := make([]byte, 4)
+	_ = c1.SetDeadline(time.Now().Add(time.Second))
+	if _, err := io.ReadFull(c1, got); err != nil {
+		t.Fatalf("kept tag read: %v", err)
+	}
+	if _, err := unknown.Write([]byte("ping")); err != nil {
+		t.Fatalf("unknown write: %v", err)
+	}
+	if _, err := io.ReadFull(unknown, got); err != nil {
+		t.Fatalf("unknown read: %v", err)
+	}
+
+	refused := dialTagged(0)
+	defer refused.Close()
+	_ = refused.SetReadDeadline(time.Now().Add(time.Second))
+	if _, err := refused.Read(buf); err == nil {
+		t.Fatal("new tag 0 connection was not refused")
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		s0 := link.TagStats(0)
+		s1 := link.TagStats(1)
+		if s0.ClosedByCut >= 1 && s0.RefusedWhileCut >= 1 && s1.ClosedByCut == 0 && s1.RefusedWhileCut == 0 && s1.Accepted >= 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("tag stats tag0=%+v tag1=%+v", s0, s1)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 }

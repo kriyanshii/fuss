@@ -30,7 +30,10 @@ type Link struct {
 	mu     sync.Mutex
 	cut    bool
 	closed bool
-	conns  map[net.Conn]struct{} // client-side connections only
+	conns  map[net.Conn]connMeta // client-side connections only
+	tagger func(net.Addr) (tag int, known bool)
+	// refuse reports connections to reject after a partial cut. Nil refuses none.
+	refuse func(tag int, known bool) bool
 
 	accepted        atomic.Int64
 	closedByCut     atomic.Int64
@@ -38,7 +41,24 @@ type Link struct {
 	lastCut         atomic.Value // time.Time
 	lastHeal        atomic.Value // time.Time
 
+	srcMu sync.Mutex
+	byTag map[int]*tagStats // per source tag; unknown owners are not entered
+
 	wg sync.WaitGroup
+}
+
+// connMeta is the label on one accepted client connection.
+type connMeta struct {
+	tag   int
+	known bool
+}
+
+// tagStats counts one source tag. A shared inbound proxy has one Link and
+// several tags; evidence for a kept source must not reuse another tag's totals.
+type tagStats struct {
+	accepted        atomic.Int64
+	closedByCut     atomic.Int64
+	refusedWhileCut atomic.Int64
 }
 
 // New prepares a Link. Call Start to begin accepting.
@@ -52,7 +72,7 @@ func New(listen, upstream string) (*Link, error) {
 	l := &Link{
 		listen:   listen,
 		upstream: upstream,
-		conns:    make(map[net.Conn]struct{}),
+		conns:    make(map[net.Conn]connMeta),
 	}
 	l.lastCut.Store(time.Time{})
 	l.lastHeal.Store(time.Time{})
@@ -117,23 +137,112 @@ func (l *Link) Cut() {
 	l.mu.Lock()
 	l.cut = true
 	l.lastCut.Store(time.Now())
-	conns := takeConns(l)
+	conns, tags := takeAll(l)
 	l.mu.Unlock()
 
-	if n := int64(len(conns)); n > 0 {
-		l.closedByCut.Add(n)
-	}
+	l.noteClosed(len(conns), tags)
 	for _, c := range conns {
 		_ = c.Close()
 	}
 }
 
-// Heal resumes accepting and forwarding after a Cut.
+// Heal resumes accepting and forwarding after a Cut or CutWhere.
 func (l *Link) Heal() {
 	l.mu.Lock()
 	l.cut = false
+	l.refuse = nil
 	l.lastHeal.Store(time.Now())
 	l.mu.Unlock()
+}
+
+// SetTagger labels each accepted connection before it is forwarded.
+// known is false when the owner cannot be determined; the connection is still kept.
+// A nil tagger leaves connections unlabeled.
+func (l *Link) SetTagger(fn func(remote net.Addr) (tag int, known bool)) {
+	l.mu.Lock()
+	l.tagger = fn
+	l.mu.Unlock()
+}
+
+// CutWhere closes open connections for which match is true and refuses later
+// accepts that match. Connections that do not match stay open.
+func (l *Link) CutWhere(match func(tag int, known bool) bool) {
+	if match == nil {
+		return
+	}
+	l.mu.Lock()
+	var closeNow []net.Conn
+	var closedTags []int
+	for c, info := range l.conns {
+		if match(info.tag, info.known) {
+			closeNow = append(closeNow, c)
+			delete(l.conns, c)
+			if info.known {
+				closedTags = append(closedTags, info.tag)
+			}
+		}
+	}
+	prev := l.refuse
+	l.refuse = func(tag int, known bool) bool {
+		if prev != nil && prev(tag, known) {
+			return true
+		}
+		return match(tag, known)
+	}
+	l.lastCut.Store(time.Now())
+	l.mu.Unlock()
+
+	l.noteClosed(len(closeNow), closedTags)
+	for _, c := range closeNow {
+		_ = c.Close()
+	}
+}
+
+// TagStats is the counters for one source tag. Unknown owners are omitted.
+func (l *Link) TagStats(tag int) Stats {
+	l.srcMu.Lock()
+	b := l.byTag[tag]
+	var st Stats
+	if b != nil {
+		st.Accepted = b.accepted.Load()
+		st.ClosedByCut = b.closedByCut.Load()
+		st.RefusedWhileCut = b.refusedWhileCut.Load()
+	}
+	l.srcMu.Unlock()
+	l.mu.Lock()
+	for _, info := range l.conns {
+		if info.known && info.tag == tag {
+			st.Open++
+		}
+	}
+	l.mu.Unlock()
+	return st
+}
+
+// AllTagStats snapshots every source tag. Open is the connections still tracked.
+func (l *Link) AllTagStats() map[int]Stats {
+	l.mu.Lock()
+	open := map[int]int{}
+	for _, info := range l.conns {
+		if info.known {
+			open[info.tag]++
+		}
+	}
+	l.mu.Unlock()
+
+	l.srcMu.Lock()
+	defer l.srcMu.Unlock()
+	out := make(map[int]Stats, len(l.byTag))
+	for tag, b := range l.byTag {
+		st := Stats{
+			Accepted:        b.accepted.Load(),
+			ClosedByCut:     b.closedByCut.Load(),
+			RefusedWhileCut: b.refusedWhileCut.Load(),
+			Open:            open[tag],
+		}
+		out[tag] = st
+	}
+	return out
 }
 
 // Stats returns a snapshot of counters.
@@ -153,13 +262,64 @@ func (l *Link) Stats() Stats {
 	}
 }
 
+// noteTagged counts one attributed connection. Refused dials also count as accepted,
+// matching the listener-level accepted counter.
+func (l *Link) noteTagged(tag int, known, refused bool) {
+	if !known {
+		return
+	}
+	b := l.tagBucket(tag)
+	b.accepted.Add(1)
+	if refused {
+		b.refusedWhileCut.Add(1)
+	}
+}
+
+func (l *Link) noteClosed(n int, tags []int) {
+	if n > 0 {
+		l.closedByCut.Add(int64(n))
+	}
+	for _, tag := range tags {
+		l.tagBucket(tag).closedByCut.Add(1)
+	}
+}
+
+func (l *Link) tagBucket(tag int) *tagStats {
+	l.srcMu.Lock()
+	defer l.srcMu.Unlock()
+	if l.byTag == nil {
+		l.byTag = make(map[int]*tagStats)
+	}
+	b := l.byTag[tag]
+	if b == nil {
+		b = &tagStats{}
+		l.byTag[tag] = b
+	}
+	return b
+}
+
+// takeAll drains the client connection set and the known source tags in it.
+// Caller must hold l.mu. ClosedByCut is not updated here.
+func takeAll(l *Link) ([]net.Conn, []int) {
+	conns := make([]net.Conn, 0, len(l.conns))
+	var tags []int
+	for c, info := range l.conns {
+		conns = append(conns, c)
+		if info.known {
+			tags = append(tags, info.tag)
+		}
+	}
+	l.conns = make(map[net.Conn]connMeta)
+	return conns, tags
+}
+
 // takeConns drains the client connection set. Caller must hold l.mu.
 func takeConns(l *Link) []net.Conn {
 	conns := make([]net.Conn, 0, len(l.conns))
 	for c := range l.conns {
 		conns = append(conns, c)
 	}
-	l.conns = make(map[net.Conn]struct{})
+	l.conns = make(map[net.Conn]connMeta)
 	return conns
 }
 
@@ -183,24 +343,48 @@ func (l *Link) acceptLoop() {
 			continue
 		}
 		l.accepted.Add(1)
-
-		l.mu.Lock()
-		if l.cut || l.closed {
-			l.mu.Unlock()
-			l.refusedWhileCut.Add(1)
-			_ = c.Close()
-			continue
-		}
-		l.conns[c] = struct{}{}
-		l.mu.Unlock()
-
 		l.wg.Add(1)
-		go l.handle(c)
+		go l.admit(c)
 	}
 }
 
-func (l *Link) handle(client net.Conn) {
+func (l *Link) admit(c net.Conn) {
 	defer l.wg.Done()
+
+	l.mu.Lock()
+	if l.closed {
+		l.mu.Unlock()
+		_ = c.Close()
+		return
+	}
+	// Tag even on a full cut so a refused dial is counted for its source.
+	// Unknown owners stay out of the per-source counters.
+	tagger := l.tagger
+	l.mu.Unlock()
+
+	meta := connMeta{}
+	if tagger != nil {
+		tag, known := tagger(c.RemoteAddr())
+		meta = connMeta{tag: tag, known: known}
+	}
+
+	l.mu.Lock()
+	refuse := l.closed || l.cut || (l.refuse != nil && l.refuse(meta.tag, meta.known))
+	if refuse {
+		l.mu.Unlock()
+		l.noteTagged(meta.tag, meta.known, true)
+		l.refusedWhileCut.Add(1)
+		_ = c.Close()
+		return
+	}
+	l.noteTagged(meta.tag, meta.known, false)
+	l.conns[c] = meta
+	l.mu.Unlock()
+
+	l.handle(c)
+}
+
+func (l *Link) handle(client net.Conn) {
 	defer l.removeConn(client)
 	defer client.Close()
 
@@ -210,9 +394,10 @@ func (l *Link) handle(client net.Conn) {
 	}
 	defer up.Close()
 
-	// If Cut landed while dialing, drop without forwarding.
+	// If Cut or CutWhere landed while dialing, drop without forwarding.
 	l.mu.Lock()
-	drop := l.cut || l.closed
+	_, tracked := l.conns[client]
+	drop := l.cut || l.closed || !tracked
 	l.mu.Unlock()
 	if drop {
 		return

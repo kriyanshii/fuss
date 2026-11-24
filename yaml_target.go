@@ -22,23 +22,23 @@ import (
 )
 
 type yamlTarget struct {
-	Name      string                 `yaml:"name"`
-	Binary    yamlBinary             `yaml:"binary"`
-	Args      []string               `yaml:"args"`
-	Env       map[string]string      `yaml:"env"`
-	DataDir   string                 `yaml:"data_dir"`
-	PortBase  int                    `yaml:"port_base"`
-	PortMod   int                    `yaml:"port_mod"`
-	Start     yamlStart              `yaml:"start"`
-	Health    yamlHealth             `yaml:"health"`
-	Workload  yamlWorkload           `yaml:"workload"`
-	Kill      yamlKill               `yaml:"kill"`
-	Restart   yamlRestart            `yaml:"restart"`
-	Steps     []yamlStep             `yaml:"steps"`
-	Topology  yamlTopology           `yaml:"topology"`
-	Fault     yamlFault              `yaml:"fault"`
-	Check     yamlCheck              `yaml:"check"`
-	Controls  map[string]yamlControl `yaml:"controls"`
+	Name     string                 `yaml:"name"`
+	Binary   yamlBinary             `yaml:"binary"`
+	Args     []string               `yaml:"args"`
+	Env      map[string]string      `yaml:"env"`
+	DataDir  string                 `yaml:"data_dir"`
+	PortBase int                    `yaml:"port_base"`
+	PortMod  int                    `yaml:"port_mod"`
+	Start    yamlStart              `yaml:"start"`
+	Health   yamlHealth             `yaml:"health"`
+	Workload yamlWorkload           `yaml:"workload"`
+	Kill     yamlKill               `yaml:"kill"`
+	Restart  yamlRestart            `yaml:"restart"`
+	Steps    []yamlStep             `yaml:"steps"`
+	Topology yamlTopology           `yaml:"topology"`
+	Fault    yamlFault              `yaml:"fault"`
+	Check    yamlCheck              `yaml:"check"`
+	Controls map[string]yamlControl `yaml:"controls"`
 }
 
 // yamlTopology starts N peer processes for one trial. Empty Nodes means no topology.
@@ -47,7 +47,7 @@ type yamlTopology struct {
 	DataDir   string        `yaml:"data_dir"`
 	Ports     yamlTopoPorts `yaml:"ports"`
 	Peers     yamlTopoPeers `yaml:"peers"`
-	ProxyMode string        `yaml:"proxy_mode"` // "per_pair" (default) or "per_node"
+	ProxyMode string        `yaml:"proxy_mode"` // "per_pair" (default), "per_node", or "per_node_owned"
 	Start     []string      `yaml:"start"`
 	Ready     yamlTopoReady `yaml:"ready"`
 	StopGrace string        `yaml:"stop_grace"`
@@ -310,12 +310,12 @@ func LoadYAMLTarget(path string) (*YAMLAdapter, error) {
 		mode = "per_pair"
 	}
 	switch mode {
-	case "per_pair", "per_node":
+	case "per_pair", "per_node", "per_node_owned":
 	default:
-		return nil, fmt.Errorf("target-config %s: topology.proxy_mode %q not supported (per_pair or per_node)", path, cfg.Topology.ProxyMode)
+		return nil, fmt.Errorf("target-config %s: topology.proxy_mode %q not supported (per_pair, per_node, or per_node_owned)", path, cfg.Topology.ProxyMode)
 	}
-	if mode == "per_node" && !cfg.Topology.Peers.ViaProxy {
-		return nil, fmt.Errorf("target-config %s: topology.proxy_mode per_node requires topology.peers.via_proxy", path)
+	if (mode == "per_node" || mode == "per_node_owned") && !cfg.Topology.Peers.ViaProxy {
+		return nil, fmt.Errorf("target-config %s: topology.proxy_mode %s requires topology.peers.via_proxy", path, mode)
 	}
 	cfg.Topology.ProxyMode = mode
 
@@ -603,8 +603,18 @@ type topologyLink struct {
 	Listen      string
 	StatsBefore proxy.Stats
 	StatsAfter  proxy.Stats
+	tagBefore   map[int]proxy.Stats // per source, snapshotted at cut
 	CutTime     time.Time
 	cut         bool
+	cutFrom     map[int]struct{} // per_node_owned: sources cut on this inbound proxy
+}
+
+// unknownOwner is a connection whose socket owner was not one of the topology PIDs.
+type unknownOwner struct {
+	To     int
+	Listen string
+	Remote string
+	Cut    bool
 }
 
 type isolateState struct {
@@ -629,6 +639,7 @@ type topologyRuntime struct {
 	ProxyMode string
 	Nodes     []*topologyNode
 	Links     []*topologyLink
+	Unknown   []unknownOwner
 	Isolate   *isolateState
 	Pause     *pauseState
 	AllReady  bool
@@ -684,6 +695,9 @@ func (rt *topologyRuntime) isolateEvidence() map[string]any {
 	if rt.Isolate == nil {
 		return nil
 	}
+	if rt.ProxyMode == "per_node_owned" {
+		return rt.ownedIsolateEvidence()
+	}
 	links := make([]map[string]any, 0, len(rt.Links))
 	cutN := 0
 	total := 0
@@ -734,6 +748,97 @@ func (rt *topologyRuntime) isolateEvidence() map[string]any {
 	return out
 }
 
+// ownedIsolateEvidence reports directed pairs, not the shared inbound proxies.
+// Caller holds rt.mu.
+func (rt *topologyRuntime) ownedIsolateEvidence() map[string]any {
+	n := len(rt.Nodes)
+	byTo := make(map[int]*topologyLink, len(rt.Links))
+	for _, l := range rt.Links {
+		if l == nil || l.Link == nil {
+			continue
+		}
+		byTo[l.To] = l
+	}
+	total := n * (n - 1)
+	if total < 0 {
+		total = 0
+	}
+	links := make([]map[string]any, 0, total)
+	cutN := 0
+	for from := 0; from < n; from++ {
+		for to := 0; to < n; to++ {
+			if from == to {
+				continue
+			}
+			phys := byTo[to]
+			cut := false
+			listen := ""
+			var before, after proxy.Stats
+			var cutTime time.Time
+			if phys != nil {
+				listen = phys.Listen
+				if phys.tagBefore != nil {
+					before = phys.tagBefore[from]
+				}
+				if phys.cut {
+					cut = true
+				}
+				if _, ok := phys.cutFrom[from]; ok {
+					cut = true
+				}
+				if phys.cut || len(phys.cutFrom) > 0 {
+					after = phys.Link.TagStats(from)
+				} else {
+					after = before
+				}
+				if cut {
+					cutTime = phys.CutTime
+					cutN++
+				}
+			}
+			m := map[string]any{
+				"from":         from,
+				"to":           to,
+				"listen":       listen,
+				"cut":          cut,
+				"stats_before": statsMap(before),
+				"stats_after":  statsMap(after),
+			}
+			if !cutTime.IsZero() {
+				m["cut_time"] = cutTime.UTC().Format(time.RFC3339Nano)
+			}
+			links = append(links, m)
+		}
+	}
+	dir := rt.Isolate.Direction
+	if dir == "" {
+		dir = "both"
+	}
+	unk := make([]map[string]any, 0, len(rt.Unknown))
+	for _, u := range rt.Unknown {
+		unk = append(unk, map[string]any{
+			"to":     u.To,
+			"listen": u.Listen,
+			"remote": u.Remote,
+			"cut":    u.Cut,
+		})
+	}
+	out := map[string]any{
+		"target":         rt.Isolate.Target,
+		"trigger_fired":  rt.Isolate.TriggerFired,
+		"proxy_mode":     "per_node_owned",
+		"direction":      dir,
+		"links_cut":      cutN,
+		"links_total":    total,
+		"links":          links,
+		"unknown_owners": unk,
+	}
+	if !rt.Isolate.CutTime.IsZero() {
+		out["cut_time"] = rt.Isolate.CutTime.UTC().Format(time.RFC3339Nano)
+	}
+	return out
+}
+
 func (rt *topologyRuntime) pauseEvidence() map[string]any {
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
@@ -756,7 +861,7 @@ func (rt *topologyRuntime) cutObserved() bool {
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
 	for _, l := range rt.Links {
-		if l == nil || !l.cut || l.Link == nil {
+		if l == nil || l.Link == nil || (!l.cut && len(l.cutFrom) == 0) {
 			continue
 		}
 		st := l.Link.Stats()
@@ -804,7 +909,7 @@ func (y *YAMLAdapter) startTopology(t *BaseTrial, log *os.File) (*exec.Cmd, erro
 			peerAddrs[i] = make([]string, n)
 		}
 		switch topo.ProxyMode {
-		case "per_node":
+		case "per_node", "per_node_owned":
 			nodeProxies = make([]string, n)
 			for j := 0; j < n; j++ {
 				upstream := "127.0.0.1:" + strconv.Itoa(ports[j])
@@ -922,6 +1027,14 @@ func (y *YAMLAdapter) startTopology(t *BaseTrial, log *os.File) (*exec.Cmd, erro
 		if err != nil {
 			y.stopTopology(rt)
 			return nil, err
+		}
+	}
+	if topo.ProxyMode == "per_node_owned" {
+		for _, l := range rt.Links {
+			if l == nil || l.Link == nil {
+				continue
+			}
+			l.Link.SetTagger(y.ownedTagger(rt, l.To, l.Listen))
 		}
 	}
 
@@ -1101,34 +1214,128 @@ func (y *YAMLAdapter) cutIsolate(rt *topologyRuntime, nodeIdx int, direction str
 		rt.Isolate.CutTime = cutAt
 		rt.Isolate.Direction = direction
 	}
-	var toCut []*topologyLink
+	mode := rt.ProxyMode
+	type cutOp struct {
+		link    *topologyLink
+		partial bool // cut one source on a shared inbound proxy
+	}
+	var ops []cutOp
 	for _, l := range rt.Links {
 		if l == nil || l.Link == nil {
 			continue
 		}
-		switch direction {
-		case "inbound":
+		switch {
+		case direction == "inbound" && l.To == nodeIdx:
+			ops = append(ops, cutOp{link: l})
+		case direction != "inbound" && mode == "per_node_owned" && l.From < 0:
 			if l.To == nodeIdx {
-				toCut = append(toCut, l)
+				ops = append(ops, cutOp{link: l})
+			} else {
+				ops = append(ops, cutOp{link: l, partial: true})
 			}
-		default: // both
-			if l.From == nodeIdx || l.To == nodeIdx {
-				toCut = append(toCut, l)
-			}
+		case direction != "inbound" && (l.From == nodeIdx || l.To == nodeIdx):
+			ops = append(ops, cutOp{link: l})
 		}
 	}
 	rt.mu.Unlock()
 
-	for _, l := range toCut {
+	for _, op := range ops {
+		l := op.link
 		before := l.Link.Stats()
-		l.Link.Cut()
+		tagBefore := l.Link.AllTagStats()
+		if op.partial {
+			src := nodeIdx
+			l.Link.CutWhere(func(tag int, known bool) bool {
+				return known && tag == src
+			})
+		} else {
+			l.Link.Cut()
+		}
 		rt.mu.Lock()
 		l.StatsBefore = before
+		l.tagBefore = tagBefore
 		l.CutTime = cutAt
-		l.cut = true
 		l.StatsAfter = l.Link.Stats()
+		if op.partial {
+			if l.cutFrom == nil {
+				l.cutFrom = map[int]struct{}{}
+			}
+			l.cutFrom[nodeIdx] = struct{}{}
+		} else {
+			l.cut = true
+			for i := range rt.Unknown {
+				if rt.Unknown[i].Listen == l.Listen {
+					rt.Unknown[i].Cut = true
+				}
+			}
+		}
 		rt.mu.Unlock()
 	}
+}
+
+// ownedTagger maps an accepted client socket to the topology node that owns it.
+func (y *YAMLAdapter) ownedTagger(rt *topologyRuntime, to int, listen string) func(net.Addr) (int, bool) {
+	return func(remote net.Addr) (int, bool) {
+		if remote == nil {
+			rt.addUnknown(unknownOwner{To: to, Listen: listen})
+			return 0, false
+		}
+		for attempt := 0; attempt < 3; attempt++ {
+			pids, by := rt.nodePIDs()
+			if len(pids) == 0 {
+				return -1, true
+			}
+			pid, err := proxy.OwnerPID(remote, pids)
+			if err == nil {
+				if idx, ok := by[pid]; ok {
+					return idx, true
+				}
+			}
+			if attempt+1 < 3 {
+				time.Sleep(15 * time.Millisecond)
+			}
+		}
+		rt.addUnknown(unknownOwner{To: to, Listen: listen, Remote: remote.String()})
+		return 0, false
+	}
+}
+
+func (rt *topologyRuntime) nodePIDs() ([]int, map[int]int) {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	pids := make([]int, 0, len(rt.Nodes))
+	by := make(map[int]int, len(rt.Nodes))
+	for _, n := range rt.Nodes {
+		if n == nil || n.PID <= 0 {
+			continue
+		}
+		pids = append(pids, n.PID)
+		by[n.PID] = n.Index
+	}
+	return pids, by
+}
+
+func (rt *topologyRuntime) addUnknown(u unknownOwner) {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	for _, l := range rt.Links {
+		if l != nil && l.Listen == u.Listen && l.cut {
+			u.Cut = true
+			break
+		}
+	}
+	rt.Unknown = append(rt.Unknown, u)
+}
+
+func (rt *topologyRuntime) unknownOnCutLink() bool {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	for _, u := range rt.Unknown {
+		if u.Cut {
+			return true
+		}
+	}
+	return false
 }
 
 // checkIsolate returns a non-empty Verdict when the isolate fault cannot be proven.
@@ -1162,6 +1369,13 @@ func (y *YAMLAdapter) checkIsolate(rt *topologyRuntime) CheckResult {
 	obsDeadline := time.Now().Add(2 * time.Second)
 	for {
 		if rt.cutObserved() {
+			if rt.unknownOnCutLink() {
+				return CheckResult{
+					Verdict:  "UNKNOWN",
+					Evidence: 1,
+					Problems: []error{fmt.Errorf("fault.isolate: unknown owner on a cut link")},
+				}
+			}
 			return CheckResult{}
 		}
 		if time.Now().After(obsDeadline) {

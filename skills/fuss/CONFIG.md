@@ -319,10 +319,10 @@ shaped when `via_proxy` is true:
 
 - `per_pair` — one `proxy.Link` per ordered pair `(i, j)`. Node `i` dials a
   distinct listen addr to reach `j`. This is the historical default.
-- `per_node` — one inbound `proxy.Link` per node. Every peer dials the same
+- `per_node`: one inbound `proxy.Link` per node. Every peer dials the same
   listen addr to reach that node. Exposes `${node_proxy_addr_k}` and
   `${peers_via_proxy}`. Requires `via_proxy: true`.
-- `per_node_owned` — one inbound proxy per node, same addresses as `per_node`.
+- `per_node_owned`: one inbound proxy per node, same addresses as `per_node`.
   On accept, Fuss calls `OwnerPID` and tags the connection with the source
   node. A connection whose owner is not one of the topology PIDs is kept and
   recorded as an unknown owner. Requires `via_proxy: true`.
@@ -341,9 +341,9 @@ one node and leaves the process running.
 
 **`fault.isolate.direction`** (string, default: `both`). Which links to cut:
 
-- `both` — every link into or out of the node. Allowed for `per_pair` and
+- `both`: every link into or out of the node. Allowed for `per_pair` and
   `per_node_owned`.
-- `inbound` — only links whose destination is the node.
+- `inbound`: only links whose destination is the node.
 
 With `topology.proxy_mode: per_node`, only `inbound` is allowed. Load rejects
 `direction: both` because a shared inbound proxy cannot separate one node's

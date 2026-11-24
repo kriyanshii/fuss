@@ -409,7 +409,8 @@ func runDrive(dir string, n int, key, record, cut, gate, mode string) int {
 	}
 	_ = os.WriteFile(cut, []byte("NOW\n"), 0o644)
 	if mode == "bug" && gate != "" {
-		// Let isolate land, then release the held replication (too late).
+		// Correctness depends on the cut happening first (gate opens only after
+		// cut_now), not on this sleep; the sleep just gives isolate time to land.
 		time.Sleep(400 * time.Millisecond)
 		_ = os.WriteFile(gate, []byte("GO\n"), 0o644)
 	}

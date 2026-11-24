@@ -41,14 +41,6 @@ steps:
     timeout: 13s
   - name: complete
     command: ["${binary}", "human-task", "complete", "--run-id=${run_id}", "--step=h", "${name}"]
-    kill:
-      at: file
-      file:
-        glob: "${home}/data/dag-runs/${name}/dag-runs/*/*/*/dag-run_*_${run_id}/*/status.jsonl"
-        contains: queuedAt
-        poll: 1ms
-        offset_ms: 0
-        timeout: 13s
   - name: complete-again
     delay: 35s
     command: ["${binary}", "human-task", "complete", "--run-id=${run_id}", "--step=h", "${name}"]
@@ -68,10 +60,11 @@ check:
     contains: "start after ${run_id}"
     as: starts
   command:
+    # Live trials: status for this run_id. Controls may plant ${home}/status.txt.
     command:
       - /bin/sh
       - -c
-      - ${binary} status --run-id=${run_id} ${name} || ${binary} status --run-id=r1 ${name} || cat ${home}/status.txt
+      - ${binary} status --run-id=${run_id} ${name} || cat ${home}/status.txt
     as: status
     contains: Queued
   rules:

@@ -347,6 +347,14 @@ func LoadYAMLTarget(path string) (*YAMLAdapter, error) {
 	if cfg.Fault.Pause.active() && cfg.Fault.Pause.Node == "" {
 		return nil, fmt.Errorf("target-config %s: fault.pause.node is required", path)
 	}
+	for _, st := range cfg.Steps {
+		if strings.TrimSpace(st.Delay) == "" {
+			continue
+		}
+		if _, err := time.ParseDuration(st.Delay); err != nil {
+			return nil, fmt.Errorf("target-config %s: steps[%q].delay %q: %w", path, st.Name, st.Delay, err)
+		}
+	}
 	return &YAMLAdapter{path: path, cfg: cfg}, nil
 }
 
@@ -521,7 +529,8 @@ func (y *YAMLAdapter) startSteps(t *BaseTrial, log *os.File) (*exec.Cmd, error) 
 			break
 		}
 		if st.Delay != "" {
-			time.Sleep(parseYAMLDuration(st.Delay, 0))
+			// Validated non-empty at load; zero only if empty (skipped above).
+			time.Sleep(mustYAMLDuration(st.Delay))
 		}
 		args := y.expandSlice(st.Command, vars)
 		if len(args) == 0 {
@@ -1638,6 +1647,15 @@ func parseYAMLDuration(s string, def time.Duration) time.Duration {
 	return d
 }
 
+// mustYAMLDuration parses a duration that LoadYAMLTarget already validated.
+func mustYAMLDuration(s string) time.Duration {
+	d, err := time.ParseDuration(s)
+	if err != nil {
+		return 0
+	}
+	return d
+}
+
 func (y *YAMLAdapter) Status(at AdapterTrial) (AdapterStatus, error) {
 	t, ok := at.(*BaseTrial)
 	if !ok {
@@ -1738,7 +1756,7 @@ func (y *YAMLAdapter) runAfterSteps(t *BaseTrial, steps []yamlStep) error {
 	defer log.Close()
 	for _, st := range steps {
 		if st.Delay != "" {
-			time.Sleep(parseYAMLDuration(st.Delay, 0))
+			time.Sleep(mustYAMLDuration(st.Delay))
 		}
 		args := y.expandSlice(st.Command, vars)
 		if len(args) == 0 {

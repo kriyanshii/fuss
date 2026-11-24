@@ -237,8 +237,9 @@ unless `delay` is set (a pure wait). Example:
 `command: ["/bin/sh", "-c", "echo A >> ${dir}/seq.txt"]`
 
 **`steps[].delay`** (duration, default: empty). Sleep this long before the
-step's command (or alone, when `command` is empty). Unparseable values sleep
-zero. Example: `delay: 35s`
+step's command (or alone, when `command` is empty). A non-empty value that
+`time.ParseDuration` rejects is a load error (so `35` without a unit does not
+silently become no wait). Example: `delay: 35s`
 
 **`steps[].wait_exit`** (bool, default: `false`). On the way to the live
 step, `true` waits for the command to finish. Example: `wait_exit: true`
@@ -431,10 +432,12 @@ non-empty, only files whose contents contain this substring are counted.
 Directories and unreadable paths are skipped. Example: `contains: "READY"`
 
 **`check.file_count.json_field`** (string, default: empty). When non-empty,
-each globbed file is parsed as JSON. A dotted path (`dagRun.id`) walks object
-keys in order. A bare name searches nested objects and arrays for a key of
-that name. The file counts if the matched value equals `equals`. The filename
-is not consulted. Invalid JSON does not count. Example: `json_field: dagRun.id`
+each globbed file is parsed as JSON. Prefer a dotted path (`dagRun.id`), which
+walks object keys in order. A bare name (no dots) matches a key of that name
+at any depth in nested objects and arrays, so it can hit the wrong field if
+the document has more than one; use a path when the shape is nested. The file
+counts if the matched value equals `equals`. The filename is not consulted.
+Invalid JSON does not count. Example: `json_field: dagRun.id`
 
 **`check.file_count.equals`** (string, default: empty). Expanded. The value
 `json_field` is compared to, using `fmt.Sprint` of the JSON value.

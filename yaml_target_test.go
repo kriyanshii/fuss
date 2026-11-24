@@ -245,6 +245,28 @@ func TestExpandTemplatesName(t *testing.T) {
 	}
 }
 
+func TestLoadYAMLStepDelayReject(t *testing.T) {
+	dir := t.TempDir()
+	cfg := filepath.Join(dir, "bad-delay.yaml")
+	body := `
+name: bad-delay
+binary:
+  default: true
+  extra: ["/bin/true"]
+steps:
+  - name: wait
+    delay: "35"
+  - name: live
+    command: ["/bin/true"]
+`
+	if err := os.WriteFile(cfg, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadYAMLTarget(cfg); err == nil {
+		t.Fatal("expected load error for delay without unit")
+	}
+}
+
 func TestYAMLStepDelay(t *testing.T) {
 	dir := t.TempDir()
 	cfg := filepath.Join(dir, "delay.yaml")

@@ -357,6 +357,13 @@ func (n *node) gateLoop() {
 }
 
 func runDrive(dir string, n int, key, record, cut, gate, mode string) int {
+	// Always release the trial. A stuck dial must not hold the kill file
+	// until Fuss treats the run as a broken setup.
+	defer func() {
+		_ = os.WriteFile(filepath.Join(dir, "drive_done"), []byte("DONE\n"), 0o644)
+	}()
+	poll := &http.Client{Timeout: 300 * time.Millisecond}
+	put := &http.Client{Timeout: 3 * time.Second}
 	// Wait for every node's client addr file.
 	clients := make([]string, n)
 	deadline := time.Now().Add(5 * time.Second)
@@ -384,7 +391,7 @@ func runDrive(dir string, n int, key, record, cut, gate, mode string) int {
 	// Wait until node 0 is leader and accepting.
 	deadline = time.Now().Add(3 * time.Second)
 	for {
-		resp, err := http.Get("http://" + clients[0] + "/leader")
+		resp, err := poll.Get("http://" + clients[0] + "/leader")
 		if err == nil {
 			b, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
@@ -400,7 +407,7 @@ func runDrive(dir string, n int, key, record, cut, gate, mode string) int {
 	}
 
 	req, _ := http.NewRequest(http.MethodPut, "http://"+clients[0]+"/k/"+key, strings.NewReader("v"))
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := put.Do(req)
 	if err != nil || resp.StatusCode != 200 {
 		if resp != nil {
 			resp.Body.Close()
@@ -420,13 +427,11 @@ func runDrive(dir string, n int, key, record, cut, gate, mode string) int {
 	// Bug mode must not release replication until Fuss has applied the cut.
 	// The applied file is that evidence; a sleep is not.
 	if err := waitIsolateApplied(dir, "node_0", 8*time.Second); err != nil {
-		_ = os.WriteFile(filepath.Join(dir, "drive_done"), []byte("DONE\n"), 0o644)
 		return 0
 	}
 	if mode == "bug" && gate != "" {
 		_ = os.WriteFile(gate, []byte("GO\n"), 0o644)
 	}
-	_ = os.WriteFile(filepath.Join(dir, "drive_done"), []byte("DONE\n"), 0o644)
 	return 0
 }
 

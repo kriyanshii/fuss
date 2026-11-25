@@ -20,7 +20,7 @@ go build -o fuss .
 | Read level | **Linearizable** (etcdctl default). Do not pass `--consistency=s`. Serializable reads may be stale. | [API guarantees (v3.7)](https://etcd.io/docs/v3.7/learning/api_guarantees/) · [etcdctl README @ v3.7.4](https://github.com/etcd-io/etcd/blob/v3.7.4/etcdctl/README.md) |
 | Election defaults | Heartbeat interval **100ms** (`TickMs`), election timeout **1000ms** (`ElectionMs`). Scenario waits up to **10s** for a new leader. | [config.go @ v3.7.4](https://github.com/etcd-io/etcd/blob/v3.7.4/server/embed/config.go) (`TickMs: 100`, `ElectionMs: 1000`) · [Tuning (v3.7)](https://etcd.io/docs/v3.7/tuning/) |
 | Isolate shape | **Symmetric** isolate of `node_0` (`direction: both`) on `proxy_mode: per_node_owned`. One advertised peer URL per member, same as rqlite, but owner PID separates flows on that shared inbound proxy, so outbound from node 0 is cut without cutting 1↔2. No `fault.pause`. | Fuss `topology.proxy_mode` / `fault.isolate.direction` in `skills/fuss/CONFIG.md` |
-| Expected verdict | **PASS**: a completed `put` remains visible to a linearizable `get` on the new leader after the symmetric isolate | Derived from the sources above. No official isolate checklist. |
+| Expected verdict | **PASS** when `node_0` was the leader before the cut and a linearizable `get` on the new leader still returns the value. **UNKNOWN** when `node_0` did not win the election (`reason=leader_not_node_0`), or when the get fails. A missing value after a successful get is **LOST WRITE**. | Derived from the sources above. No official isolate checklist. |
 
 **Peer transport (reading, not a verdict).** At v3.7.4, `rafthttp` keeps long-lived streams to each peer and redials when a stream dies; a pipeline of short HTTP posts is the fallback until the stream is up. A cut has to close the current sockets and refuse the redial. If a redial is accepted after the cut, Fuss’s `-json` evidence is the record. Do not paper over that with a sleep. Source: [rafthttp/peer.go @ v3.7.4](https://github.com/etcd-io/etcd/blob/v3.7.4/server/etcdserver/api/rafthttp/peer.go).
 
@@ -35,12 +35,12 @@ go build -o fuss .
 ## Scenario
 
 1. Three members boot with the same `--initial-cluster`, each advertising its proxy as `--initial-advertise-peer-urls` and listening for peers on the real port behind that proxy. Client URLs are direct.
-2. `etcdctl put` one key to node 0, retried for up to 10s so the first election can finish. etcdctl forwards to whoever is leader and returns only after the write is committed. A put that never succeeds is `UNKNOWN` (no ack).
-3. Isolate `node_0` with `direction: both`. No pause.
-4. Poll `etcdctl endpoint status` on nodes 1 and 2 for up to 10s until one reports `header.member_id == leader`.
-5. `etcdctl get` that key from the new leader with the default linearizable read.
+2. Poll `etcdctl endpoint status` on node 0 for up to 10s. This version always cuts `node_0`. If node 0 is not the leader, the verdict is `UNKNOWN reason=leader_not_node_0` and nothing is acknowledged. Any member can win the first election; this scenario does not move the leader.
+3. `etcdctl put` the key to node 0. etcdctl returns only after the write is committed. A put that fails is `UNKNOWN reason=write_failed` and is not an acknowledgement.
+4. Isolate `node_0` with `direction: both`. No pause. The driver waits for `${dir}/isolate_applied.json` (`trigger_fired` true, `links_cut` > 0, `target` `node_0`) before it reads. If that file does not appear, the verdict is `UNKNOWN reason=cut_not_applied`.
+5. Poll `etcdctl endpoint status` on nodes 1 and 2 for up to 10s until one reports `header.member_id == leader`.
+6. `etcdctl get` that key from the new leader, `-w json`, default linearizable read, with a 2s dial timeout and a 5s command timeout.
 
-Verdicts from the drive script: value present on the new leader →
-`PASS read_from=node_1|node_2 leader=self after_cut=yes` (check rules
-require that full line); missing → `LOST WRITE`; no new leader among
-nodes 1/2 → `UNKNOWN`. Trial JSON `evidence.check.out` carries that line.
+A get is a verdict only when etcdctl exits 0 and the JSON parses. No `kvs` → `LOST WRITE read_from=node_1|node_2 leader=self after_cut=yes value_missing=yes`. Value `ok` → `PASS read_from=... leader=self after_cut=yes`. A different value → `UNKNOWN reason=read_unexpected`. A non-zero etcdctl status, including a timeout, → `UNKNOWN reason=read_failed`. Unparseable JSON → `UNKNOWN reason=read_malformed`. Check rules require the full PASS or LOST WRITE line. Trial JSON `evidence.check.out` carries that line.
+
+`-save-bundle` and `-replay-bundle` use the same bundle format as `examples/repkv/bundles/lost-write`.

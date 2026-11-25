@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"net"
 	"os"
 	"os/exec"
@@ -329,6 +330,7 @@ func TestYAMLTopologyIsolateNode0(t *testing.T) {
 	if !rt.cutObserved() {
 		t.Fatal("expected cut evidence on a link")
 	}
+	assertIsolateAppliedFile(t, dir, 4)
 	ev := rt.isolateEvidence()
 	if ev["trigger_fired"] != true {
 		t.Fatalf("evidence trigger_fired=%v", ev["trigger_fired"])
@@ -541,6 +543,112 @@ func TestYAMLTopologyIsolateTriggerNeverUNKNOWN(t *testing.T) {
 	ev := rt.isolateEvidence()
 	if ev["trigger_fired"] != false {
 		t.Fatalf("trigger_fired=%v", ev["trigger_fired"])
+	}
+}
+
+func TestIsolateScenarioUnknownReasonKept(t *testing.T) {
+	buildTopologyHold(t)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "unknown.yaml")
+	body := []byte(`
+name: isolate-unknown-reason
+binary:
+  default: hold
+  extra: ["./testdata/yaml/topology/hold"]
+topology:
+  nodes: 3
+  data_dir: "${dir}/node${i}"
+  ports:
+    base: 0
+  peers:
+    port_name: raft
+    via_proxy: true
+  start: ["${binary}", "${data_dir}", "${port}", "${peers}"]
+  ready:
+    file: "${data_dir}/ready"
+    contains: READY
+    timeout: 2s
+  stop_grace: 200ms
+fault:
+  isolate: node_0
+  after:
+    file:
+      glob: "${dir}/cut_now"
+      contains: NOW
+      poll: 10ms
+      timeout: 200ms
+check:
+  command:
+    command: ["/bin/sh", "-c", "echo UNKNOWN reason=leader_not_node_0"]
+    as: out
+  rules:
+    - if: { out_contains: "UNKNOWN reason=leader_not_node_0" }
+      verdict: UNKNOWN
+    - else: FAIL
+`)
+	if err := os.WriteFile(path, body, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	a, err := LoadYAMLTarget(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bin, _, err := a.ResolveBinary("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	trialDir := t.TempDir()
+	at, err := a.Init(1, trialDir, bin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	log, err := os.Create(filepath.Join(trialDir, "log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer log.Close()
+	hold, err := a.Start(at, log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rt := at.Data()["topology"].(*topologyRuntime)
+	t.Cleanup(func() {
+		a.stopTopology(rt)
+		if hold.Process != nil {
+			_ = hold.Process.Kill()
+			_ = hold.Wait()
+		}
+	})
+	_ = hold.Process.Kill()
+	_ = hold.Wait()
+	cr := a.CheckNamed(at, true, "topology")
+	if cr.Verdict != "UNKNOWN" {
+		t.Fatalf("verdict %s want UNKNOWN problems %v", cr.Verdict, cr.Problems)
+	}
+	for _, p := range cr.Problems {
+		if strings.Contains(p.Error(), "trigger did not fire") {
+			t.Fatalf("scenario reason was replaced: %v", cr.Problems)
+		}
+	}
+	vals, _ := at.Data()["check_vals"].(map[string]any)
+	out, _ := vals["out"].(string)
+	if !strings.Contains(out, "UNKNOWN reason=leader_not_node_0") {
+		t.Fatalf("check out %q", out)
+	}
+}
+
+func assertIsolateAppliedFile(t *testing.T, dir string, wantCut int) {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join(dir, "isolate_applied.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc isolateAppliedDoc
+	if err := json.Unmarshal(b, &doc); err != nil {
+		t.Fatal(err)
+	}
+	if doc.Target != "node_0" || !doc.TriggerFired || doc.LinksCut != wantCut {
+		t.Fatalf("isolate_applied.json = %+v", doc)
 	}
 }
 

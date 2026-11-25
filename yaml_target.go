@@ -1176,7 +1176,7 @@ func (y *YAMLAdapter) watchIsolate(t *BaseTrial, rt *topologyRuntime) {
 	if perr != nil {
 		return
 	}
-	y.cutIsolate(rt, idx, direction)
+	y.cutIsolate(rt, idx, direction, t.Dir())
 }
 
 func (y *YAMLAdapter) watchPause(t *BaseTrial, rt *topologyRuntime) {
@@ -1228,7 +1228,50 @@ func (y *YAMLAdapter) pauseNode(rt *topologyRuntime, nodeIdx int) {
 	rt.mu.Unlock()
 }
 
-func (y *YAMLAdapter) cutIsolate(rt *topologyRuntime, nodeIdx int, direction string) {
+// isolateAppliedDoc is ${dir}/isolate_applied.json, written after Cut returns.
+// Scenarios wait for it before accepting a post-cut read.
+type isolateAppliedDoc struct {
+	Target       string `json:"target"`
+	Direction    string `json:"direction"`
+	LinksCut     int    `json:"links_cut"`
+	LinksTotal   int    `json:"links_total"`
+	TriggerFired bool   `json:"trigger_fired"`
+	CutTime      string `json:"cut_time,omitempty"`
+}
+
+func appliedFromEvidence(ev map[string]any) isolateAppliedDoc {
+	if ev == nil {
+		return isolateAppliedDoc{}
+	}
+	doc := isolateAppliedDoc{
+		LinksCut:   asInt(ev["links_cut"]),
+		LinksTotal: asInt(ev["links_total"]),
+	}
+	doc.Target, _ = ev["target"].(string)
+	doc.Direction, _ = ev["direction"].(string)
+	doc.TriggerFired, _ = ev["trigger_fired"].(bool)
+	doc.CutTime, _ = ev["cut_time"].(string)
+	return doc
+}
+
+func writeIsolateApplied(dir string, ev map[string]any) {
+	if dir == "" || ev == nil {
+		return
+	}
+	b, err := json.Marshal(appliedFromEvidence(ev))
+	if err != nil {
+		return
+	}
+	b = append(b, '\n')
+	tmp := filepath.Join(dir, ".isolate_applied.json.tmp")
+	final := filepath.Join(dir, "isolate_applied.json")
+	if err := os.WriteFile(tmp, b, 0o644); err != nil {
+		return
+	}
+	_ = os.Rename(tmp, final)
+}
+
+func (y *YAMLAdapter) cutIsolate(rt *topologyRuntime, nodeIdx int, direction, dir string) {
 	rt.mu.Lock()
 	cutAt := time.Now()
 	if rt.Isolate != nil {
@@ -1292,6 +1335,7 @@ func (y *YAMLAdapter) cutIsolate(rt *topologyRuntime, nodeIdx int, direction str
 		}
 		rt.mu.Unlock()
 	}
+	writeIsolateApplied(dir, rt.isolateEvidence())
 }
 
 // ownedTagger maps an accepted client socket to the topology node that owns it.
@@ -1727,6 +1771,16 @@ func (y *YAMLAdapter) CheckNamed(at AdapterTrial, killed bool, phase string) Che
 		}
 		if y.cfg.Fault.Isolate.active() {
 			if cr := y.checkIsolate(rt); cr.Verdict != "" {
+				// The scenario's own UNKNOWN (failed read, wrong leader, cut
+				// file missing) names the reason. PASS and LOST WRITE do not
+				// override a cut Fuss could not prove.
+				if y.usesRulesCheck() {
+					rules := y.checkRules(t)
+					if rules.Verdict == "UNKNOWN" {
+						return rules
+					}
+					delete(t.Data(), "check_vals")
+				}
 				return cr
 			}
 		}
@@ -1741,10 +1795,15 @@ func (y *YAMLAdapter) CheckNamed(at AdapterTrial, killed bool, phase string) Che
 			return CheckResult{Verdict: "FAIL", Problems: []error{err}, Evidence: 1}
 		}
 	}
-	if len(y.cfg.Check.Rules) > 0 || y.cfg.Check.FileCount.Glob != "" || y.cfg.Check.RecordCount.Contains != "" || len(y.cfg.Check.Command.Command) > 0 {
+	if y.usesRulesCheck() {
 		return y.checkRules(t)
 	}
 	return y.checkAcks(t)
+}
+
+func (y *YAMLAdapter) usesRulesCheck() bool {
+	c := y.cfg.Check
+	return len(c.Rules) > 0 || c.FileCount.Glob != "" || c.RecordCount.Contains != "" || len(c.Command.Command) > 0
 }
 
 func (y *YAMLAdapter) runAfterSteps(t *BaseTrial, steps []yamlStep) error {

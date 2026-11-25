@@ -387,6 +387,11 @@ reports `closed_by_cut` or `refused_while_cut` growth, the check verdict is
 `UNKNOWN` (never `PASS`). Trial JSON `evidence.isolate` records
 `proxy_mode`, `direction`, `links_cut`, `links_total`, `trigger_fired`,
 `cut_time`, and per-link `stats_before` / `stats_after`.
+When the cut has been applied, Fuss also writes `${dir}/isolate_applied.json`
+(`target`, `direction`, `links_cut`, `links_total`, `trigger_fired`, `cut_time`).
+A scenario that reads after the cut waits for that file and treats a missing
+file, `trigger_fired` false, or `links_cut` of 0 as `UNKNOWN`. The read is
+not a verdict until that evidence is there.
 Example: `after: { file: { glob: "${dir}/cut_now", contains: NOW, poll: 10ms, timeout: 5s } }`
 
 ## `check`

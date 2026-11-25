@@ -5,6 +5,7 @@ package main
 
 import (
 	"bufio"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -35,13 +36,21 @@ func main() {
 	key := flag.String("key", "", "key (drive/verify)")
 	record := flag.String("record", "", "ack record path (drive)")
 	cut := flag.String("cut", "", "isolate trigger file (drive)")
+	cutNode := flag.String("cut-node", "node_0", "verify: isolate_applied.json target")
+	readFault := flag.String("read-fault", "", "verify: refused dials a closed port after the leader is known")
+	version := flag.Bool("version", false, "print repkv and exit")
 	flag.Parse()
+
+	if *version {
+		fmt.Println("repkv")
+		os.Exit(0)
+	}
 
 	switch {
 	case *drive:
 		os.Exit(runDrive(*dir, *n, *key, *record, *cut, *gate, *mode))
 	case *verify:
-		os.Exit(runVerify(*dir, *n, *key))
+		os.Exit(runVerify(*dir, *n, *key, *cutNode, *readFault))
 	default:
 		if *dataDir == "" || *peerListen == "" {
 			fmt.Fprintln(os.Stderr, "repkv: -data-dir and -peer-listen required")
@@ -52,16 +61,16 @@ func main() {
 }
 
 type node struct {
-	id       int
-	mode     string
-	gate     string
-	peers    []string // index -> dial addr; peers[id] == ""
-	mu       sync.Mutex
-	store    map[string]string
-	leader   int
-	lastHB   time.Time
-	term     int
-	pending  map[string]string // bug mode: waiting for gate
+	id      int
+	mode    string
+	gate    string
+	peers   []string // index -> dial addr; peers[id] == ""
+	mu      sync.Mutex
+	store   map[string]string
+	leader  int
+	lastHB  time.Time
+	term    int
+	pending map[string]string // bug mode: waiting for gate
 }
 
 func runNode(id int, dataDir, peerListen, peerAddrs, client, mode, gate string) int {
@@ -408,63 +417,161 @@ func runDrive(dir string, n int, key, record, cut, gate, mode string) int {
 		}
 	}
 	_ = os.WriteFile(cut, []byte("NOW\n"), 0o644)
+	// Bug mode must not release replication until Fuss has applied the cut.
+	// The applied file is that evidence; a sleep is not.
+	if err := waitIsolateApplied(dir, "node_0", 8*time.Second); err != nil {
+		_ = os.WriteFile(filepath.Join(dir, "drive_done"), []byte("DONE\n"), 0o644)
+		return 0
+	}
 	if mode == "bug" && gate != "" {
-		// Correctness depends on the cut happening first (gate opens only after
-		// cut_now), not on this sleep; the sleep just gives isolate time to land.
-		time.Sleep(400 * time.Millisecond)
 		_ = os.WriteFile(gate, []byte("GO\n"), 0o644)
 	}
 	_ = os.WriteFile(filepath.Join(dir, "drive_done"), []byte("DONE\n"), 0o644)
 	return 0
 }
 
-func runVerify(dir string, n int, key string) int {
+type isolateApplied struct {
+	Target       string `json:"target"`
+	LinksCut     int    `json:"links_cut"`
+	TriggerFired bool   `json:"trigger_fired"`
+}
+
+func waitIsolateApplied(dir, target string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for {
+		if doc, err := readIsolateApplied(dir); err == nil && appliedOK(doc, target) {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("cut not applied")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+func readIsolateApplied(dir string) (isolateApplied, error) {
+	b, err := os.ReadFile(filepath.Join(dir, "isolate_applied.json"))
+	if err != nil {
+		return isolateApplied{}, err
+	}
+	var doc isolateApplied
+	if err := json.Unmarshal(b, &doc); err != nil {
+		return isolateApplied{}, err
+	}
+	return doc, nil
+}
+
+func appliedOK(doc isolateApplied, target string) bool {
+	return doc.TriggerFired && doc.LinksCut > 0 && doc.Target == target
+}
+
+func runVerify(dir string, n int, key, cutNode, readFault string) int {
+	if cutNode == "" {
+		cutNode = "node_0"
+	}
+	doc, err := readIsolateApplied(dir)
+	if err != nil || !appliedOK(doc, cutNode) {
+		fmt.Println("UNKNOWN reason=cut_not_applied")
+		return 0
+	}
 	clients := make([]string, n)
 	for i := 0; i < n; i++ {
 		b, err := os.ReadFile(filepath.Join(dir, fmt.Sprintf("node%d", i), "client"))
 		if err != nil {
-			fmt.Println("UNKNOWN")
+			fmt.Println("UNKNOWN reason=no_client")
 			return 0
 		}
 		clients[i] = strings.TrimSpace(string(b))
 	}
-	// Wait for a leader among nodes 1..n-1 (not the isolated node 0).
+	// The surviving leader is a node other than the isolated one that reports itself.
 	deadline := time.Now().Add(3 * time.Second)
 	newLead := -1
-	for time.Now().Before(deadline) {
+	for time.Now().Before(deadline) && newLead < 0 {
 		for i := 1; i < n; i++ {
-			resp, err := http.Get("http://" + clients[i] + "/leader")
-			if err != nil {
-				continue
-			}
-			b, _ := io.ReadAll(resp.Body)
-			resp.Body.Close()
-			lead, err := strconv.Atoi(strings.TrimSpace(string(b)))
-			if err == nil && lead >= 1 && lead < n {
-				// Confirm that node agrees it is leader / serves.
-				newLead = lead
+			id, err := leaderID(clients[i])
+			if err == nil && id == i {
+				newLead = i
 				break
 			}
 		}
-		if newLead >= 1 {
-			break
+		if newLead < 0 {
+			time.Sleep(50 * time.Millisecond)
 		}
-		time.Sleep(50 * time.Millisecond)
 	}
 	if newLead < 1 {
-		fmt.Println("UNKNOWN")
+		fmt.Println("UNKNOWN reason=no_new_leader")
 		return 0
 	}
-	resp, err := http.Get("http://" + clients[newLead] + "/k/" + key)
+	client := &http.Client{Timeout: 2 * time.Second}
+	url := "http://" + clients[newLead] + "/k/" + key
+	if readFault == "refused" {
+		url = "http://127.0.0.1:1/k/" + key
+	}
+	resp, err := client.Get(url)
+	var status int
+	var body string
+	if err == nil {
+		status = resp.StatusCode
+		b, rerr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		resp.Body.Close()
+		if rerr != nil {
+			err = rerr
+		} else {
+			body = string(b)
+		}
+	}
+	kind, reason := classifyRead(status, body, err, "v")
+	fmt.Println(verifyLine(kind, reason, newLead))
+	return 0
+}
+
+func leaderID(client string) (int, error) {
+	c := &http.Client{Timeout: time.Second}
+	resp, err := c.Get("http://" + client + "/leader")
 	if err != nil {
-		fmt.Println("UNKNOWN")
-		return 0
+		return -1, err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode == http.StatusOK {
-		fmt.Println("PASS")
-		return 0
+	b, err := io.ReadAll(io.LimitReader(resp.Body, 64))
+	if err != nil {
+		return -1, err
 	}
-	fmt.Println("LOST WRITE")
-	return 0
+	if resp.StatusCode != http.StatusOK {
+		return -1, fmt.Errorf("status %d", resp.StatusCode)
+	}
+	return strconv.Atoi(strings.TrimSpace(string(b)))
+}
+
+// classifyRead distinguishes a missing value from a failed query.
+// kind is pass, lost, or unknown. A non-nil err, or any status other than
+// 200 or 404, is unknown with reason read_error.
+func classifyRead(status int, body string, err error, want string) (kind, reason string) {
+	if err != nil {
+		return "unknown", "read_error"
+	}
+	switch status {
+	case http.StatusNotFound:
+		return "lost", ""
+	case http.StatusOK:
+		if strings.TrimSpace(body) != want {
+			return "unknown", "read_unexpected"
+		}
+		return "pass", ""
+	default:
+		return "unknown", "read_error"
+	}
+}
+
+func verifyLine(kind, reason string, node int) string {
+	switch kind {
+	case "pass":
+		return fmt.Sprintf("PASS read_from=node_%d leader=self after_cut=yes", node)
+	case "lost":
+		return fmt.Sprintf("LOST WRITE read_from=node_%d leader=self after_cut=yes value_missing=yes", node)
+	default:
+		if reason == "" {
+			reason = "unspecified"
+		}
+		return "UNKNOWN reason=" + reason
+	}
 }

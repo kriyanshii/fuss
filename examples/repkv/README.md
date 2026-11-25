@@ -16,15 +16,28 @@ go build -o fuss .
 
 ## Replay
 
-There is no saved trial-directory replay for these YAML scenarios. A failing
-trial keeps its temp dir (`dir_kept: true`) for inspection, but replaying the
-finding means re-running the same seed (no root required; Fuss uses userspace
-proxies):
+`examples/repkv/bundles/lost-write` is one saved bug-mode run. It holds the
+scenario, the Fuss revision, the repkv version and checksum, the seed, the
+acknowledged write, the applied partition, and the read. From a clean checkout:
 
 ```sh
-./fuss -target-config=examples/repkv/repkv-bug.yaml -seed=1 -n=1 -json
+./examples/repkv/replay.sh
 ```
 
-Re-run that ten times; the bar is LOST WRITE every time. `-adapter=repkv`
-loads the same `repkv.yaml` via `examples/repkv/repkv.yaml`, but prefer
-`-target-config` so the path is explicit.
+That rebuilds Fuss and repkv, runs the saved scenario and seed, and prints:
+
+```
+ack: ack 1-0
+cut: target=node_0 direction=both links_cut=4 trigger_fired=true
+read: LOST WRITE read_from=node_1 leader=self after_cut=yes value_missing=yes
+verdict: LOST WRITE
+```
+
+Exit 0 means the new run showed those three facts and the same verdict. The
+target's own exit status for bug mode is 1, because the verdict is LOST WRITE.
+
+`-adapter=repkv` loads `examples/repkv/repkv.yaml`. Prefer `-target-config` so
+the path is explicit.
+
+`repkv-read-error.yaml` is the same cluster and cut. The check dials a closed
+port after the new leader is known, and the verdict is `UNKNOWN reason=read_error`.

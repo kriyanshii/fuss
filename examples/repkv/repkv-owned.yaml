@@ -49,7 +49,7 @@ kill:
     glob: "${dir}/drive_done"
     contains: DONE
     poll: 10ms
-    timeout: 10s
+    timeout: 20s
 check:
   command:
     command: ["${binary}", "-verify", "-dir", "${dir}", "-n", "3", "-key", "${seed}-0"]

@@ -1,0 +1,359 @@
+package main
+
+import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"io"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"time"
+)
+
+// bundleCLI is set from main. saveDir writes one bundle after a single seed.
+// want, when set, is a saved bundle the run must reproduce.
+type bundleCLI struct {
+	saveDir string
+	want    *replayBundle
+	got     *replayFacts
+}
+
+var bundleRun bundleCLI
+
+// replayBundle is the portable record of one seeded run.
+// format 1. scenario.yaml sits next to bundle.json.
+type replayBundle struct {
+	Format         int          `json:"format"`
+	FussRevision   string       `json:"fuss_revision"`
+	Target         bundleTarget `json:"target"`
+	Seed           int64        `json:"seed"`
+	Scenario       string       `json:"scenario"`
+	ScenarioSHA256 string       `json:"scenario_sha256"`
+	Inputs         bundleInputs `json:"inputs"`
+	Ack            bundleAck    `json:"ack"`
+	Cut            bundleCut    `json:"cut"`
+	Read           bundleRead   `json:"read"`
+	Verdict        string       `json:"verdict"`
+}
+
+type bundleTarget struct {
+	Name     string `json:"name"`
+	Binary   string `json:"binary"`
+	Version  string `json:"version,omitempty"`
+	Checksum string `json:"checksum"`
+}
+
+type bundleInputs struct {
+	Seed     int64  `json:"seed"`
+	N        int    `json:"n"`
+	Scenario string `json:"scenario"`
+}
+
+type bundleAck struct {
+	Line string `json:"line"`
+	Key  string `json:"key,omitempty"`
+}
+
+type bundleCut struct {
+	Target       string `json:"target"`
+	Direction    string `json:"direction"`
+	TriggerFired bool   `json:"trigger_fired"`
+	LinksCut     int    `json:"links_cut"`
+	LinksTotal   int    `json:"links_total"`
+	CutTime      string `json:"cut_time,omitempty"`
+}
+
+type bundleRead struct {
+	Text    string `json:"text"`
+	From    string `json:"from,omitempty"`
+	OK      bool   `json:"ok"`
+	Missing bool   `json:"missing"`
+}
+
+type replayFacts struct {
+	Verdict  string
+	Ack      bundleAck
+	Cut      bundleCut
+	Read     bundleRead
+	Version  string
+	Checksum string
+}
+
+func fileSHA256(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return "sha256:" + hex.EncodeToString(h.Sum(nil)), nil
+}
+
+func fussRevision() string {
+	cmd := exec.Command("git", "rev-parse", "HEAD")
+	out, err := cmd.Output()
+	if err != nil {
+		return "unknown"
+	}
+	rev := strings.TrimSpace(string(out))
+	dirty := exec.Command("git", "status", "--porcelain")
+	if b, err := dirty.Output(); err == nil && len(bytes.TrimSpace(b)) > 0 {
+		rev += "-dirty"
+	}
+	return rev
+}
+
+func probeVersion(bin string) string {
+	for _, arg := range []string{"-version", "--version"} {
+		cmd := exec.Command(bin, arg)
+		var buf bytes.Buffer
+		cmd.Stdout = &buf
+		cmd.Stderr = &buf
+		timer := time.AfterFunc(2*time.Second, func() {
+			if cmd.Process != nil {
+				_ = cmd.Process.Kill()
+			}
+		})
+		err := cmd.Run()
+		timer.Stop()
+		if err != nil {
+			continue
+		}
+		line := strings.TrimSpace(buf.String())
+		if i := strings.IndexByte(line, '\n'); i >= 0 {
+			line = strings.TrimSpace(line[:i])
+		}
+		if line != "" {
+			return line
+		}
+	}
+	return ""
+}
+
+func readAckLine(record string) bundleAck {
+	for _, ln := range strings.Split(record, "\n") {
+		ln = strings.TrimSpace(ln)
+		if strings.HasPrefix(ln, "ack ") {
+			return bundleAck{Line: ln, Key: strings.TrimSpace(strings.TrimPrefix(ln, "ack "))}
+		}
+	}
+	return bundleAck{}
+}
+
+func parseReadLine(text string) bundleRead {
+	r := bundleRead{Text: strings.TrimSpace(text)}
+	if strings.Contains(r.Text, "after_cut=yes") &&
+		(strings.HasPrefix(r.Text, "PASS ") || r.Text == "PASS" || strings.HasPrefix(r.Text, "LOST WRITE")) {
+		r.OK = true
+	}
+	r.Missing = strings.Contains(r.Text, "value_missing=yes")
+	const key = "read_from="
+	if i := strings.Index(r.Text, key); i >= 0 {
+		rest := r.Text[i+len(key):]
+		if j := strings.IndexAny(rest, " \n\t"); j >= 0 {
+			rest = rest[:j]
+		}
+		r.From = rest
+	}
+	return r
+}
+
+func cutFromEvidence(ev map[string]any) bundleCut {
+	if ev == nil {
+		return bundleCut{}
+	}
+	c := bundleCut{
+		LinksCut:   asInt(ev["links_cut"]),
+		LinksTotal: asInt(ev["links_total"]),
+	}
+	c.Target, _ = ev["target"].(string)
+	c.Direction, _ = ev["direction"].(string)
+	c.TriggerFired, _ = ev["trigger_fired"].(bool)
+	c.CutTime, _ = ev["cut_time"].(string)
+	return c
+}
+
+func collectReplayFacts(result *adapterTrialResult, binaryPath string) replayFacts {
+	ack := bundleAck{}
+	if result != nil && result.dir != "" {
+		b, _ := os.ReadFile(filepath.Join(result.dir, "runs.txt"))
+		ack = readAckLine(string(b))
+	}
+	var cut bundleCut
+	var read bundleRead
+	verdict := ""
+	if result != nil {
+		verdict = result.verdict
+		cut = cutFromEvidence(result.isolate)
+		if result.check != nil {
+			if s, ok := result.check["out"].(string); ok {
+				read = parseReadLine(s)
+			}
+		}
+	}
+	sum, _ := fileSHA256(binaryPath)
+	return replayFacts{
+		Verdict:  verdict,
+		Ack:      ack,
+		Cut:      cut,
+		Read:     read,
+		Version:  probeVersion(binaryPath),
+		Checksum: sum,
+	}
+}
+
+func writeReplayBundle(dir, scenarioPath, binaryPath, targetName string, seed int64, facts replayFacts) error {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	src, err := os.ReadFile(scenarioPath)
+	if err != nil {
+		return fmt.Errorf("save bundle: scenario: %w", err)
+	}
+	scenarioCopy := filepath.Join(dir, "scenario.yaml")
+	if err := os.WriteFile(scenarioCopy, src, 0o644); err != nil {
+		return err
+	}
+	sum, err := fileSHA256(scenarioCopy)
+	if err != nil {
+		return err
+	}
+	b := replayBundle{
+		Format:       1,
+		FussRevision: fussRevision(),
+		Target: bundleTarget{
+			Name:     targetName,
+			Binary:   filepath.Base(binaryPath),
+			Version:  facts.Version,
+			Checksum: facts.Checksum,
+		},
+		Seed:           seed,
+		Scenario:       scenarioPath,
+		ScenarioSHA256: sum,
+		Inputs: bundleInputs{
+			Seed:     seed,
+			N:        1,
+			Scenario: "scenario.yaml",
+		},
+		Ack:     facts.Ack,
+		Cut:     facts.Cut,
+		Read:    facts.Read,
+		Verdict: facts.Verdict,
+	}
+	body, err := json.MarshalIndent(b, "", "  ")
+	if err != nil {
+		return err
+	}
+	body = append(body, '\n')
+	return os.WriteFile(filepath.Join(dir, "bundle.json"), body, 0o644)
+}
+
+func loadReplayBundle(dir string) (*replayBundle, error) {
+	b, err := os.ReadFile(filepath.Join(dir, "bundle.json"))
+	if err != nil {
+		return nil, fmt.Errorf("replay bundle: %w", err)
+	}
+	var got replayBundle
+	if err := json.Unmarshal(b, &got); err != nil {
+		return nil, fmt.Errorf("replay bundle: %w", err)
+	}
+	if got.Format != 1 {
+		return nil, fmt.Errorf("replay bundle: format %d is not supported", got.Format)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "scenario.yaml")); err != nil {
+		return nil, fmt.Errorf("replay bundle: scenario.yaml: %w", err)
+	}
+	return &got, nil
+}
+
+// replayMatches reports why a new run does not show the saved failure or pass.
+// A lost-write bundle matches only when the new run recorded an acknowledgement,
+// an applied partition, and a successful read that found the value missing.
+func replayMatches(want *replayBundle, got replayFacts) error {
+	var problems []string
+	if got.Verdict != want.Verdict {
+		problems = append(problems, fmt.Sprintf("verdict %s, bundle %s", got.Verdict, want.Verdict))
+	}
+	if got.Ack.Line == "" {
+		problems = append(problems, "no write acknowledgement")
+	} else if want.Ack.Line != "" && got.Ack.Line != want.Ack.Line {
+		problems = append(problems, fmt.Sprintf("ack %q, bundle %q", got.Ack.Line, want.Ack.Line))
+	}
+	if !got.Cut.TriggerFired || got.Cut.LinksCut < 1 {
+		problems = append(problems, "partition was not applied")
+	} else if want.Cut.Target != "" && got.Cut.Target != want.Cut.Target {
+		problems = append(problems, fmt.Sprintf("cut target %s, bundle %s", got.Cut.Target, want.Cut.Target))
+	}
+	switch want.Verdict {
+	case "LOST WRITE", "PASS":
+		if !got.Read.OK {
+			problems = append(problems, "read was not a successful read after the cut")
+		}
+		if got.Read.From != "node_1" && got.Read.From != "node_2" {
+			problems = append(problems, "read was not from a surviving leader")
+		}
+	}
+	if want.Verdict == "LOST WRITE" && !got.Read.Missing {
+		problems = append(problems, "read did not show the value missing")
+	}
+	if want.Verdict == "PASS" && got.Read.Missing {
+		problems = append(problems, "read showed the value missing")
+	}
+	if len(problems) == 0 {
+		return nil
+	}
+	return fmt.Errorf("%s", strings.Join(problems, "; "))
+}
+
+func printReplayReport(want *replayBundle, got *replayFacts) {
+	fmt.Printf("replay: seed=%d fuss_revision=%s target_version=%s target_checksum=%s\n",
+		want.Seed, want.FussRevision, want.Target.Version, want.Target.Checksum)
+	if got == nil {
+		fmt.Println("ack:")
+		fmt.Println("cut:")
+		fmt.Println("read:")
+		fmt.Println("verdict:")
+		return
+	}
+	if got.Checksum != "" && got.Checksum != want.Target.Checksum {
+		fmt.Printf("replay: this_target_checksum=%s\n", got.Checksum)
+	}
+	if got.Version != "" && got.Version != want.Target.Version {
+		fmt.Printf("replay: this_target_version=%s\n", got.Version)
+	}
+	fmt.Printf("ack: %s\n", got.Ack.Line)
+	fmt.Printf("cut: target=%s direction=%s links_cut=%d trigger_fired=%t\n",
+		got.Cut.Target, got.Cut.Direction, got.Cut.LinksCut, got.Cut.TriggerFired)
+	fmt.Printf("read: %s\n", got.Read.Text)
+	fmt.Printf("verdict: %s\n", got.Verdict)
+}
+
+func replaySavedBundle(dir string, json bool) int {
+	b, err := loadReplayBundle(dir)
+	if err != nil {
+		fatal(err)
+	}
+	scenario := filepath.Join(dir, "scenario.yaml")
+	sum, err := fileSHA256(scenario)
+	if err != nil {
+		fatal(err)
+	}
+	if sum != b.ScenarioSHA256 {
+		fatal(fmt.Errorf("scenario.yaml checksum %s, bundle says %s", sum, b.ScenarioSHA256))
+	}
+	adapter, err := LoadYAMLTarget(scenario)
+	if err != nil {
+		fatal(err)
+	}
+	jsonOut = json
+	bundleRun.want = b
+	bundleRun.got = nil
+	return runAdapter(adapter, "", b.Seed, 1, true, "")
+}

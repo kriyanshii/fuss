@@ -56,28 +56,97 @@ topology:
             return 1
           }
           raft_state() {
-            curl -sf "http://$1/status" | python3 -c 'import sys,json; s=json.load(sys.stdin); print(s.get("store",{}).get("raft",{}).get("state",""))' 2>/dev/null || true
+            curl -sf --max-time 2 "http://$1/status" | python3 -c 'import sys,json; s=json.load(sys.stdin); print(s.get("store",{}).get("raft",{}).get("state",""))' 2>/dev/null || true
+          }
+          exec_ok() {
+            python3 -c 'import textwrap; exec(textwrap.dedent("""
+              import json, sys
+              kind = sys.argv[1]
+              try:
+                  d = json.load(sys.stdin)
+              except Exception:
+                  sys.exit(2)
+              results = d.get("results")
+              if not isinstance(results, list) or not results or not isinstance(results[0], dict):
+                  sys.exit(2)
+              r = results[0]
+              if r.get("error"):
+                  sys.exit(3)
+              if kind == "insert":
+                  n = r.get("rows_affected")
+                  if isinstance(n, bool) or not isinstance(n, int) or n < 1:
+                      sys.exit(3)
+              sys.exit(0)
+            """))' "$1"
+          }
+          query_kind() {
+            python3 -c 'import textwrap; exec(textwrap.dedent("""
+              import json, sys
+              try:
+                  d = json.load(sys.stdin)
+              except Exception:
+                  print("malformed")
+                  raise SystemExit
+              results = d.get("results")
+              if not isinstance(results, list) or not results or not isinstance(results[0], dict):
+                  print("malformed")
+                  raise SystemExit
+              r = results[0]
+              if r.get("error"):
+                  print("error")
+                  raise SystemExit
+              if "columns" not in r and "values" not in r:
+                  print("malformed")
+                  raise SystemExit
+              rows = r.get("values") or []
+              print("present" if rows else "missing")
+            """))'
+          }
+          cut_applied() {
+            python3 -c 'import textwrap; exec(textwrap.dedent("""
+              import json, sys
+              try:
+                  d = json.load(open(sys.argv[1]))
+              except Exception:
+                  sys.exit(1)
+              ok = d.get("target") == "node_0" and d.get("trigger_fired") is True and int(d.get("links_cut") or 0) > 0
+              sys.exit(0 if ok else 1)
+            """))' "$1"
           }
           finish() { echo "$1" > "$RESULT"; echo DONE > "$DONE"; exit 0; }
-          if ! wait_http; then finish UNKNOWN; fi
+          if ! wait_http; then finish "UNKNOWN reason=nodes_not_ready"; fi
           H0=$(cat "${DIR}/http_0")
           H1=$(cat "${DIR}/http_1")
           H2=$(cat "${DIR}/http_2")
-          if ! wait_ready "$H0" || ! wait_ready "$H1" || ! wait_ready "$H2"; then finish UNKNOWN; fi
+          if ! wait_ready "$H0" || ! wait_ready "$H1" || ! wait_ready "$H2"; then finish "UNKNOWN reason=nodes_not_ready"; fi
+          leader_ok=0
           for _ in $(seq 1 100); do
-            [ "$(raft_state "$H0")" = "Leader" ] && break
+            if [ "$(raft_state "$H0")" = "Leader" ]; then leader_ok=1; break; fi
             sleep 0.1
           done
-          code=$(curl -s -o "${DIR}/create.out" -w "%{http_code}" -XPOST "http://${H0}/db/execute" \
+          if [ "$leader_ok" != 1 ]; then finish "UNKNOWN reason=leader_not_node_0"; fi
+          code=$(curl -sS -o "${DIR}/create.out" -w "%{http_code}" --max-time 5 -XPOST "http://${H0}/db/execute" \
             -H "Content-Type: application/json" \
-            -d '["CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT)"]')
-          if [ "$code" != "200" ]; then finish UNKNOWN; fi
-          code=$(curl -s -o "${DIR}/insert.out" -w "%{http_code}" -XPOST "http://${H0}/db/execute" \
+            -d '["CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT)"]' || true)
+          if [ "$code" != "200" ]; then finish "UNKNOWN reason=write_failed http=${code}"; fi
+          if ! exec_ok create < "${DIR}/create.out"; then finish "UNKNOWN reason=write_body"; fi
+          code=$(curl -sS -o "${DIR}/insert.out" -w "%{http_code}" --max-time 5 -XPOST "http://${H0}/db/execute" \
             -H "Content-Type: application/json" \
-            -d "[[\"INSERT INTO kv(k,v) VALUES(?,?)\", \"${KEY}\", \"ok\"]]")
-          if [ "$code" != "200" ]; then finish UNKNOWN; fi
+            -d "[[\"INSERT INTO kv(k,v) VALUES(?,?)\", \"${KEY}\", \"ok\"]]" || true)
+          if [ "$code" != "200" ]; then finish "UNKNOWN reason=write_failed http=${code}"; fi
+          if ! exec_ok insert < "${DIR}/insert.out"; then finish "UNKNOWN reason=write_body"; fi
           echo "ack ${KEY}" >> "${DIR}/runs.txt"
           echo NOW > "$CUT"
+          # Do not read until Fuss has written isolate_applied.json for this cut.
+          applied=0
+          for _ in $(seq 1 150); do
+            if [ -s "${DIR}/isolate_applied.json" ] && cut_applied "${DIR}/isolate_applied.json"; then
+              applied=1
+              break
+            fi
+            sleep 0.1
+          done
+          if [ "$applied" != 1 ]; then finish "UNKNOWN reason=cut_not_applied"; fi
           # New leader must be node_1 or node_2 (not isolated node_0), observed after cut.
           NEW_HTTP=""
           NEW_NODE=""
@@ -88,14 +157,18 @@ topology:
             if [ "$s2" = "Leader" ]; then NEW_HTTP=$H2; NEW_NODE=node_2; break; fi
             sleep 0.1
           done
-          if [ -z "$NEW_HTTP" ] || [ -z "$NEW_NODE" ]; then finish UNKNOWN; fi
-          if [ "$(raft_state "$NEW_HTTP")" != "Leader" ]; then finish UNKNOWN; fi
-          body=$(curl -sf -G "http://${NEW_HTTP}/db/query" --data-urlencode "q=SELECT v FROM kv WHERE k='${KEY}'" --data-urlencode "level=strong" || true)
-          if echo "$body" | python3 -c 'import sys,json; d=json.load(sys.stdin); rows=(d.get("results") or [{}])[0].get("values") or []; sys.exit(0 if rows else 1)'; then
-            finish "PASS read_from=${NEW_NODE} raft_state=Leader after_cut=yes"
-          else
-            finish "LOST WRITE read_from=${NEW_NODE}"
-          fi
+          if [ -z "$NEW_HTTP" ] || [ -z "$NEW_NODE" ]; then finish "UNKNOWN reason=no_new_leader"; fi
+          if [ "$(raft_state "$NEW_HTTP")" != "Leader" ]; then finish "UNKNOWN reason=no_new_leader"; fi
+          code=$(curl -sS -o "${DIR}/query.out" -w "%{http_code}" --max-time 5 -G "http://${NEW_HTTP}/db/query" --data-urlencode "q=SELECT v FROM kv WHERE k='${KEY}'" --data-urlencode "level=strong" || true)
+          if [ "$code" = "000" ]; then finish "UNKNOWN reason=read_timeout"; fi
+          if [ "$code" != "200" ]; then finish "UNKNOWN reason=read_failed http=${code}"; fi
+          kind=$(query_kind < "${DIR}/query.out")
+          case "$kind" in
+            present) finish "PASS read_from=${NEW_NODE} raft_state=Leader after_cut=yes" ;;
+            missing) finish "LOST WRITE read_from=${NEW_NODE} raft_state=Leader after_cut=yes value_missing=yes" ;;
+            error) finish "UNKNOWN reason=read_error" ;;
+            *) finish "UNKNOWN reason=read_malformed" ;;
+          esac
         ) &
         # exec so the PID Fuss recorded is rqlited, which owns the Raft sockets
         exec ${binary} -node-id "node_${i}" \
@@ -148,7 +221,9 @@ check:
     command: ["/bin/cat", "${dir}/result.txt"]
     as: out
   rules:
-    - if: { out_contains: "LOST WRITE" }
+    - if: { out_contains: "LOST WRITE read_from=node_1 raft_state=Leader after_cut=yes value_missing=yes" }
+      verdict: "LOST WRITE"
+    - if: { out_contains: "LOST WRITE read_from=node_2 raft_state=Leader after_cut=yes value_missing=yes" }
       verdict: "LOST WRITE"
     # PASS only if the strong read was from node_1 or node_2 as Leader after cut.
     - if: { out_contains: "PASS read_from=node_1 raft_state=Leader after_cut=yes" }

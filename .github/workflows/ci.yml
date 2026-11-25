@@ -72,3 +72,65 @@ jobs:
         seed: "1"
         n: "10"
         expected-verdict: "PASS"
+
+  repkv:
+    name: repkv (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: '1.27'
+
+    - name: Build
+      run: |
+        go build -o fuss .
+        go build -o examples/repkv/repkv ./examples/repkv
+
+    - name: Correct mode
+      run: |
+        set +e
+        ./fuss -target-config=examples/repkv/repkv.yaml -target=./examples/repkv/repkv -seed=1 -n=10 -json > repkv-correct.json
+        rc=$?
+        set -e
+        if [ "$rc" -ne 0 ]; then
+          echo "fuss exited $rc"
+          cat repkv-correct.json
+          exit 1
+        fi
+        python3 scripts/assert_repkv_json.py repkv-correct.json PASS 10
+
+    - name: Bug mode
+      run: |
+        set +e
+        ./fuss -target-config=examples/repkv/repkv-bug.yaml -target=./examples/repkv/repkv -seed=1 -n=10 -json > repkv-bug.json
+        rc=$?
+        set -e
+        if [ "$rc" -eq 2 ] || [ "$rc" -eq 3 ]; then
+          echo "fuss exited $rc"
+          cat repkv-bug.json
+          exit 1
+        fi
+        python3 scripts/assert_repkv_json.py repkv-bug.json "LOST WRITE" 10
+
+    - name: Read error is UNKNOWN
+      run: |
+        set +e
+        ./fuss -target-config=examples/repkv/repkv-read-error.yaml -target=./examples/repkv/repkv -seed=1 -n=10 -json > repkv-read-error.json
+        rc=$?
+        set -e
+        if [ "$rc" -eq 2 ] || [ "$rc" -eq 3 ]; then
+          echo "fuss exited $rc"
+          cat repkv-read-error.json
+          exit 1
+        fi
+        python3 scripts/assert_repkv_json.py repkv-read-error.json UNKNOWN 10

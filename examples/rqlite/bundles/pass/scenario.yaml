@@ -1,0 +1,235 @@
+# rqlite v10.7.4: per_node_owned Raft proxies, symmetric isolate of node_0, no pause.
+# Requires rqlited v10.7.4 on PATH. Not run in CI.
+name: rqlite
+binary:
+  default: rqlited
+  extra: ["./examples/rqlite/rqlited"]
+topology:
+  nodes: 3
+  data_dir: "${dir}/node${i}"
+  ports:
+    base: 0
+  proxy_mode: per_node_owned
+  peers:
+    port_name: raft
+    via_proxy: true
+  start:
+    - /bin/sh
+    - -c
+    - |
+      set -e
+      case "${i}" in
+        0) ADV='${node_proxy_addr_0}' ;;
+        1) ADV='${node_proxy_addr_1}' ;;
+        2) ADV='${node_proxy_addr_2}' ;;
+        *) echo "bad i=${i}" >&2; exit 1 ;;
+      esac
+      HTTP_PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')
+      HTTP="127.0.0.1:${HTTP_PORT}"
+      echo "$HTTP" > "${data_dir}/http_addr"
+      echo "$HTTP" > "${dir}/http_${i}"
+      RAFT="127.0.0.1:${port}"
+      # -join takes host:port of a peer's Raft/mux address (not an http:// URL).
+      JOIN0='${node_proxy_addr_0}'
+      if [ "${i}" = "0" ]; then
+        (
+          DIR="${dir}"
+          KEY="${seed}-0"
+          RESULT="${DIR}/result.txt"
+          CUT="${DIR}/cut_now"
+          DONE="${DIR}/drive_done"
+          wait_http() {
+            for _ in $(seq 1 150); do
+              [ -f "${DIR}/http_0" ] && [ -f "${DIR}/http_1" ] && [ -f "${DIR}/http_2" ] && return 0
+              sleep 0.1
+            done
+            return 1
+          }
+          wait_ready() {
+            h="$1"
+            for _ in $(seq 1 150); do
+              if curl -sf "http://${h}/readyz" | grep -q "node ok"; then
+                return 0
+              fi
+              sleep 0.1
+            done
+            return 1
+          }
+          raft_state() {
+            curl -sf --max-time 2 "http://$1/status" | python3 -c 'import sys,json; s=json.load(sys.stdin); print(s.get("store",{}).get("raft",{}).get("state",""))' 2>/dev/null || true
+          }
+          exec_ok() {
+            python3 -c 'import textwrap; exec(textwrap.dedent("""
+              import json, sys
+              kind = sys.argv[1]
+              try:
+                  d = json.load(sys.stdin)
+              except Exception:
+                  sys.exit(2)
+              results = d.get("results")
+              if not isinstance(results, list) or not results or not isinstance(results[0], dict):
+                  sys.exit(2)
+              r = results[0]
+              if r.get("error"):
+                  sys.exit(3)
+              if kind == "insert":
+                  n = r.get("rows_affected")
+                  if isinstance(n, bool) or not isinstance(n, int) or n < 1:
+                      sys.exit(3)
+              sys.exit(0)
+            """))' "$1"
+          }
+          query_kind() {
+            python3 -c 'import textwrap; exec(textwrap.dedent("""
+              import json, sys
+              try:
+                  d = json.load(sys.stdin)
+              except Exception:
+                  print("malformed")
+                  raise SystemExit
+              results = d.get("results")
+              if not isinstance(results, list) or not results or not isinstance(results[0], dict):
+                  print("malformed")
+                  raise SystemExit
+              r = results[0]
+              if r.get("error"):
+                  print("error")
+                  raise SystemExit
+              if "columns" not in r and "values" not in r:
+                  print("malformed")
+                  raise SystemExit
+              rows = r.get("values") or []
+              print("present" if rows else "missing")
+            """))'
+          }
+          cut_applied() {
+            python3 -c 'import textwrap; exec(textwrap.dedent("""
+              import json, sys
+              try:
+                  d = json.load(open(sys.argv[1]))
+              except Exception:
+                  sys.exit(1)
+              ok = d.get("target") == "node_0" and d.get("trigger_fired") is True and int(d.get("links_cut") or 0) > 0
+              sys.exit(0 if ok else 1)
+            """))' "$1"
+          }
+          finish() { echo "$1" > "$RESULT"; echo DONE > "$DONE"; exit 0; }
+          if ! wait_http; then finish "UNKNOWN reason=nodes_not_ready"; fi
+          H0=$(cat "${DIR}/http_0")
+          H1=$(cat "${DIR}/http_1")
+          H2=$(cat "${DIR}/http_2")
+          if ! wait_ready "$H0" || ! wait_ready "$H1" || ! wait_ready "$H2"; then finish "UNKNOWN reason=nodes_not_ready"; fi
+          leader_ok=0
+          for _ in $(seq 1 100); do
+            if [ "$(raft_state "$H0")" = "Leader" ]; then leader_ok=1; break; fi
+            sleep 0.1
+          done
+          if [ "$leader_ok" != 1 ]; then finish "UNKNOWN reason=leader_not_node_0"; fi
+          code=$(curl -sS -o "${DIR}/create.out" -w "%{http_code}" --max-time 5 -XPOST "http://${H0}/db/execute" \
+            -H "Content-Type: application/json" \
+            -d '["CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT)"]' || true)
+          if [ "$code" != "200" ]; then finish "UNKNOWN reason=write_failed http=${code}"; fi
+          if ! exec_ok create < "${DIR}/create.out"; then finish "UNKNOWN reason=write_body"; fi
+          code=$(curl -sS -o "${DIR}/insert.out" -w "%{http_code}" --max-time 5 -XPOST "http://${H0}/db/execute" \
+            -H "Content-Type: application/json" \
+            -d "[[\"INSERT INTO kv(k,v) VALUES(?,?)\", \"${KEY}\", \"ok\"]]" || true)
+          if [ "$code" != "200" ]; then finish "UNKNOWN reason=write_failed http=${code}"; fi
+          if ! exec_ok insert < "${DIR}/insert.out"; then finish "UNKNOWN reason=write_body"; fi
+          echo "ack ${KEY}" >> "${DIR}/runs.txt"
+          echo NOW > "$CUT"
+          # Do not read until Fuss has written isolate_applied.json for this cut.
+          applied=0
+          for _ in $(seq 1 150); do
+            if [ -s "${DIR}/isolate_applied.json" ] && cut_applied "${DIR}/isolate_applied.json"; then
+              applied=1
+              break
+            fi
+            sleep 0.1
+          done
+          if [ "$applied" != 1 ]; then finish "UNKNOWN reason=cut_not_applied"; fi
+          # New leader must be node_1 or node_2 (not isolated node_0), observed after cut.
+          NEW_HTTP=""
+          NEW_NODE=""
+          for _ in $(seq 1 100); do
+            s1=$(raft_state "$H1")
+            s2=$(raft_state "$H2")
+            if [ "$s1" = "Leader" ]; then NEW_HTTP=$H1; NEW_NODE=node_1; break; fi
+            if [ "$s2" = "Leader" ]; then NEW_HTTP=$H2; NEW_NODE=node_2; break; fi
+            sleep 0.1
+          done
+          if [ -z "$NEW_HTTP" ] || [ -z "$NEW_NODE" ]; then finish "UNKNOWN reason=no_new_leader"; fi
+          if [ "$(raft_state "$NEW_HTTP")" != "Leader" ]; then finish "UNKNOWN reason=no_new_leader"; fi
+          code=$(curl -sS -o "${DIR}/query.out" -w "%{http_code}" --max-time 5 -G "http://${NEW_HTTP}/db/query" --data-urlencode "q=SELECT v FROM kv WHERE k='${KEY}'" --data-urlencode "level=strong" || true)
+          if [ "$code" = "000" ]; then finish "UNKNOWN reason=read_timeout"; fi
+          if [ "$code" != "200" ]; then finish "UNKNOWN reason=read_failed http=${code}"; fi
+          kind=$(query_kind < "${DIR}/query.out")
+          case "$kind" in
+            present) finish "PASS read_from=${NEW_NODE} raft_state=Leader after_cut=yes" ;;
+            missing) finish "LOST WRITE read_from=${NEW_NODE} raft_state=Leader after_cut=yes value_missing=yes" ;;
+            error) finish "UNKNOWN reason=read_error" ;;
+            *) finish "UNKNOWN reason=read_malformed" ;;
+          esac
+        ) &
+        # exec so the PID Fuss recorded is rqlited, which owns the Raft sockets
+        exec ${binary} -node-id "node_${i}" \
+          -http-addr "$HTTP" \
+          -raft-addr "$RAFT" \
+          -raft-adv-addr "$ADV" \
+          "${data_dir}/rqlite"
+      else
+        for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do
+          [ -f "${dir}/http_0" ] && break
+          sleep 0.2
+        done
+        exec ${binary} -node-id "node_${i}" \
+          -http-addr "$HTTP" \
+          -raft-addr "$RAFT" \
+          -raft-adv-addr "$ADV" \
+          -join "$JOIN0" \
+          -join-attempts 30 \
+          -join-interval 500ms \
+          "${data_dir}/rqlite"
+      fi
+  ready:
+    command:
+      - /bin/sh
+      - -c
+      - |
+        curl -sf "http://$(cat ${data_dir}/http_addr)/readyz"
+    contains: "node ok"
+    timeout: 30s
+  stop_grace: 2s
+fault:
+  isolate:
+    node: node_0
+    direction: both
+  after:
+    file:
+      glob: "${dir}/cut_now"
+      contains: NOW
+      poll: 10ms
+      timeout: 15s
+kill:
+  at: file
+  file:
+    glob: "${dir}/drive_done"
+    contains: DONE
+    poll: 10ms
+    timeout: 45s
+check:
+  command:
+    command: ["/bin/cat", "${dir}/result.txt"]
+    as: out
+  rules:
+    - if: { out_contains: "LOST WRITE read_from=node_1 raft_state=Leader after_cut=yes value_missing=yes" }
+      verdict: "LOST WRITE"
+    - if: { out_contains: "LOST WRITE read_from=node_2 raft_state=Leader after_cut=yes value_missing=yes" }
+      verdict: "LOST WRITE"
+    # PASS only if the strong read was from node_1 or node_2 as Leader after cut.
+    - if: { out_contains: "PASS read_from=node_1 raft_state=Leader after_cut=yes" }
+      verdict: PASS
+    - if: { out_contains: "PASS read_from=node_2 raft_state=Leader after_cut=yes" }
+      verdict: PASS
+    - if: { out_contains: "UNKNOWN" }
+      verdict: UNKNOWN
+    - else: FAIL

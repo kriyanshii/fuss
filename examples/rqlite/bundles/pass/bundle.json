@@ -1,0 +1,37 @@
+{
+  "format": 1,
+  "fuss_revision": "a6505d93949767ff9857e8433588448ef1c6ba00",
+  "target": {
+    "name": "rqlite",
+    "binary": "rqlited",
+    "version": "rqlited v10.7.4 darwin arm64 go1.27.4 sqlite3.54.1 (commit 4452a98, compiler gc)",
+    "checksum": "sha256:54d15cd9f55e0ab179c788fd7171b2b6cb1c5196b770ae6096a0b120ca86edcd"
+  },
+  "seed": 1,
+  "scenario": "examples/rqlite/rqlite.yaml",
+  "scenario_sha256": "sha256:344fa691725504d6dd3f091af46f04049a07f11b3549637f95d7cb65850333d8",
+  "inputs": {
+    "seed": 1,
+    "n": 1,
+    "scenario": "scenario.yaml"
+  },
+  "ack": {
+    "line": "ack 1-0",
+    "key": "1-0"
+  },
+  "cut": {
+    "target": "node_0",
+    "direction": "both",
+    "trigger_fired": true,
+    "links_cut": 4,
+    "links_total": 6,
+    "cut_time": "2026-11-25T11:11:58.493728Z"
+  },
+  "read": {
+    "text": "PASS read_from=node_1 raft_state=Leader after_cut=yes",
+    "from": "node_1",
+    "ok": true,
+    "missing": false
+  },
+  "verdict": "PASS"
+}

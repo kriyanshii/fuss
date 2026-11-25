@@ -1,0 +1,37 @@
+{
+  "format": 1,
+  "fuss_revision": "a6505d93949767ff9857e8433588448ef1c6ba00",
+  "target": {
+    "name": "repkv-bug",
+    "binary": "repkv",
+    "version": "repkv",
+    "checksum": "sha256:7cf53615cbc09abc7e03d5e7bfbe1c8839ba238defe5c828220f32d67b79042d"
+  },
+  "seed": 1,
+  "scenario": "examples/repkv/repkv-bug.yaml",
+  "scenario_sha256": "sha256:305d284fdef8afb8aad8e166143f9b55a3eb27f9a9e93d60a585154771c27813",
+  "inputs": {
+    "seed": 1,
+    "n": 1,
+    "scenario": "scenario.yaml"
+  },
+  "ack": {
+    "line": "ack 1-0",
+    "key": "1-0"
+  },
+  "cut": {
+    "target": "node_0",
+    "direction": "both",
+    "trigger_fired": true,
+    "links_cut": 4,
+    "links_total": 6,
+    "cut_time": "2026-11-25T11:11:56.347677Z"
+  },
+  "read": {
+    "text": "LOST WRITE read_from=node_1 leader=self after_cut=yes value_missing=yes",
+    "from": "node_1",
+    "ok": true,
+    "missing": true
+  },
+  "verdict": "LOST WRITE"
+}

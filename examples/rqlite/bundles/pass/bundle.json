@@ -9,7 +9,7 @@
   },
   "seed": 1,
   "scenario": "examples/rqlite/rqlite.yaml",
-  "scenario_sha256": "sha256:344fa691725504d6dd3f091af46f04049a07f11b3549637f95d7cb65850333d8",
+  "scenario_sha256": "sha256:2262e35bb0b9ffd788e9a7bd674af63221c4bdb8723bae067253ea77e552b4b3",
   "inputs": {
     "seed": 1,
     "n": 1,

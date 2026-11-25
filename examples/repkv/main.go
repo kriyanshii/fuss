@@ -521,7 +521,7 @@ func runVerify(dir string, n int, key, cutNode, readFault string) int {
 		}
 	}
 	kind, reason := classifyRead(status, body, err, "v")
-	fmt.Println(verifyLine(kind, reason, newLead))
+	fmt.Println(verifyLine(kind, reason, newLead, key))
 	return 0
 }
 
@@ -562,12 +562,12 @@ func classifyRead(status int, body string, err error, want string) (kind, reason
 	}
 }
 
-func verifyLine(kind, reason string, node int) string {
+func verifyLine(kind, reason string, node int, key string) string {
 	switch kind {
 	case "pass":
-		return fmt.Sprintf("PASS read_from=node_%d leader=self after_cut=yes", node)
+		return fmt.Sprintf("PASS read_from=node_%d leader=self after_cut=yes key=%s", node, key)
 	case "lost":
-		return fmt.Sprintf("LOST WRITE read_from=node_%d leader=self after_cut=yes value_missing=yes", node)
+		return fmt.Sprintf("LOST WRITE read_from=node_%d leader=self after_cut=yes value_missing=yes key=%s", node, key)
 	default:
 		if reason == "" {
 			reason = "unspecified"

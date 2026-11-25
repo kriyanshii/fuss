@@ -60,9 +60,12 @@ type yamlTopoPeers struct {
 	ViaProxy bool   `yaml:"via_proxy"`
 }
 
-// yamlFaultIsolate is fault.isolate: a string "node_0", or {node, direction}.
+// yamlFaultIsolate is fault.isolate: a string "node_0", or {node, node_file, direction}.
+// node_file is read when the trigger fires, so a scenario can name the target
+// after it has seen which process is leader.
 type yamlFaultIsolate struct {
 	Node      string `yaml:"node"`
+	NodeFile  string `yaml:"node_file"`
 	Direction string `yaml:"direction"` // "both" (default) or "inbound"
 }
 
@@ -74,12 +77,14 @@ func (f *yamlFaultIsolate) UnmarshalYAML(value *yaml.Node) error {
 	case yaml.MappingNode:
 		var raw struct {
 			Node      string `yaml:"node"`
+			NodeFile  string `yaml:"node_file"`
 			Direction string `yaml:"direction"`
 		}
 		if err := value.Decode(&raw); err != nil {
 			return err
 		}
 		f.Node = raw.Node
+		f.NodeFile = raw.NodeFile
 		f.Direction = raw.Direction
 		return nil
 	case yaml.AliasNode:
@@ -92,7 +97,19 @@ func (f *yamlFaultIsolate) UnmarshalYAML(value *yaml.Node) error {
 	}
 }
 
-func (f yamlFaultIsolate) active() bool { return strings.TrimSpace(f.Node) != "" }
+func (f yamlFaultIsolate) active() bool {
+	return strings.TrimSpace(f.Node) != "" || strings.TrimSpace(f.NodeFile) != ""
+}
+
+// isolatePinsNode reports whether replay must cut the same node index.
+// A node_file scenario names the leader at runtime, so a later run may cut
+// a different index and still isolate the elected leader.
+func (y *YAMLAdapter) isolatePinsNode() bool {
+	if strings.TrimSpace(y.cfg.Fault.Isolate.NodeFile) != "" && strings.TrimSpace(y.cfg.Fault.Isolate.Node) == "" {
+		return false
+	}
+	return true
+}
 
 func (f yamlFaultIsolate) direction() string {
 	d := strings.TrimSpace(f.Direction)
@@ -334,8 +351,11 @@ func LoadYAMLTarget(path string) (*YAMLAdapter, error) {
 	if mode == "per_node" && cfg.Fault.Isolate.active() && dir == "both" {
 		return nil, fmt.Errorf("target-config %s: topology.proxy_mode per_node cannot use fault.isolate direction both; per_node proxies can't separate one node's outbound links (use direction: inbound)", path)
 	}
-	if cfg.Fault.Isolate.active() && cfg.Fault.Isolate.Node == "" {
-		return nil, fmt.Errorf("target-config %s: fault.isolate.node is required", path)
+	if strings.TrimSpace(cfg.Fault.Isolate.Node) != "" && strings.TrimSpace(cfg.Fault.Isolate.NodeFile) != "" {
+		return nil, fmt.Errorf("target-config %s: fault.isolate accepts node or node_file, not both", path)
+	}
+	if cfg.Fault.Isolate.active() && strings.TrimSpace(cfg.Fault.Isolate.Node) == "" && strings.TrimSpace(cfg.Fault.Isolate.NodeFile) == "" {
+		return nil, fmt.Errorf("target-config %s: fault.isolate.node or fault.isolate.node_file is required", path)
 	}
 	resume := cfg.Fault.Pause.resume()
 	switch resume {
@@ -643,7 +663,8 @@ type isolateState struct {
 	Direction    string
 	TriggerFired bool
 	CutTime      time.Time
-	Done         bool // waiter finished (fired or timed out)
+	Done         bool   // waiter finished (fired or timed out)
+	Fault        string // set when the trigger fired but no node could be cut
 }
 
 type pauseState struct {
@@ -1166,17 +1187,47 @@ func (y *YAMLAdapter) watchIsolate(t *BaseTrial, rt *topologyRuntime) {
 		return
 	}
 	rt.Isolate.TriggerFired = true
-	target := expandTemplates(y.cfg.Fault.Isolate.Node, vars)
+	target, terr := y.isolateTarget(vars)
 	rt.Isolate.Target = target
 	direction := y.cfg.Fault.Isolate.direction()
 	rt.Isolate.Direction = direction
+	if terr != nil {
+		rt.Isolate.Fault = terr.Error()
+		rt.mu.Unlock()
+		return
+	}
 	rt.mu.Unlock()
 
 	idx, perr := parseIsolateNode(target)
 	if perr != nil {
+		rt.mu.Lock()
+		rt.Isolate.Fault = perr.Error()
+		rt.mu.Unlock()
 		return
 	}
 	y.cutIsolate(rt, idx, direction, t.Dir())
+}
+
+// isolateTarget is the node name at the moment the trigger fires.
+// node_file wins over a static node: the scenario writes node_<index> there
+// after it has observed the leader.
+func (y *YAMLAdapter) isolateTarget(vars map[string]string) (string, error) {
+	if file := strings.TrimSpace(y.cfg.Fault.Isolate.NodeFile); file != "" {
+		path := expandTemplates(file, vars)
+		b, err := os.ReadFile(path)
+		if err != nil {
+			return "", fmt.Errorf("node file: %w", err)
+		}
+		line := strings.TrimSpace(string(b))
+		if i := strings.IndexAny(line, "\r\n"); i >= 0 {
+			line = strings.TrimSpace(line[:i])
+		}
+		if line == "" {
+			return "", fmt.Errorf("node file %s is empty", path)
+		}
+		return line, nil
+	}
+	return strings.TrimSpace(expandTemplates(y.cfg.Fault.Isolate.Node, vars)), nil
 }
 
 func (y *YAMLAdapter) watchPause(t *BaseTrial, rt *topologyRuntime) {
@@ -1411,6 +1462,10 @@ func (y *YAMLAdapter) checkIsolate(rt *topologyRuntime) CheckResult {
 		rt.mu.Lock()
 		done := rt.Isolate != nil && rt.Isolate.Done
 		fired := rt.Isolate != nil && rt.Isolate.TriggerFired
+		fault := ""
+		if rt.Isolate != nil {
+			fault = rt.Isolate.Fault
+		}
 		rt.mu.Unlock()
 		if done {
 			if !fired {
@@ -1418,6 +1473,13 @@ func (y *YAMLAdapter) checkIsolate(rt *topologyRuntime) CheckResult {
 					Verdict:  "UNKNOWN",
 					Evidence: 1,
 					Problems: []error{fmt.Errorf("fault.isolate: trigger did not fire")},
+				}
+			}
+			if fault != "" {
+				return CheckResult{
+					Verdict:  "UNKNOWN",
+					Evidence: 1,
+					Problems: []error{fmt.Errorf("fault.isolate: %s", fault)},
 				}
 			}
 			break

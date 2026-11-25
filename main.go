@@ -413,11 +413,11 @@ func runAdapter(adapter Adapter, targetFlag string, seed int64, n int, doKill bo
 	})
 
 	if bundleRun.want != nil {
-		printReplayReport(bundleRun.want, bundleRun.got)
+		printReplayReport(bundleRun.want, bundleRun.got, bundleRun.pinNode)
 		if bundleRun.got == nil {
 			return exitSetup
 		}
-		if err := replayMatches(bundleRun.want, *bundleRun.got); err != nil {
+		if err := replayMatches(bundleRun.want, *bundleRun.got, bundleRun.pinNode); err != nil {
 			fmt.Fprintf(os.Stderr, "replay: %s\n", err)
 			return exitFail
 		}

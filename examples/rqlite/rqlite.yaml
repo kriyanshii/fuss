@@ -164,8 +164,8 @@ topology:
           if [ "$code" != "200" ]; then finish "UNKNOWN reason=read_failed http=${code}"; fi
           kind=$(query_kind < "${DIR}/query.out")
           case "$kind" in
-            present) finish "PASS read_from=${NEW_NODE} raft_state=Leader after_cut=yes" ;;
-            missing) finish "LOST WRITE read_from=${NEW_NODE} raft_state=Leader after_cut=yes value_missing=yes" ;;
+            present) finish "PASS read_from=${NEW_NODE} raft_state=Leader after_cut=yes key=${KEY}" ;;
+            missing) finish "LOST WRITE read_from=${NEW_NODE} raft_state=Leader after_cut=yes value_missing=yes key=${KEY}" ;;
             error) finish "UNKNOWN reason=read_error" ;;
             *) finish "UNKNOWN reason=read_malformed" ;;
           esac

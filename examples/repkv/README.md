@@ -27,13 +27,13 @@ acknowledged write, the applied partition, and the read. From a clean checkout:
 That rebuilds Fuss and repkv, runs the saved scenario and seed, and prints:
 
 ```
-ack: ack 1-0
+ack: key=1-0
 cut: target=node_0 direction=both links_cut=4 trigger_fired=true
-read: LOST WRITE read_from=node_1 leader=self after_cut=yes value_missing=yes
+read: key=1-0 read_from=node_1 status=ok found=false
 verdict: LOST WRITE
 ```
 
-Exit 0 means the new run showed those three facts and the same verdict. The
+Exit 0 means the new run showed those three facts, the read named the same key as the acknowledgement, and the verdict matched. The
 target's own exit status for bug mode is 1, because the verdict is LOST WRITE.
 
 `-adapter=repkv` loads `examples/repkv/repkv.yaml`. Prefer `-target-config` so

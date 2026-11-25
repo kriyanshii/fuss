@@ -346,6 +346,16 @@ one node and leaves the process running.
 
 - String form: `isolate: node_0` (direction defaults to `both`).
 - Object form: `isolate: { node: node_0, direction: inbound }`.
+- Runtime target: `isolate: { node_file: ${dir}/leader_node, direction: both }`.
+  When the trigger fires, Fuss reads the first line of that file and cuts
+  that node. The scenario writes `node_0`, `node_1`, or `node_2` after it
+  has seen which member is leader, then writes the trigger file. `node` and
+  `node_file` cannot both be set. A missing, empty, or unreadable file cuts
+  nothing, and the trial is `UNKNOWN`. Replay of a `node_file` scenario
+  accepts a different node index when that index was the leader before a
+  two-way cut and another member read the same key. A scenario that sets
+  `node` still requires that same index. If the leader changes before the
+  cut and the applied target is not that leader, the trial is `UNKNOWN`.
 
 **`fault.isolate.direction`** (string, default: `both`). Which links to cut:
 

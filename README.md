@@ -41,26 +41,26 @@ Replay the saved bug-mode failure from a clean checkout:
 The command rebuilds Fuss and repkv, runs the saved scenario and seed, and prints the acknowledgement, the applied partition, and the read:
 
 ```
-ack: ack 1-0
+ack: key=1-0
 cut: target=node_0 direction=both links_cut=4 trigger_fired=true
-read: LOST WRITE read_from=node_1 leader=self after_cut=yes value_missing=yes
+read: key=1-0 read_from=node_1 status=ok found=false
 verdict: LOST WRITE
 ```
 
-That block is a replay on this machine. Exit 0 means the new run showed those three facts and the same verdict.
+That block is a replay on this machine. Exit 0 means the new run showed those three facts, the read named the same key as the acknowledgement, and the verdict matched. repkv pins `node_0`, so the cut target must be the same node. An etcd scenario that writes the leader into `node_file` prints `saved=` and `replay=` targets. A different index still passes when that index was the leader before the cut.
 
 ## The same file, on rqlite and etcd
 
-rqlite and etcd use the same shape: three processes, one acknowledged write, a symmetric partition of `node_0`, then a read from a new leader. Fuss writes `${dir}/isolate_applied.json` when the cut is applied. The scenario reads only after that file names `node_0` with `trigger_fired` true and `links_cut` greater than 0. A timeout, a failed query, or a malformed body is `UNKNOWN` with a reason. `LOST WRITE` requires a successful read that shows the value is missing.
+rqlite and etcd use the same shape: three processes, one acknowledged write, a symmetric partition, then a read from a new leader. rqlite cuts `node_0` after that node has reported itself leader. etcd writes the elected leader's name to `${dir}/leader_node` and Fuss cuts that member. Fuss writes `${dir}/isolate_applied.json` when the cut is applied. The scenario reads only after that file names the intended member with `trigger_fired` true and `links_cut` greater than 0. A timeout, a failed query, or a malformed body is `UNKNOWN` with a reason. `LOST WRITE` requires a successful read that shows the value is missing. If etcd's leader changes between the acknowledgement and the cut, the verdict is `UNKNOWN` and there is no post-cut read.
 
 ```bash
 ./fuss -target-config=examples/rqlite/rqlite.yaml -seed=1 -n=1 -json
 ./fuss -target-config=examples/etcd/etcd.yaml -seed=1 -n=1 -json
 ```
 
-rqlite v10.7.4, seed 1, on this machine: `PASS read_from=node_2 raft_state=Leader after_cut=yes`. The write body was checked before the acknowledgement. Replaying `examples/rqlite/bundles/pass` printed the same acknowledgement (`ack 1-0`), cut (`node_0`, `links_cut=4`), and read.
+rqlite v10.7.4, seed 1, on this machine: `PASS read_from=node_2 raft_state=Leader after_cut=yes`. The write body was checked before the acknowledgement. Replaying `examples/rqlite/bundles/pass` printed `ack: key=1-0`, a 4-link cut of `node_0`, and `read: key=1-0 read_from=node_1 status=ok found=true`.
 
-etcd v3.7.4 always cuts `node_0`. Seeds 1 to 4 on this machine were `UNKNOWN reason=leader_not_node_0`, so they did not acknowledge a write or read it back. Any member can win the first election. This version reports UNKNOWN when `node_0` is not the leader.
+etcd v3.7.4, seeds 1 to 4 on this machine, all PASS. The cut target was `node_0`, `node_0`, `node_1`, and `node_2`. Each read came from a different member and included that leader's id (`leader_id`) and the cut target (`cut_target`). `links_cut` was 4 and `trigger_fired` was true. A saved seed-1 run is `examples/etcd/bundles/pass`.
 
 Save a run and replay it with the same bundle format:
 
@@ -75,10 +75,11 @@ The bundle stores the scenario, the Fuss revision, the target version and checks
 
 - repkv, seeds 1 to 10 on this machine: correct mode 10 PASS, bug mode 10 LOST WRITE, read-error mode 10 UNKNOWN. The PASS and LOST WRITE trials had an applied partition and a read from the surviving leader.
 - rqlite v10.7.4, seed 1: PASS after a strong read from `node_2`, with the cut applied (`links_cut=4`).
-- etcd v3.7.4, seeds 1 to 4: UNKNOWN because `node_0` was not the leader before the cut.
+- etcd v3.7.4, seeds 1 to 4: PASS after cutting the elected leader and reading the value from a survivor.
 
 Limits, stated plainly:
 - The rqlite fault is a symmetric isolate of `node_0` after that node has reported itself leader. rqlite still advertises one Raft address per node; `per_node_owned` tags the source process, so node 0's outbound heartbeats are refused and nodes 1 and 2 keep talking. There is no pause.
+- The etcd fault is a symmetric isolate of whichever member acknowledged the write. Fuss reads that name from `${dir}/leader_node` when the trigger fires. The member id in the result is the id etcd assigned at startup.
 - A PASS is the documented guarantee for this one scenario and this one fault.
 - No new bugs found yet.
 

@@ -28,14 +28,14 @@ func TestClassifyRead(t *testing.T) {
 			if kind != tc.kind || why != tc.why {
 				t.Fatalf("classifyRead = %s %s, want %s %s", kind, why, tc.kind, tc.why)
 			}
-			line := verifyLine(kind, why, 1)
+			line := verifyLine(kind, why, 1, "1-0")
 			switch kind {
 			case "pass":
-				if line != "PASS read_from=node_1 leader=self after_cut=yes" {
+				if line != "PASS read_from=node_1 leader=self after_cut=yes key=1-0" {
 					t.Fatalf("line %q", line)
 				}
 			case "lost":
-				if line != "LOST WRITE read_from=node_1 leader=self after_cut=yes value_missing=yes" {
+				if line != "LOST WRITE read_from=node_1 leader=self after_cut=yes value_missing=yes key=1-0" {
 					t.Fatalf("line %q", line)
 				}
 			default:

@@ -20,6 +20,9 @@ type bundleCLI struct {
 	saveDir string
 	want    *replayBundle
 	got     *replayFacts
+	// pinNode is true when the scenario names fault.isolate.node.
+	// A node_file scenario isolates whoever was leader, so the node index may change.
+	pinNode bool
 }
 
 var bundleRun bundleCLI
@@ -65,13 +68,18 @@ type bundleCut struct {
 	LinksCut     int    `json:"links_cut"`
 	LinksTotal   int    `json:"links_total"`
 	CutTime      string `json:"cut_time,omitempty"`
+	LeaderID     string `json:"leader_id,omitempty"`
+	LeaderNode   string `json:"leader_node,omitempty"`
 }
 
 type bundleRead struct {
-	Text    string `json:"text"`
-	From    string `json:"from,omitempty"`
-	OK      bool   `json:"ok"`
-	Missing bool   `json:"missing"`
+	Text     string `json:"text"`
+	Key      string `json:"key,omitempty"`
+	From     string `json:"from,omitempty"`
+	OK       bool   `json:"ok"`
+	Missing  bool   `json:"missing"`
+	LeaderID string `json:"leader_id,omitempty"`
+	Reason   string `json:"reason,omitempty"`
 }
 
 type replayFacts struct {
@@ -154,15 +162,36 @@ func parseReadLine(text string) bundleRead {
 		r.OK = true
 	}
 	r.Missing = strings.Contains(r.Text, "value_missing=yes")
-	const key = "read_from="
-	if i := strings.Index(r.Text, key); i >= 0 {
-		rest := r.Text[i+len(key):]
-		if j := strings.IndexAny(rest, " \n\t"); j >= 0 {
-			rest = rest[:j]
-		}
-		r.From = rest
-	}
+	r.From = lineField(r.Text, "read_from=")
+	r.LeaderID = lineField(r.Text, "leader_id=")
+	r.Key = lineField(r.Text, "key=")
+	r.Reason = lineField(r.Text, "reason=")
 	return r
+}
+
+// formatReplayRead is the labeled read line. status=ok means the query
+// completed and was parsed. found is false when that query showed the key missing.
+func formatReplayRead(r bundleRead) string {
+	if !r.OK {
+		return fmt.Sprintf("key=%s read_from=%s status=failed", r.Key, r.From)
+	}
+	found := "true"
+	if r.Missing {
+		found = "false"
+	}
+	return fmt.Sprintf("key=%s read_from=%s status=ok found=%s", r.Key, r.From, found)
+}
+
+func lineField(text, key string) string {
+	i := strings.Index(text, key)
+	if i < 0 {
+		return ""
+	}
+	rest := text[i+len(key):]
+	if j := strings.IndexAny(rest, " \n\t"); j >= 0 {
+		rest = rest[:j]
+	}
+	return rest
 }
 
 func cutFromEvidence(ev map[string]any) bundleCut {
@@ -197,6 +226,11 @@ func collectReplayFacts(result *adapterTrialResult, binaryPath string) replayFac
 				read = parseReadLine(s)
 			}
 		}
+		if cut.LeaderID == "" {
+			cut.LeaderID = read.LeaderID
+		}
+		// cut_target in the check line is the member the scenario observed as leader.
+		cut.LeaderNode = lineField(read.Text, "cut_target=")
 	}
 	sum, _ := fileSHA256(binaryPath)
 	return replayFacts{
@@ -276,7 +310,9 @@ func loadReplayBundle(dir string) (*replayBundle, error) {
 // replayMatches reports why a new run does not show the saved failure or pass.
 // A lost-write bundle matches only when the new run recorded an acknowledgement,
 // an applied partition, and a successful read that found the value missing.
-func replayMatches(want *replayBundle, got replayFacts) error {
+// pinNode requires the same node index. Otherwise the scenario isolates the
+// elected leader, and a different index still matches when that index was the leader.
+func replayMatches(want *replayBundle, got replayFacts, pinNode bool) error {
 	var problems []string
 	if got.Verdict != want.Verdict {
 		problems = append(problems, fmt.Sprintf("verdict %s, bundle %s", got.Verdict, want.Verdict))
@@ -288,16 +324,23 @@ func replayMatches(want *replayBundle, got replayFacts) error {
 	}
 	if !got.Cut.TriggerFired || got.Cut.LinksCut < 1 {
 		problems = append(problems, "partition was not applied")
-	} else if want.Cut.Target != "" && got.Cut.Target != want.Cut.Target {
-		problems = append(problems, fmt.Sprintf("cut target %s, bundle %s", got.Cut.Target, want.Cut.Target))
+	} else if pinNode {
+		if want.Cut.Target != "" && got.Cut.Target != want.Cut.Target {
+			problems = append(problems, fmt.Sprintf("cut target %s, bundle %s", got.Cut.Target, want.Cut.Target))
+		}
+	} else if err := electedLeaderCut(got); err != nil {
+		problems = append(problems, err.Error())
 	}
 	switch want.Verdict {
 	case "LOST WRITE", "PASS":
 		if !got.Read.OK {
 			problems = append(problems, "read was not a successful read after the cut")
 		}
-		if got.Read.From != "node_1" && got.Read.From != "node_2" {
+		if got.Read.From == "" || !strings.HasPrefix(got.Read.From, "node_") || got.Read.From == got.Cut.Target {
 			problems = append(problems, "read was not from a surviving leader")
+		}
+		if got.Ack.Key == "" || got.Read.Key == "" || got.Ack.Key != got.Read.Key {
+			problems = append(problems, fmt.Sprintf("ack key %q, read key %q", got.Ack.Key, got.Read.Key))
 		}
 	}
 	if want.Verdict == "LOST WRITE" && !got.Read.Missing {
@@ -312,7 +355,40 @@ func replayMatches(want *replayBundle, got replayFacts) error {
 	return fmt.Errorf("%s", strings.Join(problems, "; "))
 }
 
-func printReplayReport(want *replayBundle, got *replayFacts) {
+// electedLeaderCut checks that this run applied a two-way cut to the member
+// it observed as leader before the cut.
+func electedLeaderCut(got replayFacts) error {
+	if got.Cut.Direction != "both" {
+		return fmt.Errorf("cut direction %s, want both", got.Cut.Direction)
+	}
+	if got.Cut.LeaderNode == "" {
+		return fmt.Errorf("leader before the cut was not recorded")
+	}
+	if got.Cut.Target != got.Cut.LeaderNode {
+		return fmt.Errorf("cut %s, leader before the cut was %s", got.Cut.Target, got.Cut.LeaderNode)
+	}
+	return nil
+}
+
+func formatCutLine(saved string, cut bundleCut, pinNode bool) string {
+	leaderID := cut.LeaderID
+	if pinNode {
+		line := fmt.Sprintf("cut: target=%s direction=%s links_cut=%d trigger_fired=%t",
+			cut.Target, cut.Direction, cut.LinksCut, cut.TriggerFired)
+		if leaderID != "" {
+			line += " leader_id=" + leaderID
+		}
+		return line
+	}
+	line := fmt.Sprintf("cut: saved=%s replay=%s direction=%s links_cut=%d trigger_fired=%t",
+		saved, cut.Target, cut.Direction, cut.LinksCut, cut.TriggerFired)
+	if leaderID != "" {
+		line += " leader_id=" + leaderID
+	}
+	return line
+}
+
+func printReplayReport(want *replayBundle, got *replayFacts, pinNode bool) {
 	fmt.Printf("replay: seed=%d fuss_revision=%s target_version=%s target_checksum=%s\n",
 		want.Seed, want.FussRevision, want.Target.Version, want.Target.Checksum)
 	if got == nil {
@@ -328,10 +404,17 @@ func printReplayReport(want *replayBundle, got *replayFacts) {
 	if got.Version != "" && got.Version != want.Target.Version {
 		fmt.Printf("replay: this_target_version=%s\n", got.Version)
 	}
-	fmt.Printf("ack: %s\n", got.Ack.Line)
-	fmt.Printf("cut: target=%s direction=%s links_cut=%d trigger_fired=%t\n",
-		got.Cut.Target, got.Cut.Direction, got.Cut.LinksCut, got.Cut.TriggerFired)
-	fmt.Printf("read: %s\n", got.Read.Text)
+	fmt.Printf("ack: key=%s\n", got.Ack.Key)
+	cut := got.Cut
+	if cut.LeaderID == "" {
+		cut.LeaderID = got.Read.LeaderID
+	}
+	fmt.Println(formatCutLine(want.Cut.Target, cut, pinNode))
+	fmt.Printf("read: %s\n", formatReplayRead(got.Read))
+	if got.Verdict == "UNKNOWN" && got.Read.Reason != "" {
+		fmt.Printf("verdict: UNKNOWN reason=%s\n", got.Read.Reason)
+		return
+	}
 	fmt.Printf("verdict: %s\n", got.Verdict)
 }
 
@@ -355,5 +438,6 @@ func replaySavedBundle(dir string, json bool) int {
 	jsonOut = json
 	bundleRun.want = b
 	bundleRun.got = nil
+	bundleRun.pinNode = adapter.isolatePinsNode()
 	return runAdapter(adapter, "", b.Seed, 1, true, "")
 }

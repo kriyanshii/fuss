@@ -637,6 +637,82 @@ check:
 	}
 }
 
+func TestYAMLTopologyIsolateNodeFile(t *testing.T) {
+	buildTopologyHold(t)
+	a, err := LoadYAMLTarget("testdata/yaml/topology/isolate_node_file.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bin, _, err := a.ResolveBinary("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	at, err := a.Init(1, dir, bin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	log, err := os.Create(filepath.Join(dir, "log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer log.Close()
+	hold, err := a.Start(at, log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rt := at.Data()["topology"].(*topologyRuntime)
+	t.Cleanup(func() {
+		a.stopTopology(rt)
+		if hold.Process != nil {
+			_ = hold.Process.Kill()
+			_ = hold.Wait()
+		}
+	})
+	if !rt.AllReady {
+		t.Fatal("expected all ready")
+	}
+	if err := os.WriteFile(filepath.Join(dir, "leader_node"), []byte("node_1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "cut_now"), []byte("NOW\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		b, err := os.ReadFile(filepath.Join(dir, "isolate_applied.json"))
+		if err == nil {
+			var doc isolateAppliedDoc
+			if json.Unmarshal(b, &doc) == nil && doc.TriggerFired && doc.Target == "node_1" && doc.LinksCut == 4 {
+				rt.mu.Lock()
+				target := rt.Isolate.Target
+				rt.mu.Unlock()
+				if target != "node_1" {
+					t.Fatalf("runtime target %s", target)
+				}
+				return
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("isolate_applied.json = %s (%v)", b, err)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+func TestIsolateNodeAndNodeFileRejected(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "target.yaml")
+	body := []byte("name: both\nbinary: { default: true }\nfault:\n  isolate:\n    node: node_0\n    node_file: ${dir}/leader_node\n    direction: both\n")
+	if err := os.WriteFile(path, body, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := LoadYAMLTarget(path)
+	if err == nil || !strings.Contains(err.Error(), "not both") {
+		t.Fatal(err)
+	}
+}
+
 func assertIsolateAppliedFile(t *testing.T, dir string, wantCut int) {
 	t.Helper()
 	b, err := os.ReadFile(filepath.Join(dir, "isolate_applied.json"))

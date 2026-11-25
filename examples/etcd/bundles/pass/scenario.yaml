@@ -1,0 +1,329 @@
+# etcd v3.7.4: per_node_owned peer proxies, symmetric isolate of the elected leader, no pause.
+# Requires the v3.7.4 etcd and etcdctl binaries (etcdctl beside etcd, or on PATH).
+# Not run in CI.
+name: etcd
+binary:
+  default: etcd
+  extra: ["./examples/etcd/etcd"]
+topology:
+  nodes: 3
+  data_dir: "${dir}/node${i}"
+  ports:
+    base: 0
+  proxy_mode: per_node_owned
+  peers:
+    port_name: peer
+    via_proxy: true
+  start:
+    - /bin/sh
+    - -c
+    - |
+      set -e
+      case "${i}" in
+        0|1|2) ;;
+        *) echo "bad i=${i}" >&2; exit 1 ;;
+      esac
+      HTTP_PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')
+      HTTP="127.0.0.1:${HTTP_PORT}"
+      echo "$HTTP" > "${data_dir}/http_addr"
+      echo "$HTTP" > "${dir}/http_${i}"
+      PEER_LISTEN="http://127.0.0.1:${port}"
+      ADV0="http://${node_proxy_addr_0}"
+      ADV1="http://${node_proxy_addr_1}"
+      ADV2="http://${node_proxy_addr_2}"
+      case "${i}" in
+        0) ADV="$ADV0" ;;
+        1) ADV="$ADV1" ;;
+        2) ADV="$ADV2" ;;
+      esac
+      CLUSTER="node_0=${ADV0},node_1=${ADV1},node_2=${ADV2}"
+      if [ "${i}" = "0" ]; then
+        (
+          DIR="${dir}"
+          KEY="${seed}-0"
+          RESULT="${DIR}/result.txt"
+          CUT="${DIR}/cut_now"
+          DONE="${DIR}/drive_done"
+          ETCDCTL="$(dirname ${binary})/etcdctl"
+          if [ ! -x "$ETCDCTL" ]; then ETCDCTL="etcdctl"; fi
+          export ETCDCTL_API=3
+          wait_http() {
+            for _ in $(seq 1 150); do
+              [ -f "${DIR}/http_0" ] && [ -f "${DIR}/http_1" ] && [ -f "${DIR}/http_2" ] && return 0
+              sleep 0.1
+            done
+            return 1
+          }
+          wait_ready() {
+            h="$1"
+            for _ in $(seq 1 150); do
+              if curl -sf "http://${h}/health" | grep -q '"health":"true"'; then
+                return 0
+              fi
+              sleep 0.1
+            done
+            return 1
+          }
+          status_role() {
+            "$ETCDCTL" --endpoints="http://$1" --dial-timeout=2s --command-timeout=5s endpoint status -w json 2>/dev/null | python3 -c 'import textwrap; exec(textwrap.dedent("""
+              import json, sys
+              def ident(v):
+                  if isinstance(v, bool) or v is None:
+                      return None
+                  if isinstance(v, int):
+                      return str(v)
+                  if isinstance(v, str) and v.strip():
+                      return v.strip()
+                  return None
+              try:
+                  rows = json.load(sys.stdin)
+              except Exception:
+                  sys.exit(1)
+              if not isinstance(rows, list) or not rows or not isinstance(rows[0], dict):
+                  sys.exit(1)
+              st = rows[0].get("Status") or {}
+              header = st.get("header") or {}
+              mid = ident(header.get("member_id"))
+              leader = ident(st.get("leader"))
+              if not mid or not leader:
+                  sys.exit(1)
+              print("leader" if mid == leader else "follower", mid)
+            """))'
+          }
+          elected() {
+            found=0
+            node=""
+            id=""
+            for i in 0 1 2; do
+              case "$i" in
+                0) h="$H0" ;;
+                1) h="$H1" ;;
+                2) h="$H2" ;;
+              esac
+              line=$(status_role "$h") || continue
+              role=${line%% *}
+              mid=${line#* }
+              if [ "$role" = "leader" ]; then
+                found=$((found + 1))
+                node="node_$i"
+                id="$mid"
+              fi
+            done
+            if [ "$found" != 1 ]; then
+              return 1
+            fi
+            ELECT_NODE="$node"
+            ELECT_ID="$id"
+          }
+          cut_applied() {
+            python3 -c 'import textwrap; exec(textwrap.dedent("""
+              import json, sys
+              try:
+                  d = json.load(open(sys.argv[1]))
+              except Exception:
+                  sys.exit(1)
+              ok = (
+                  d.get("target") == sys.argv[2]
+                  and d.get("trigger_fired") is True
+                  and int(d.get("links_cut") or 0) > 0
+              )
+              sys.exit(0 if ok else 1)
+            """))' "$1" "$2"
+          }
+          applied_target() {
+            python3 -c 'import textwrap; exec(textwrap.dedent("""
+              import json, sys
+              try:
+                  d = json.load(open(sys.argv[1]))
+              except Exception:
+                  print("")
+                  raise SystemExit
+              print(d.get("target") or "")
+            """))' "$1"
+          }
+          get_kind() {
+            python3 -c 'import textwrap; exec(textwrap.dedent("""
+              import json, sys, base64
+              try:
+                  d = json.load(sys.stdin)
+              except Exception:
+                  print("malformed")
+                  raise SystemExit
+              if not isinstance(d, dict):
+                  print("malformed")
+                  raise SystemExit
+              kvs = d.get("kvs") or []
+              if not isinstance(kvs, list):
+                  print("malformed")
+                  raise SystemExit
+              if not kvs:
+                  print("missing")
+                  raise SystemExit
+              kv = kvs[0]
+              if not isinstance(kv, dict) or "value" not in kv:
+                  print("malformed")
+                  raise SystemExit
+              try:
+                  val = base64.b64decode(kv["value"]).decode()
+              except Exception:
+                  print("malformed")
+                  raise SystemExit
+              print("present" if val == "ok" else "unexpected")
+            """))'
+          }
+          finish() { echo "$1" > "$RESULT"; echo DONE > "$DONE"; exit 0; }
+          if ! wait_http; then finish "UNKNOWN reason=nodes_not_ready"; fi
+          H0=$(cat "${DIR}/http_0")
+          H1=$(cat "${DIR}/http_1")
+          H2=$(cat "${DIR}/http_2")
+          if ! wait_ready "$H0" || ! wait_ready "$H1" || ! wait_ready "$H2"; then finish "UNKNOWN reason=nodes_not_ready"; fi
+          # Any member can win the first election. Observe that member, then
+          # cut it. A put that never succeeds is UNKNOWN, and is not an ack.
+          LEAD_NODE=""
+          LEAD_ID=""
+          for _ in $(seq 1 100); do
+            if elected; then LEAD_NODE=$ELECT_NODE; LEAD_ID=$ELECT_ID; break; fi
+            sleep 0.1
+          done
+          if [ -z "$LEAD_NODE" ] || [ -z "$LEAD_ID" ]; then finish "UNKNOWN reason=no_leader"; fi
+          case "$LEAD_NODE" in
+            node_0) PUT_HTTP=$H0 ;;
+            node_1) PUT_HTTP=$H1 ;;
+            node_2) PUT_HTTP=$H2 ;;
+            *) finish "UNKNOWN reason=no_leader" ;;
+          esac
+          PUT_OK=0
+          for _ in $(seq 1 20); do
+            if "$ETCDCTL" --endpoints="http://${PUT_HTTP}" --dial-timeout=2s --command-timeout=5s put "${KEY}" ok > "${DIR}/put.out" 2>"${DIR}/put.err"; then
+              PUT_OK=1
+              break
+            fi
+            sleep 0.1
+          done
+          if [ "$PUT_OK" != 1 ]; then finish "UNKNOWN reason=write_failed"; fi
+          echo "ack ${KEY}" >> "${DIR}/runs.txt"
+          # The member that acknowledged the write must still be leader when
+          # the cut is requested. A change here is UNKNOWN: do not cut, do not read.
+          if ! elected; then finish "UNKNOWN reason=leader_changed"; fi
+          if [ "$ELECT_NODE" != "$LEAD_NODE" ] || [ "$ELECT_ID" != "$LEAD_ID" ]; then
+            finish "UNKNOWN reason=leader_changed"
+          fi
+          printf '%s\n' "$LEAD_NODE" > "${DIR}/leader_node"
+          echo NOW > "$CUT"
+          # Do not read until Fuss has written isolate_applied.json for this leader.
+          applied=0
+          for _ in $(seq 1 150); do
+            if [ -s "${DIR}/isolate_applied.json" ] && cut_applied "${DIR}/isolate_applied.json" "$LEAD_NODE"; then
+              applied=1
+              break
+            fi
+            if [ -s "${DIR}/isolate_applied.json" ]; then
+              got=$(applied_target "${DIR}/isolate_applied.json")
+              if [ -n "$got" ] && [ "$got" != "$LEAD_NODE" ]; then
+                finish "UNKNOWN reason=cut_missed_leader"
+              fi
+            fi
+            sleep 0.1
+          done
+          if [ "$applied" != 1 ]; then finish "UNKNOWN reason=cut_not_applied"; fi
+          # A surviving member, not the one just cut, must report itself leader.
+          NEW_HTTP=""
+          NEW_NODE=""
+          for _ in $(seq 1 100); do
+            for i in 0 1 2; do
+              node="node_$i"
+              if [ "$node" = "$LEAD_NODE" ]; then continue; fi
+              case "$i" in
+                0) h="$H0" ;;
+                1) h="$H1" ;;
+                2) h="$H2" ;;
+              esac
+              line=$(status_role "$h") || continue
+              if [ "${line%% *}" = "leader" ]; then NEW_HTTP=$h; NEW_NODE=$node; break; fi
+            done
+            if [ -n "$NEW_NODE" ]; then break; fi
+            sleep 0.1
+          done
+          if [ -z "$NEW_HTTP" ] || [ -z "$NEW_NODE" ] || [ "$NEW_NODE" = "$LEAD_NODE" ]; then finish "UNKNOWN reason=no_new_leader"; fi
+          line=$(status_role "$NEW_HTTP") || finish "UNKNOWN reason=no_new_leader"
+          if [ "${line%% *}" != "leader" ]; then finish "UNKNOWN reason=no_new_leader"; fi
+          if ! "$ETCDCTL" --endpoints="http://${NEW_HTTP}" --dial-timeout=2s --command-timeout=5s get "${KEY}" -w json > "${DIR}/get.out" 2>"${DIR}/get.err"; then
+            finish "UNKNOWN reason=read_failed"
+          fi
+          kind=$(get_kind < "${DIR}/get.out")
+          case "$kind" in
+            present) finish "PASS read_from=${NEW_NODE} leader=self after_cut=yes leader_id=${LEAD_ID} cut_target=${LEAD_NODE} key=${KEY}" ;;
+            missing) finish "LOST WRITE read_from=${NEW_NODE} leader=self after_cut=yes value_missing=yes leader_id=${LEAD_ID} cut_target=${LEAD_NODE} key=${KEY}" ;;
+            unexpected) finish "UNKNOWN reason=read_unexpected" ;;
+            *) finish "UNKNOWN reason=read_malformed" ;;
+          esac
+        ) &
+        # exec so the PID Fuss recorded is etcd, which owns the peer sockets
+        exec ${binary} \
+          --name "node_${i}" \
+          --data-dir "${data_dir}/etcd" \
+          --listen-client-urls "http://${HTTP}" \
+          --advertise-client-urls "http://${HTTP}" \
+          --listen-peer-urls "$PEER_LISTEN" \
+          --initial-advertise-peer-urls "$ADV" \
+          --initial-cluster "$CLUSTER" \
+          --initial-cluster-state new \
+          --initial-cluster-token "fuss-${seed}"
+      else
+        exec ${binary} \
+          --name "node_${i}" \
+          --data-dir "${data_dir}/etcd" \
+          --listen-client-urls "http://${HTTP}" \
+          --advertise-client-urls "http://${HTTP}" \
+          --listen-peer-urls "$PEER_LISTEN" \
+          --initial-advertise-peer-urls "$ADV" \
+          --initial-cluster "$CLUSTER" \
+          --initial-cluster-state new \
+          --initial-cluster-token "fuss-${seed}"
+      fi
+  ready:
+    command:
+      - /bin/sh
+      - -c
+      - |
+        curl -sf "http://$(cat ${data_dir}/http_addr)/health"
+    contains: '"health":"true"'
+    timeout: 30s
+  stop_grace: 2s
+fault:
+  isolate:
+    node_file: "${dir}/leader_node"
+    direction: both
+  after:
+    file:
+      glob: "${dir}/cut_now"
+      contains: NOW
+      poll: 10ms
+      timeout: 20s
+kill:
+  at: file
+  file:
+    glob: "${dir}/drive_done"
+    contains: DONE
+    poll: 10ms
+    timeout: 45s
+check:
+  command:
+    command: ["/bin/cat", "${dir}/result.txt"]
+    as: out
+  rules:
+    - if: { out_contains: "LOST WRITE read_from=node_0 leader=self after_cut=yes value_missing=yes" }
+      verdict: "LOST WRITE"
+    - if: { out_contains: "LOST WRITE read_from=node_1 leader=self after_cut=yes value_missing=yes" }
+      verdict: "LOST WRITE"
+    - if: { out_contains: "LOST WRITE read_from=node_2 leader=self after_cut=yes value_missing=yes" }
+      verdict: "LOST WRITE"
+    - if: { out_contains: "PASS read_from=node_0 leader=self after_cut=yes" }
+      verdict: PASS
+    - if: { out_contains: "PASS read_from=node_1 leader=self after_cut=yes" }
+      verdict: PASS
+    - if: { out_contains: "PASS read_from=node_2 leader=self after_cut=yes" }
+      verdict: PASS
+    - if: { out_contains: "UNKNOWN" }
+      verdict: UNKNOWN
+    - else: FAIL

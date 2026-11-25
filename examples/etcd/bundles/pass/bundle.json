@@ -1,0 +1,41 @@
+{
+  "format": 1,
+  "fuss_revision": "c83a551a141ee3005a58931d4533f30ce44975f4",
+  "target": {
+    "name": "etcd",
+    "binary": "etcd",
+    "version": "etcd Version: 3.7.4",
+    "checksum": "sha256:004e95dca712293d8ce86adbf18fff3a84b152575c7eb80a3ff6c44b1ed0dc45"
+  },
+  "seed": 1,
+  "scenario": "examples/etcd/etcd.yaml",
+  "scenario_sha256": "sha256:b070cfd35648ba78eeed2fc5ae58f64e01624f147df1bf01a73de5e39214592b",
+  "inputs": {
+    "seed": 1,
+    "n": 1,
+    "scenario": "scenario.yaml"
+  },
+  "ack": {
+    "line": "ack 1-0",
+    "key": "1-0"
+  },
+  "cut": {
+    "target": "node_0",
+    "direction": "both",
+    "trigger_fired": true,
+    "links_cut": 4,
+    "links_total": 6,
+    "cut_time": "2026-11-25T14:25:58.985248Z",
+    "leader_id": "1691087835951997378",
+    "leader_node": "node_0"
+  },
+  "read": {
+    "text": "PASS read_from=node_1 leader=self after_cut=yes leader_id=1691087835951997378 cut_target=node_0 key=1-0",
+    "key": "1-0",
+    "from": "node_1",
+    "ok": true,
+    "missing": false,
+    "leader_id": "1691087835951997378"
+  },
+  "verdict": "PASS"
+}

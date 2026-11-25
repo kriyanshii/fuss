@@ -54,6 +54,6 @@ Seeds 1 to 4 on this machine, etcd v3.7.4, exit 0:
 
 Each trial had `links_cut` 4 and `trigger_fired` true. The read came from a member other than the cut target.
 
-`examples/etcd/bundles/pass` is one saved seed-1 run of this scenario. The bundle records the leader id, the member Fuss cut, and the key the linearizable get checked.
+`examples/etcd/bundles/pass` is the seed-1 run generated from `c83a551`. Fuss `-json` verdict was `PASS`. The leader id was `1691087835951997378`, Fuss cut `node_0` (`links_cut` 4, `trigger_fired` true, direction `both`), and the linearizable get of key `1-0` from `node_1` returned the value.
 
 `-save-bundle` and `-replay-bundle` use the same bundle format as `examples/repkv/bundles/lost-write`. The replay prints `ack: key=...` and `read: key=...` and fails when those keys differ. It also prints the saved cut target and the replayed cut target. A later run may elect a different member. The replay still passes when that member was the leader before a two-way cut and a different member returned the key. A cut of a follower does not pass. If the leader changes before the cut, the trial is `UNKNOWN` with `reason=leader_changed` or `reason=cut_missed_leader`.

@@ -93,8 +93,8 @@ does not own the peer sockets, and the cut is then UNKNOWN.
 ## Choosing the proxy
 
 Pick the mode from the connections the fault has to interrupt. The two
-examples below are that choice. `examples/postgres/README.md` is the
-PostgreSQL side in full, including the `psql` invocation.
+examples below are that choice. The runnable inbound cut is
+`examples/valkey/README.md`.
 
 | | PostgreSQL | etcd |
 | --- | --- | --- |

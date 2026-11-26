@@ -184,6 +184,19 @@ func TestYAMLCountsRules(t *testing.T) {
 	}
 }
 
+func TestRqliteResultControls(t *testing.T) {
+	a, err := LoadYAMLTarget("examples/rqlite/rqlite.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.RunControl("lost_write", 1, "/bin/true"); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.RunControl("result_absent", 1, "/bin/true"); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestYAMLPlantDirControl(t *testing.T) {
 	a, err := LoadYAMLTarget("testdata/yaml/plant/target.yaml")
 	if err != nil {

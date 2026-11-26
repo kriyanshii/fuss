@@ -71,3 +71,21 @@ version token must still be `v=9.2.0`. If `valkey-cli` is not next to
 A `(nil)` reply from `valkey-cli --no-raw` is a successful read of a missing
 key. A non-zero `valkey-cli` is a failed query. Those are different result
 lines: `value_missing=yes` versus `UNKNOWN reason=read_failed`.
+
+## Recorded run
+
+Clean checkout `64c4e32`, binary `/tmp/valkey-9.2.0/src/valkey-server`
+(`Valkey server v=9.2.0`). Command:
+`./fuss -target-config=examples/valkey/valkey.yaml -target=/tmp/valkey-9.2.0/src/valkey-server -seed=1 -n=10 -json`.
+Exit 0. Summary: `"pass":10`, `"fail":0`, `"acks":10`, `"seeds":10`.
+
+Every trial's `"verdict"` is `PASS` and `"label"` is `before-start`. None has
+a `reason` field. Each `evidence.check.out` is
+`PASS read_from=node_1 replica_before_cut=ok after_cut=yes cut_target=node_0 key=<seed>-0`,
+with `acks` 1. Each isolate block has `proxy_mode` `per_node`, `direction`
+`inbound`, `target` `node_0`, `trigger_fired` true, `links_cut` 1. The link
+`"to":0` is `"cut":true`, with `stats_before` accepted 1 and open 1, and
+`stats_after` accepted 2, `closed_by_cut` 1, `refused_while_cut` 1, open 0.
+The link `"to":1` is `"cut":false`. `took_ms` is 6617.947, 6351.735,
+6571.296, 6582.928, 6583.857, 6346.321, 6545.093, 6554.379, 6329.49,
+6565.008 for seeds 1 through 10. No trial was UNKNOWN.

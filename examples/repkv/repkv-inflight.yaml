@@ -42,17 +42,13 @@ kill:
     timeout: 20s
 check:
   command:
-    command: ["${binary}", "-verify", "-dir", "${dir}", "-n", "3", "-key", "${seed}-0"]
+    command: ["${binary}", "-verify", "-porcupine", "-dir", "${dir}", "-n", "3", "-key", "${seed}-0", "-initial", ""]
     as: out
   rules:
-    - if: { out_contains: "LOST WRITE read_from=node_1 leader=self after_cut=yes value_missing=yes" }
-      verdict: "LOST WRITE"
-    - if: { out_contains: "LOST WRITE read_from=node_2 leader=self after_cut=yes value_missing=yes" }
-      verdict: "LOST WRITE"
-    - if: { out_contains: "PASS read_from=node_1 leader=self after_cut=yes" }
-      verdict: PASS
-    - if: { out_contains: "PASS read_from=node_2 leader=self after_cut=yes" }
-      verdict: PASS
-    - if: { out_contains: "UNKNOWN" }
+    - if: { out_contains: "history unknown" }
       verdict: UNKNOWN
+    - if: { out_contains: "history illegal" }
+      verdict: ILLEGAL
+    - if: { out_contains: "history legal" }
+      verdict: PASS
     - else: FAIL

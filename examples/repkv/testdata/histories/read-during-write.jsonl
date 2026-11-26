@@ -1,0 +1,4 @@
+{"kind":"client","id":"w1","phase":"start","op":"write","key":"x","value":"1","at":"2026-11-26T00:00:00Z"}
+{"kind":"client","id":"r1","phase":"start","op":"read","key":"x","at":"2026-11-26T00:00:01Z"}
+{"kind":"client","id":"r1","phase":"end","op":"read","observe":"ok","value":"0","at":"2026-11-26T00:00:02Z"}
+{"kind":"client","id":"w1","phase":"end","op":"write","observe":"ok","at":"2026-11-26T00:00:03Z"}

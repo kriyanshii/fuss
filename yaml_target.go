@@ -1927,14 +1927,15 @@ func (y *YAMLAdapter) CheckNamed(at AdapterTrial, killed bool, phase string) Che
 		if y.cfg.Fault.Isolate.active() {
 			if cr := y.checkIsolate(rt); cr.Verdict != "" {
 				// The scenario's own UNKNOWN (failed read, wrong leader, cut
-				// file missing) names the reason. PASS and LOST WRITE do not
-				// override a cut Fuss could not prove.
+				// file missing) names the reason. A legal or illegal history
+				// does not override a cut Fuss could not prove: the experiment
+				// stays UNKNOWN. The check output stays, so the history
+				// conclusion is still visible next to that verdict.
 				if y.usesRulesCheck() {
 					rules := y.checkRules(t)
 					if rules.Verdict == "UNKNOWN" {
 						return rules
 					}
-					delete(t.Data(), "check_vals")
 				}
 				return cr
 			}

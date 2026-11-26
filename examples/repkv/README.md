@@ -66,5 +66,53 @@ r1 completes: value=v
 `node_1` may be `node_2`. The verdict line is unchanged. `observe` is only
 what the client saw. Whether a timed-out write took effect is a separate fact.
 
+`repkv -check-history` reads that JSONL offline. It ignores `kind` `cut`.
+The key starts at `-initial` (default `0`). A completed write has to sit
+in the order. A timed-out write may be omitted, or placed at or after its
+start. Exit 0 prints one legal order. Exit 1 prints why none exists.
+
+```sh
+./examples/repkv/repkv -check-history examples/repkv/testdata/histories/timeout-then-new.jsonl
+./examples/repkv/repkv -check-history /tmp/repkv-inflight-history.jsonl -initial 0
+```
+
+The same JSONL files are the controls for a Porcupine register. A timed-out
+write has two assumptions, and they are named separately. The effect is
+`none` (the write did not happen), `required` (it must take effect), or
+`optional` (it may be omitted). The bound is `timeout` (if it takes effect,
+it does so by the client timeout) or `open` (it may take effect later).
+
+`required` and `timeout` together reject a later read of the old value,
+because the write is required to take effect, not only because the timeout
+is a bound. `optional` and `timeout` still allow that read by omitting the
+write, and reject a read of the old value followed by a read of the new one
+(`timeout-late-write.jsonl`). Leaving the bound `open` accepts that late
+write. A timed-out write of `1` followed by reads of `1` then `0`
+(`timeout-then-revert.jsonl`) is illegal under every combination: one
+ordering still has to explain the whole history. Overlapping writes are
+legal when every later read matches one order, and illegal when the reads
+require two (`overlap-agree.jsonl`, `overlap-disagree.jsonl`).
+
+`repkv-inflight.yaml` feeds its recorded JSONL to Porcupine with
+`effect=optional` and `bound=open`. The check prints `history legal` or
+`history illegal`. That line is the history verdict. Fuss still verifies the
+cut on its own. If the cut cannot be verified, the experiment verdict is
+`UNKNOWN` even when the history is legal. The trial JSON keeps the history
+line in `evidence.check.out` and the cut in `evidence.isolate`.
+
+`schedules.sh` runs that same write and post-cut read at three gates.
+`before` writes `cut_now` and waits for the applied cut before the client
+invokes the write. `pending` invokes the write, waits until it has replicated,
+then cuts while the response is still held. `after` waits until the client
+observes success, then cuts. Each run saves `history.jsonl` and `cut.json`.
+The experiment is `PASS` only when the requested window occurred, Porcupine
+says the history is legal, and a read started after the cut. A missing
+post-cut read keeps the history line and the experiment is `UNKNOWN`.
+
+```sh
+./examples/repkv/schedules.sh
+./examples/repkv/schedules.sh pending
+```
+
 `repkv-read-error.yaml` is the same cluster and cut. The check dials a closed
 port after the new leader is known, and the verdict is `UNKNOWN reason=read_error`.

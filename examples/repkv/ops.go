@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 )
@@ -43,15 +44,31 @@ type cutEvent struct {
 }
 
 type recorder struct {
-	path string
+	paths []string
 }
 
-func openRecorder() *recorder {
-	return &recorder{path: os.Getenv("REPKV_CLIENT_LOG")}
+func openRecorder(extra ...string) *recorder {
+	var paths []string
+	add := func(p string) {
+		if p == "" {
+			return
+		}
+		for _, have := range paths {
+			if have == p {
+				return
+			}
+		}
+		paths = append(paths, p)
+	}
+	add(os.Getenv("REPKV_CLIENT_LOG"))
+	for _, p := range extra {
+		add(p)
+	}
+	return &recorder{paths: paths}
 }
 
 func (r *recorder) start(id, op, key, value, from string) {
-	if r == nil || r.path == "" {
+	if r == nil || len(r.paths) == 0 {
 		return
 	}
 	r.append(clientEvent{
@@ -67,7 +84,7 @@ func (r *recorder) start(id, op, key, value, from string) {
 }
 
 func (r *recorder) end(id, op, observe, value, errText string, missing bool) {
-	if r == nil || r.path == "" {
+	if r == nil || len(r.paths) == 0 {
 		return
 	}
 	r.append(clientEvent{
@@ -84,16 +101,22 @@ func (r *recorder) end(id, op, observe, value, errText string, missing bool) {
 }
 
 func (r *recorder) append(v any) {
+	if r == nil || len(r.paths) == 0 {
+		return
+	}
 	b, err := json.Marshal(v)
 	if err != nil {
 		return
 	}
-	f, err := os.OpenFile(r.path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
-	if err != nil {
-		return
+	line := append(b, '\n')
+	for _, path := range r.paths {
+		f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+		if err != nil {
+			continue
+		}
+		_, _ = f.Write(line)
+		_ = f.Close()
 	}
-	_, _ = f.Write(append(b, '\n'))
-	_ = f.Close()
 }
 
 // observeHTTP classifies what the client saw. A timeout is a timeout even
@@ -131,20 +154,22 @@ func errText(err error) string {
 }
 
 // writeSavedHistory merges the client log with Fuss's isolate file and
-// writes one JSONL history. It does nothing unless REPKV_HISTORY is set.
-func writeSavedHistory(dir string) {
-	out := os.Getenv("REPKV_HISTORY")
-	logPath := os.Getenv("REPKV_CLIENT_LOG")
-	if out == "" || logPath == "" {
-		return
-	}
+// writes ${dir}/history.jsonl. REPKV_HISTORY, when set, receives the same bytes.
+func writeSavedHistory(dir string) []byte {
+	logPath := filepath.Join(dir, "client.jsonl")
 	client, err := os.ReadFile(logPath)
 	if err != nil {
-		client = nil
+		if alt := os.Getenv("REPKV_CLIENT_LOG"); alt != "" {
+			client, _ = os.ReadFile(alt)
+		}
 	}
 	doc, _ := readIsolateApplied(dir)
 	body := buildHistory(client, doc)
-	_ = os.WriteFile(out, body, 0o644)
+	_ = os.WriteFile(filepath.Join(dir, "history.jsonl"), body, 0o644)
+	if out := os.Getenv("REPKV_HISTORY"); out != "" {
+		_ = os.WriteFile(out, body, 0o644)
+	}
+	return body
 }
 
 func buildHistory(clientJSONL []byte, doc isolateApplied) []byte {

@@ -2,11 +2,14 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -1091,4 +1094,184 @@ check:
 	if err == nil || !strings.Contains(err.Error(), "resume") {
 		t.Fatalf("want resume reject, got %v", err)
 	}
+}
+
+const namedPortShape = `
+name: named-ports
+binary:
+  default: sleep
+  extra: ["/bin/sleep"]
+topology:
+  nodes: 3
+  data_dir: "${dir}/node${i}"
+  ports:
+    base: 0
+    names: [raft, http]
+  proxy_mode: per_node_owned
+  peers:
+    port_name: raft
+    via_proxy: true
+  start:
+    - /bin/sh
+    - -c
+    - |
+      printf '%s\n' "${port}" > "${data_dir}/legacy_port"
+      printf '%s\n' "${port_raft}" > "${data_dir}/raft_port"
+      printf '%s\n' "${port_http}" > "${data_dir}/http_port"
+      printf '%s\n' "${addr_raft}" > "${data_dir}/raft_addr"
+      printf '%s\n' "${addr_http}" > "${data_dir}/http_addr"
+      exec /bin/sleep 30
+  ready:
+    file: "${data_dir}/http_port"
+    timeout: 5s
+  stop_grace: 200ms
+`
+
+func TestTwoRqliteNamedPortCopiesDoNotCollide(t *testing.T) {
+	cfg := t.TempDir()
+	path := filepath.Join(cfg, "ports.yaml")
+	if err := os.WriteFile(path, []byte(namedPortShape), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	type running struct {
+		a    *YAMLAdapter
+		rt   *topologyRuntime
+		hold *exec.Cmd
+		dir  string
+	}
+	dirs := []string{t.TempDir(), t.TempDir()}
+	out := make([]running, 2)
+	errs := make([]error, 2)
+	var wg sync.WaitGroup
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			a, err := LoadYAMLTarget(path)
+			if err != nil {
+				errs[i] = err
+				return
+			}
+			logf, err := os.Create(filepath.Join(dirs[i], "log"))
+			if err != nil {
+				errs[i] = err
+				return
+			}
+			defer logf.Close()
+			at, err := a.Init(int64(i+1), dirs[i], "/bin/sleep")
+			if err != nil {
+				errs[i] = err
+				return
+			}
+			hold, err := a.Start(at, logf)
+			if err != nil {
+				errs[i] = err
+				return
+			}
+			rt, _ := at.Data()["topology"].(*topologyRuntime)
+			out[i] = running{a: a, rt: rt, hold: hold, dir: dirs[i]}
+		}(i)
+	}
+	wg.Wait()
+	t.Cleanup(func() {
+		for _, r := range out {
+			if r.a != nil && r.rt != nil {
+				r.a.stopTopology(r.rt)
+			}
+			if r.hold != nil && r.hold.Process != nil {
+				_ = r.hold.Process.Kill()
+				_, _ = r.hold.Process.Wait()
+			}
+		}
+	})
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("copy %d: %v", i, err)
+		}
+	}
+
+	seen := map[string]string{}
+	take := func(label, v string) {
+		t.Helper()
+		if v == "" {
+			t.Fatalf("%s empty", label)
+		}
+		if prev, ok := seen[v]; ok {
+			t.Fatalf("port %s used by %s and %s", v, prev, label)
+		}
+		seen[v] = label
+	}
+	for copy, r := range out {
+		if r.rt == nil || !r.rt.AllReady {
+			t.Fatalf("copy %d not ready", copy)
+		}
+		raftAddr := map[int]string{}
+		httpAddr := map[int]string{}
+		for i := 0; i < 3; i++ {
+			node := filepath.Join(r.dir, "node"+strconv.Itoa(i))
+			legacy := strings.TrimSpace(readPortFile(t, filepath.Join(node, "legacy_port")))
+			raft := strings.TrimSpace(readPortFile(t, filepath.Join(node, "raft_port")))
+			http := strings.TrimSpace(readPortFile(t, filepath.Join(node, "http_port")))
+			ra := strings.TrimSpace(readPortFile(t, filepath.Join(node, "raft_addr")))
+			ha := strings.TrimSpace(readPortFile(t, filepath.Join(node, "http_addr")))
+			if ra != "127.0.0.1:"+raft || ha != "127.0.0.1:"+http {
+				t.Fatalf("copy %d node %d addrs raft=%s http=%s ports %s %s", copy, i, ra, ha, raft, http)
+			}
+			if legacy == raft || legacy == http || raft == http {
+				t.Fatalf("copy %d node %d ports not distinct legacy=%s raft=%s http=%s", copy, i, legacy, raft, http)
+			}
+			prefix := fmt.Sprintf("copy%d-node%d", copy, i)
+			take(prefix+"/legacy", legacy)
+			take(prefix+"/raft", raft)
+			take(prefix+"/http", http)
+			raftAddr[i] = ra
+			httpAddr[i] = ha
+		}
+		if len(r.rt.Links) != 3 {
+			t.Fatalf("copy %d links %d", copy, len(r.rt.Links))
+		}
+		for _, l := range r.rt.Links {
+			if l.Upstream != raftAddr[l.To] {
+				t.Fatalf("copy %d link to %d upstream %s want %s", copy, l.To, l.Upstream, raftAddr[l.To])
+			}
+			if l.Upstream == httpAddr[l.To] {
+				t.Fatalf("copy %d proxied http %s", copy, l.Upstream)
+			}
+		}
+	}
+}
+
+func TestNamedPortDuplicateRejected(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "dup.yaml")
+	body := strings.Replace(namedPortShape, "names: [raft, http]", "names: [raft, raft]", 1)
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	a, err := LoadYAMLTarget(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logf, err := os.Create(filepath.Join(dir, "log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer logf.Close()
+	at, err := a.Init(1, dir, "/bin/sleep")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = a.Start(at, logf)
+	if err == nil || !strings.Contains(err.Error(), "duplicate") {
+		t.Fatalf("want duplicate name error, got %v", err)
+	}
+}
+
+func readPortFile(t *testing.T, path string) string {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
 }

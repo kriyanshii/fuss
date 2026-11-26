@@ -173,7 +173,8 @@ type yamlFaultAfter struct {
 }
 
 type yamlTopoPorts struct {
-	Base int `yaml:"base"` // 0 means pick a free port per node
+	Base  int      `yaml:"base"`  // 0 means pick a free port per node
+	Names []string `yaml:"names"` // extra per-node ports; ${port} stays the original listen port
 }
 
 // yamlTopoReady is a per-node readiness check. File (path exists, optional
@@ -465,7 +466,7 @@ func expandTemplates(s string, vars map[string]string) string {
 		s = strings.ReplaceAll(s, "${"+k+"}", vars[k])
 	}
 	for k, v := range vars {
-		if strings.HasPrefix(k, "peer_addr_") || strings.HasPrefix(k, "node_proxy_addr_") {
+		if strings.HasPrefix(k, "peer_addr_") || strings.HasPrefix(k, "node_proxy_addr_") || strings.HasPrefix(k, "port_") || strings.HasPrefix(k, "addr_") {
 			s = strings.ReplaceAll(s, "${"+k+"}", v)
 		}
 	}
@@ -642,6 +643,7 @@ type topologyLink struct {
 	To          int
 	Link        *proxy.Link
 	Listen      string
+	Upstream    string
 	StatsBefore proxy.Stats
 	StatsAfter  proxy.Stats
 	tagBefore   map[int]proxy.Stats // per source, snapshotted at cut
@@ -915,13 +917,112 @@ func (rt *topologyRuntime) cutObserved() bool {
 	return false
 }
 
+var (
+	reservedPortMu sync.Mutex
+	reservedPorts  = map[int]struct{}{}
+)
+
+// freePort asks the kernel for an ephemeral port and remembers it for this
+// process. Two topologies started together therefore do not receive the same
+// port after the listener is closed.
 func freePort() (int, error) {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		return 0, err
+	reservedPortMu.Lock()
+	defer reservedPortMu.Unlock()
+	var last error
+	for try := 0; try < 64; try++ {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			return 0, err
+		}
+		p := ln.Addr().(*net.TCPAddr).Port
+		ln.Close()
+		if _, ok := reservedPorts[p]; ok {
+			last = fmt.Errorf("port %d already reserved", p)
+			continue
+		}
+		reservedPorts[p] = struct{}{}
+		return p, nil
 	}
-	defer ln.Close()
-	return ln.Addr().(*net.TCPAddr).Port, nil
+	if last == nil {
+		last = fmt.Errorf("no free port")
+	}
+	return 0, last
+}
+
+func validPortName(name string) bool {
+	if name == "" || name == "port" {
+		return false
+	}
+	for i, r := range name {
+		switch {
+		case r >= 'a' && r <= 'z':
+		case i > 0 && (r == '_' || (r >= '0' && r <= '9')):
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func (y *YAMLAdapter) allocateNodePorts(n int) ([]int, map[string][]int, error) {
+	seen := map[string]bool{}
+	for _, name := range y.cfg.Topology.Ports.Names {
+		if !validPortName(name) {
+			return nil, nil, fmt.Errorf("topology.ports.names: invalid name %q", name)
+		}
+		if seen[name] {
+			return nil, nil, fmt.Errorf("topology.ports.names: duplicate %q", name)
+		}
+		seen[name] = true
+	}
+	legacy := make([]int, n)
+	named := map[string][]int{}
+	for _, name := range y.cfg.Topology.Ports.Names {
+		named[name] = make([]int, n)
+	}
+	for i := 0; i < n; i++ {
+		p, err := y.onePort(n, i, 0)
+		if err != nil {
+			return nil, nil, err
+		}
+		legacy[i] = p
+		for slot, name := range y.cfg.Topology.Ports.Names {
+			p, err := y.onePort(n, i, slot+1)
+			if err != nil {
+				return nil, nil, err
+			}
+			named[name][i] = p
+		}
+	}
+	return legacy, named, nil
+}
+
+func (y *YAMLAdapter) onePort(n, i, slot int) (int, error) {
+	base := y.cfg.Topology.Ports.Base
+	if base == 0 {
+		p, err := freePort()
+		if err != nil {
+			return 0, fmt.Errorf("topology: free port: %w", err)
+		}
+		return p, nil
+	}
+	return base + n*slot + i, nil
+}
+
+func setNodePortVars(vars map[string]string, port int, named map[string][]int, i int) {
+	vars["port"] = strconv.Itoa(port)
+	for name, row := range named {
+		p := strconv.Itoa(row[i])
+		vars["port_"+name] = p
+		vars["addr_"+name] = "127.0.0.1:" + p
+	}
+}
+
+func peerUpstreamPort(portName string, legacy []int, named map[string][]int, j int) int {
+	if row, ok := named[portName]; ok {
+		return row[j]
+	}
+	return legacy[j]
 }
 
 func (y *YAMLAdapter) startTopology(t *BaseTrial, log *os.File) (*exec.Cmd, error) {
@@ -930,17 +1031,9 @@ func (y *YAMLAdapter) startTopology(t *BaseTrial, log *os.File) (*exec.Cmd, erro
 		return nil, fmt.Errorf("topology.start is required when topology.nodes > 0")
 	}
 	n := topo.Nodes
-	ports := make([]int, n)
-	for i := 0; i < n; i++ {
-		if topo.Ports.Base == 0 {
-			p, err := freePort()
-			if err != nil {
-				return nil, fmt.Errorf("topology: free port: %w", err)
-			}
-			ports[i] = p
-		} else {
-			ports[i] = topo.Ports.Base + i
-		}
+	ports, namedPorts, err := y.allocateNodePorts(n)
+	if err != nil {
+		return nil, err
 	}
 
 	rt := &topologyRuntime{Nodes: make([]*topologyNode, n), ProxyMode: topo.ProxyMode}
@@ -954,7 +1047,7 @@ func (y *YAMLAdapter) startTopology(t *BaseTrial, log *os.File) (*exec.Cmd, erro
 		case "per_node", "per_node_owned":
 			nodeProxies = make([]string, n)
 			for j := 0; j < n; j++ {
-				upstream := "127.0.0.1:" + strconv.Itoa(ports[j])
+				upstream := "127.0.0.1:" + strconv.Itoa(peerUpstreamPort(topo.Peers.PortName, ports, namedPorts, j))
 				link, err := proxy.New("127.0.0.1:0", upstream)
 				if err != nil {
 					y.stopTopology(rt)
@@ -966,7 +1059,7 @@ func (y *YAMLAdapter) startTopology(t *BaseTrial, log *os.File) (*exec.Cmd, erro
 				}
 				addr := link.Addr().String()
 				// From=-1: shared inbound proxy; every peer dials this listen addr.
-				rt.Links = append(rt.Links, &topologyLink{From: -1, To: j, Link: link, Listen: addr})
+				rt.Links = append(rt.Links, &topologyLink{From: -1, To: j, Link: link, Listen: addr, Upstream: upstream})
 				nodeProxies[j] = addr
 			}
 			for i := 0; i < n; i++ {
@@ -983,7 +1076,7 @@ func (y *YAMLAdapter) startTopology(t *BaseTrial, log *os.File) (*exec.Cmd, erro
 					if i == j {
 						continue
 					}
-					upstream := "127.0.0.1:" + strconv.Itoa(ports[j])
+					upstream := "127.0.0.1:" + strconv.Itoa(peerUpstreamPort(topo.Peers.PortName, ports, namedPorts, j))
 					link, err := proxy.New("127.0.0.1:0", upstream)
 					if err != nil {
 						y.stopTopology(rt)
@@ -994,7 +1087,7 @@ func (y *YAMLAdapter) startTopology(t *BaseTrial, log *os.File) (*exec.Cmd, erro
 						return nil, fmt.Errorf("topology proxy %d->%d start: %w", i, j, err)
 					}
 					addr := link.Addr().String()
-					tl := &topologyLink{From: i, To: j, Link: link, Listen: addr}
+					tl := &topologyLink{From: i, To: j, Link: link, Listen: addr, Upstream: upstream}
 					rt.Links = append(rt.Links, tl)
 					peerAddrs[i][j] = addr
 				}
@@ -1023,7 +1116,7 @@ func (y *YAMLAdapter) startTopology(t *BaseTrial, log *os.File) (*exec.Cmd, erro
 			vars := y.vars(t, "")
 			vars["i"] = strconv.Itoa(i)
 			vars["data_dir"] = dataDir
-			vars["port"] = strconv.Itoa(ports[i])
+			setNodePortVars(vars, ports[i], namedPorts, i)
 			y.addPeerVars(vars, peerAddrs, nodeProxies, i)
 			args := y.expandSlice(topo.Start, vars)
 			if len(args) == 0 {
@@ -1091,7 +1184,7 @@ func (y *YAMLAdapter) startTopology(t *BaseTrial, log *os.File) (*exec.Cmd, erro
 			vars := y.vars(t, "")
 			vars["i"] = strconv.Itoa(i)
 			vars["data_dir"] = node.DataDir
-			vars["port"] = strconv.Itoa(node.Port)
+			setNodePortVars(vars, node.Port, namedPorts, i)
 			y.addPeerVars(vars, peerAddrs, nodeProxies, i)
 			if err := y.waitTopologyReady(node, vars, readyTo); err != nil {
 				mu.Lock()

@@ -9,6 +9,7 @@ topology:
   data_dir: "${dir}/node${i}"
   ports:
     base: 0
+    names: [raft, http]
   proxy_mode: per_node_owned
   peers:
     port_name: raft
@@ -24,11 +25,10 @@ topology:
         2) ADV='${node_proxy_addr_2}' ;;
         *) echo "bad i=${i}" >&2; exit 1 ;;
       esac
-      HTTP_PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')
-      HTTP="127.0.0.1:${HTTP_PORT}"
+      HTTP="${addr_http}"
       echo "$HTTP" > "${data_dir}/http_addr"
       echo "$HTTP" > "${dir}/http_${i}"
-      RAFT="127.0.0.1:${port}"
+      RAFT="${addr_raft}"
       # -join takes host:port of a peer's Raft/mux address (not an http:// URL).
       JOIN0='${node_proxy_addr_0}'
       if [ "${i}" = "0" ]; then

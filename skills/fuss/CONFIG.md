@@ -29,6 +29,8 @@ name is still scanned for a later name. Any other `${...}` is left as written.
 | `${key}` | see below | During the workload, the expanded `workload.ack.key`, or `<seed>-<n>` when that field is empty and `${n}` is non-empty. During an ack check, each key parsed from an `ack ` line. Otherwise empty. |
 | `${i}` | node index as decimal | While expanding topology fields for one node (`0` .. `nodes-1`). Empty on every other expansion. |
 | `${port}` | that node's listen port | Same topology expansion. From `topology.ports.base`, or a free port when that base is `0`. |
+| `${port_<name>}` | named listen port | Set when `topology.ports.names` lists `<name>`. `${port}` is still set. |
+| `${addr_<name>}` | `127.0.0.1:${port_<name>}` | Same expansion. The direct address for that listener. |
 | `${data_dir}` | that node's data directory | Same topology expansion. The expanded `topology.data_dir`. |
 | `${peer_addr_<j>}` | proxy listen addr to node `j` | Topology expansion when `topology.peers.via_proxy` is true. Empty for `j == i`. In `per_node` mode every peer uses the same inbound proxy for `j`. |
 | `${peers}` | comma-joined peer proxy addrs | Same; every `${peer_addr_<j>}` for `j != i`. |
@@ -290,6 +292,21 @@ node and created before start. Example: `data_dir: "${dir}/node${i}"`
 free `127.0.0.1` port. When greater than zero, node `i` uses `base + i`.
 Example: `ports: { base: 0 }`
 
+**`topology.ports.names`** (list of strings, default: empty). Extra listen
+ports for each node, beside `${port}`. A name is a lowercase letter followed
+by lowercase letters, digits, or underscores, and it is not `port`. Node `i`
+receives `${port_<name>}` and `${addr_<name>}` (`127.0.0.1` and that port).
+With `base: 0` each of those ports is a free port, and one process will not
+hand the same free port to two nodes or two trials. With a fixed base, name
+slot `s` (starting at 1) for node `i` is `base + nodes*s + i`, so it stays
+off `${port}`. Example: `names: [raft, http]`
+
+`peers.port_name` chooses the port the proxies front. When that name is in
+`ports.names`, the proxy upstream is `${addr_<name>}`. Otherwise the upstream
+is `127.0.0.1:${port}`, which is what a scenario with no `names` already uses.
+`examples/rqlite` names `raft` and `http`. Raft is the proxy upstream. The
+HTTP listener is `${addr_http}` and is not proxied.
+
 **`topology.start`** (list of strings, required when `nodes > 0`). Command
 for each node. The first element is the executable. Expanded with `${i}`,
 `${data_dir}`, `${port}`, and the usual variables. Example:
@@ -314,8 +331,9 @@ Example: `timeout: 2s`
 this long before `SIGKILL`. Example: `stop_grace: 500ms`
 
 **`topology.peers.port_name`** (string, default: empty). Names which per-node
-port is the peer port. With the single topology `${port}`, that port is the
-peer port; client ports stay direct. Example: `port_name: raft`
+port is the peer port. If `ports.names` includes that name, the proxies
+front it. Otherwise they front `${port}`. Client ports stay direct.
+Example: `port_name: raft`
 
 **`topology.peers.via_proxy`** (bool, default: `false`). When true, Fuss starts
 `proxy.Link`s for peer traffic (see `proxy_mode`). Node start templates get

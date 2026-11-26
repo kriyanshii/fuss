@@ -41,6 +41,8 @@ func main() {
 	readFault := flag.String("read-fault", "", "verify: refused dials a closed port after the leader is known")
 	version := flag.Bool("version", false, "print repkv and exit")
 	renderHistoryPath := flag.String("render-history", "", "print a saved history JSONL and exit")
+	checkHistoryPath := flag.String("check-history", "", "decide whether a client history JSONL admits a legal order, then exit")
+	initialValue := flag.String("initial", "0", "known initial value of the one key checked by -check-history")
 	flag.Parse()
 
 	if *version {
@@ -59,6 +61,23 @@ func main() {
 			os.Exit(2)
 		}
 		fmt.Println(text)
+		os.Exit(0)
+	}
+	if *checkHistoryPath != "" {
+		b, err := os.ReadFile(*checkHistoryPath)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(2)
+		}
+		legal, text, err := checkHistory(b, *initialValue)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(2)
+		}
+		fmt.Println(text)
+		if !legal {
+			os.Exit(1)
+		}
 		os.Exit(0)
 	}
 

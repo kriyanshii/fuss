@@ -66,5 +66,15 @@ r1 completes: value=v
 `node_1` may be `node_2`. The verdict line is unchanged. `observe` is only
 what the client saw. Whether a timed-out write took effect is a separate fact.
 
+`repkv -check-history` reads that JSONL offline. It ignores `kind` `cut`.
+The key starts at `-initial` (default `0`). A completed write has to sit
+in the order. A timed-out write may be omitted, or placed at or after its
+start. Exit 0 prints one legal order. Exit 1 prints why none exists.
+
+```sh
+./examples/repkv/repkv -check-history examples/repkv/testdata/histories/timeout-then-new.jsonl
+./examples/repkv/repkv -check-history /tmp/repkv-inflight-history.jsonl -initial 0
+```
+
 `repkv-read-error.yaml` is the same cluster and cut. The check dials a closed
 port after the new leader is known, and the verdict is `UNKNOWN reason=read_error`.

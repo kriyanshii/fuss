@@ -8,6 +8,7 @@ history and does not know which harness did the cut.
 
 import json
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -59,13 +60,14 @@ def is_timeout(err):
 
 
 def observe(status, err):
+    """ok completed, timeout gave up, rejected is an HTTP refusal, error has no HTTP response."""
     if err is not None:
         if is_timeout(err):
             return "timeout"
         return "error"
     if status == 200:
         return "ok"
-    return "error"
+    return "rejected"
 
 
 def http_addr(i):
@@ -133,6 +135,68 @@ def wait_cut():
     return None
 
 
+def record_write(status, body, err):
+    obs = observe(status, err)
+    if obs == "ok" and not insert_ok(body):
+        obs = "rejected"
+    detail = "" if err is None else str(err)
+    if obs == "rejected" and err is None:
+        detail = body.decode("utf-8", "replace")[:256]
+    emit({
+        "kind": "client", "id": "w1", "phase": "end", "op": "write",
+        "observe": obs, "error": detail, "at": now(),
+    })
+    return obs
+
+
+def insert_then_cut(addr):
+    emit({
+        "kind": "client", "id": "w1", "phase": "start", "op": "write",
+        "key": KEY, "value": "ok", "at": now(),
+    })
+    status, body, err = call(
+        "POST",
+        f"http://{addr}/db/execute",
+        [["INSERT INTO kv(k, v) VALUES(?, ?)", KEY, "ok"]],
+        5,
+    )
+    obs = record_write(status, body, err)
+    DIR.joinpath("cut_now").write_text("NOW\n")
+    return obs
+
+
+def insert_while_open(addr):
+    box = {}
+
+    def run():
+        emit({
+            "kind": "client", "id": "w1", "phase": "start", "op": "write",
+            "key": KEY, "value": "ok", "at": now(),
+        })
+        status, body, err = call(
+            "POST",
+            f"http://{addr}/db/execute",
+            [["INSERT INTO kv(k, v) VALUES(?, ?)", KEY, "ok"]],
+            8,
+        )
+        box["obs"] = record_write(status, body, err)
+
+    th = threading.Thread(target=run)
+    th.start()
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        text = HISTORY.read_text() if HISTORY.exists() else ""
+        if '"id":"w1"' in text and '"phase":"start"' in text:
+            break
+        time.sleep(0.005)
+    else:
+        th.join()
+        return "error"
+    DIR.joinpath("cut_now").write_text("NOW\n")
+    th.join()
+    return box.get("obs", "error")
+
+
 def main():
     HISTORY.touch()
     deadline = time.time() + 20
@@ -165,27 +229,13 @@ def main():
     )
     if err is not None or status != 200:
         finish()
-    emit({
-        "kind": "client", "id": "w1", "phase": "start", "op": "write",
-        "key": KEY, "value": "ok", "at": now(),
-    })
-    status, body, err = call(
-        "POST",
-        f"http://{addrs[0]}/db/execute",
-        [["INSERT INTO kv(k, v) VALUES(?, ?)", KEY, "ok"]],
-        5,
-    )
-    obs = observe(status, err)
-    if obs == "ok" and not insert_ok(body):
-        obs = "error"
-    emit({
-        "kind": "client", "id": "w1", "phase": "end", "op": "write",
-        "observe": obs, "error": "" if err is None else str(err), "at": now(),
-    })
+    # pending: ask for the cut after the write start is on disk and before
+    # this process reads the execute response. No other gate.
+    pending = len(sys.argv) > 3 and sys.argv[3] == "pending"
+    obs = insert_while_open(addrs[0]) if pending else insert_then_cut(addrs[0])
     if obs == "ok":
         with (DIR / "runs.txt").open("a") as f:
             f.write(f"ack {KEY}\n")
-    DIR.joinpath("cut_now").write_text("NOW\n")
     applied = wait_cut()
     if applied is not None:
         try:

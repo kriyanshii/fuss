@@ -15,7 +15,7 @@ func TestObserveHTTP(t *testing.T) {
 	if got := observeHTTP(nil, http.StatusNotFound); got != "ok" {
 		t.Fatalf("404 = %s", got)
 	}
-	if got := observeHTTP(nil, http.StatusServiceUnavailable); got != "error" {
+	if got := observeHTTP(nil, http.StatusServiceUnavailable); got != "rejected" {
 		t.Fatalf("503 = %s", got)
 	}
 	if got := observeHTTP(&timeoutErr{}, 0); got != "timeout" {

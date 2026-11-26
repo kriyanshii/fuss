@@ -10,7 +10,9 @@ import (
 )
 
 // A history operation is one client call. A completed write (observe ok)
-// must sit in the order inside its interval. A timed-out or failed write
+// must sit in the order inside its interval. A rejected write also completed:
+// the server refused it, so it stays in the order and does not change the
+// register. A timed-out write, or a write that ended in a transport error,
 // may be left out, or placed anywhere at or after its start. Cut events
 // are not operations: they are how the fixture injects the fault.
 type histOp struct {
@@ -23,6 +25,18 @@ type histOp struct {
 }
 
 func (o histOp) definite() bool { return o.observe == "ok" }
+
+// rejected is a completed refusal. The write is in the history and it did
+// not take effect.
+func (o histOp) rejected() bool { return o.observe == "rejected" }
+
+// uncertain is a write whose effect the client could not see: a timeout,
+// or a transport error with no HTTP response.
+func (o histOp) uncertain() bool {
+	return o.op == "write" && !o.definite() && !o.rejected()
+}
+
+func (o histOp) completed() bool { return o.definite() || o.rejected() }
 
 // checkHistory reports whether the client JSONL admits a legal order for
 // one register that starts at initial. The explanation is one order that
@@ -66,7 +80,7 @@ func splitOptional(ops []histOp) (fixed, optional []histOp) {
 		if op.op == "read" && !op.definite() {
 			continue
 		}
-		if op.op == "write" && !op.definite() {
+		if op.uncertain() {
 			optional = append(optional, op)
 			continue
 		}
@@ -181,7 +195,7 @@ func respectsRealtime(order []histOp) bool {
 }
 
 func mustBefore(a, b histOp) bool {
-	return a.definite() && a.end.Before(b.start)
+	return a.completed() && a.end.Before(b.start)
 }
 
 func readsMatch(order []histOp, initial string) bool {
@@ -189,6 +203,9 @@ func readsMatch(order []histOp, initial string) bool {
 	for _, op := range order {
 		switch op.op {
 		case "write":
+			if op.rejected() {
+				continue
+			}
 			cur = op.value
 		case "read":
 			if op.definite() && cur != op.value {
@@ -202,7 +219,7 @@ func readsMatch(order []histOp, initial string) bool {
 func explainOrder(order, omitted []histOp, initial string) string {
 	timeouts := 0
 	for _, op := range order {
-		if op.op == "write" && !op.definite() {
+		if op.uncertain() {
 			timeouts++
 		}
 	}
@@ -211,7 +228,7 @@ func explainOrder(order, omitted []histOp, initial string) string {
 		if op.op != "read" || !op.definite() {
 			continue
 		}
-		if prev := previousWrite(order, i); prev != nil && !prev.definite() && prev.value == op.value {
+		if prev := previousWrite(order, i); prev != nil && prev.uncertain() && prev.value == op.value {
 			return fmt.Sprintf("Legal ordering: the timed-out write took effect before `%s`.", op.id)
 		}
 	}
@@ -253,7 +270,7 @@ func previousWrite(order []histOp, i int) *histOp {
 
 func previousTimeout(order []histOp, i int) *histOp {
 	for j := i - 1; j >= 0; j-- {
-		if order[j].op == "write" && !order[j].definite() {
+		if order[j].uncertain() {
 			return &order[j]
 		}
 	}
@@ -273,6 +290,13 @@ func violationText(ops []histOp) string {
 		}
 		if len(prior) == 1 && prior[0].value != r.value {
 			return fmt.Sprintf("Violation: the completed write `%s` must precede `%s`, which returned `%s`.", prior[0].id, r.id, r.value)
+		}
+		if len(prior) == 0 {
+			for _, w := range ops {
+				if w.op == "write" && w.rejected() && w.end.Before(r.start) && w.value == r.value {
+					return fmt.Sprintf("Violation: the rejected write `%s` did not take effect, and `%s` returned `%s`.", w.id, r.id, r.value)
+				}
+			}
 		}
 	}
 	return "Violation: no single ordering agrees with every read."

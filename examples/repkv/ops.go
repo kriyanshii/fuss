@@ -16,8 +16,11 @@ import (
 
 // A client event is one side of an operation: phase start is written
 // immediately before the request, phase end when the client has a response
-// or an error. id pairs the two lines. observe is what the client saw
-// (ok, timeout, or error). It is not a claim that the write took effect.
+// or an error. id pairs the two lines. observe is what the client saw:
+// ok, timeout, rejected, or error. rejected means the server returned an
+// HTTP error and the client records that the write did not take effect.
+// error means there was no HTTP response, so the write may still have
+// taken effect. timeout is the client giving up while the call was open.
 type clientEvent struct {
 	Kind    string `json:"kind"`
 	ID      string `json:"id"`
@@ -119,9 +122,15 @@ func (r *recorder) append(v any) {
 	}
 }
 
-// observeHTTP classifies what the client saw. A timeout is a timeout even
-// when the server may already have applied the write. A definitive HTTP
-// answer, including 404, is ok. Anything else is error.
+// observeHTTP classifies what the client saw.
+//
+//	ok: the server completed the call. 200 and 404 are both completed answers.
+//	timeout: the client stopped waiting. The write may already have taken effect.
+//	rejected: the server returned some other HTTP status. That is a definite
+//	  refusal: the write did not take effect. A server that applies a write
+//	  and then fails the response must not be recorded this way.
+//	error: no HTTP response (the dial failed, or the connection dropped).
+//	  The write's effect is uncertain.
 func observeHTTP(err error, status int) string {
 	if err != nil {
 		if isTimeout(err) {
@@ -132,7 +141,7 @@ func observeHTTP(err error, status int) string {
 	if status == http.StatusOK || status == http.StatusNotFound {
 		return "ok"
 	}
-	return "error"
+	return "rejected"
 }
 
 func isTimeout(err error) bool {

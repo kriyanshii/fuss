@@ -76,5 +76,15 @@ start. Exit 0 prints one legal order. Exit 1 prints why none exists.
 ./examples/repkv/repkv -check-history /tmp/repkv-inflight-history.jsonl -initial 0
 ```
 
+The same JSONL files are the controls for a Porcupine register. A timed-out
+write recorded as a failure rejects a later read of the new value. The same
+write recorded as a success bounded by the timeout rejects a later read of
+the old value. Extending that write's interval past the other operations, and
+letting the model apply it or not, accepts both, including a write that
+becomes visible only after the timeout (`timeout-late-write.jsonl`).
+Overlapping writes are legal when every later read matches one order, and
+illegal when the reads require two (`overlap-agree.jsonl`,
+`overlap-disagree.jsonl`).
+
 `repkv-read-error.yaml` is the same cluster and cut. The check dials a closed
 port after the new leader is known, and the verdict is `UNKNOWN reason=read_error`.

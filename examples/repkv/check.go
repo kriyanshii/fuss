@@ -261,16 +261,19 @@ func previousTimeout(order []histOp, i int) *histOp {
 }
 
 func violationText(ops []histOp) string {
-	for _, w := range ops {
-		if w.op != "write" || !w.definite() {
+	for _, r := range ops {
+		if r.op != "read" || !r.definite() {
 			continue
 		}
-		for _, r := range ops {
-			if r.op != "read" || !r.definite() || !w.end.Before(r.start) || r.value == w.value {
-				continue
+		var prior []histOp
+		for _, w := range ops {
+			if w.op == "write" && w.definite() && w.end.Before(r.start) {
+				prior = append(prior, w)
 			}
-			return fmt.Sprintf("Violation: the completed write `%s` must precede `%s`, which returned `%s`.", w.id, r.id, r.value)
+		}
+		if len(prior) == 1 && prior[0].value != r.value {
+			return fmt.Sprintf("Violation: the completed write `%s` must precede `%s`, which returned `%s`.", prior[0].id, r.id, r.value)
 		}
 	}
-	return "Violation: no legal ordering of the observed operations."
+	return "Violation: no single ordering agrees with every read."
 }

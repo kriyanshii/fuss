@@ -32,6 +32,21 @@ func TestHistoryControls(t *testing.T) {
 			true,
 			"Legal ordering: the timed-out write did not take effect before `r1`.",
 		},
+		{
+			"testdata/histories/timeout-late-write.jsonl",
+			true,
+			"Legal ordering: the timed-out write took effect before `r2`.",
+		},
+		{
+			"testdata/histories/overlap-agree.jsonl",
+			true,
+			"Legal ordering: w1 then w2 then r1 then r2.",
+		},
+		{
+			"testdata/histories/overlap-disagree.jsonl",
+			false,
+			"Violation: no single ordering agrees with every read.",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.file, func(t *testing.T) {

@@ -34,7 +34,9 @@ and Fuss `topology.proxy_mode` / `fault.isolate.direction` in
 ## Scenario
 
 1. Node 0 bootstraps; nodes 1 and 2 `-join` its Raft/mux address
-   (`host:port` of node 0’s proxy, not an `http://` URL).
+   (`host:port` of node 0’s proxy, not an `http://` URL). Fuss assigns
+   `${addr_raft}` and `${addr_http}` per node. Raft is the proxied listener.
+   HTTP is direct. The scenario does not pick those ports itself.
 2. Wait until node 0’s `/status` reports `Leader`. If it does not, the
    verdict is `UNKNOWN reason=leader_not_node_0` and nothing is acknowledged.
 3. Create a table and `POST` one row to node 0 **without** `?queue`. HTTP 200

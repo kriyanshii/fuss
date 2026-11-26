@@ -54,6 +54,14 @@ assigned, `${port}`:
 --listen-peer-urls http://127.0.0.1:${port}
 ```
 
+A scenario that needs a second listener lists it under `ports.names`.
+`${port}` stays the original listen port. `examples/rqlite` asks for `raft`
+and `http`. HTTP is `${addr_http}` and clients dial it directly. Raft listen
+is `${addr_raft}`. `peers.port_name: raft` makes the proxy upstream that
+Raft address. Two copies of that scenario can start together: each named
+port is chosen free, and one Fuss process does not reuse a free port it has
+already handed out.
+
 The address other members dial is the proxy in front of that node,
 `${node_proxy_addr_0}` and the same for 1 and 2:
 

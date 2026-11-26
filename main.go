@@ -337,13 +337,9 @@ func runAdapter(adapter Adapter, targetFlag string, seed int64, n int, doKill bo
 		if err != nil {
 			fatal(err)
 		}
+		var facts replayFacts
 		if bundleRun.saveDir != "" || bundleRun.want != nil {
-			facts := collectReplayFacts(result, bin)
-			if bundleRun.saveDir != "" {
-				if err := writeReplayBundle(bundleRun.saveDir, scenarioPath, bin, adapter.Name(), s, facts); err != nil {
-					fatal(err)
-				}
-			}
+			facts = collectReplayFacts(result, bin)
 			if bundleRun.want != nil {
 				got := facts
 				bundleRun.got = &got
@@ -399,6 +395,14 @@ func runAdapter(adapter Adapter, targetFlag string, seed int64, n int, doKill bo
 
 		if result.verdict == "PASS" {
 			os.RemoveAll(result.dir)
+		}
+		if bundleRun.saveDir != "" {
+			if err := missingReplayAck(facts); err != nil {
+				fatal(err)
+			}
+			if err := writeReplayBundle(bundleRun.saveDir, scenarioPath, bin, adapter.Name(), s, facts); err != nil {
+				fatal(err)
+			}
 		}
 	}
 

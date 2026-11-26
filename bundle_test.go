@@ -7,6 +7,32 @@ import (
 	"testing"
 )
 
+func TestMissingReplayAckKeepsTheReadKey(t *testing.T) {
+	facts := replayFacts{
+		Verdict: "PASS",
+		Read:    parseReadLine("PASS read_from=node_2 leader=self after_cut=yes cut_target=node_0 key=1-0"),
+	}
+	err := missingReplayAck(facts)
+	if err == nil || err.Error() != `cannot save replay bundle: missing acknowledgement for key "1-0"` {
+		t.Fatalf("err = %v", err)
+	}
+	facts.Ack = bundleAck{Line: "ack 1-0", Key: "1-0"}
+	if err := missingReplayAck(facts); err != nil {
+		t.Fatal(err)
+	}
+	facts.Ack = bundleAck{}
+	facts.Verdict = "LOST WRITE"
+	facts.Read = parseReadLine("LOST WRITE read_from=node_1 leader=self after_cut=yes value_missing=yes key=1-0")
+	err = missingReplayAck(facts)
+	if err == nil || err.Error() != `cannot save replay bundle: missing acknowledgement for key "1-0"` {
+		t.Fatalf("lost write err = %v", err)
+	}
+	facts.Verdict = "UNKNOWN"
+	if err := missingReplayAck(facts); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestReplayMatchesLostWrite(t *testing.T) {
 	want := &replayBundle{
 		Verdict: "LOST WRITE",

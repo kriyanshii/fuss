@@ -243,6 +243,19 @@ func collectReplayFacts(result *adapterTrialResult, binaryPath string) replayFac
 	}
 }
 
+// missingReplayAck is why a PASS or LOST WRITE bundle cannot be saved.
+// The live verdict stays whatever the check printed. The save step is what
+// fails, naming the key the read already reported.
+func missingReplayAck(facts replayFacts) error {
+	if facts.Verdict != "PASS" && facts.Verdict != "LOST WRITE" {
+		return nil
+	}
+	if facts.Ack.Key != "" || facts.Read.Key == "" {
+		return nil
+	}
+	return fmt.Errorf("cannot save replay bundle: missing acknowledgement for key %q", facts.Read.Key)
+}
+
 func writeReplayBundle(dir, scenarioPath, binaryPath, targetName string, seed int64, facts replayFacts) error {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err

@@ -34,7 +34,9 @@ and Fuss `topology.proxy_mode` / `fault.isolate.direction` in
 ## Scenario
 
 1. Node 0 bootstraps; nodes 1 and 2 `-join` its Raft/mux address
-   (`host:port` of node 0’s proxy, not an `http://` URL).
+   (`host:port` of node 0’s proxy, not an `http://` URL). Fuss assigns
+   `${addr_raft}` and `${addr_http}` per node. Raft is the proxied listener.
+   HTTP is direct. The scenario does not pick those ports itself.
 2. Wait until node 0’s `/status` reports `Leader`. If it does not, the
    verdict is `UNKNOWN reason=leader_not_node_0` and nothing is acknowledged.
 3. Create a table and `POST` one row to node 0 **without** `?queue`. HTTP 200
@@ -57,7 +59,12 @@ Timeout (`http` code `000`) → `UNKNOWN reason=read_timeout`. Any other HTTP
 status → `UNKNOWN reason=read_failed`. A statement `error` →
 `UNKNOWN reason=read_error`. Unparseable JSON → `UNKNOWN reason=read_malformed`.
 Check rules require the full PASS or LOST WRITE line. Trial JSON
-`evidence.check.out` carries that line.
+`evidence.check.out` carries that line. The line is written to
+`${home}/result.txt` (`${dir}/home/result.txt`). A control plants the same
+path: `examples/rqlite/fixture-lost/result.txt` is a LOST WRITE line and must
+be judged `LOST WRITE`. A control with no planted file must be judged
+`UNKNOWN` with `reason=result_absent`. Fuss runs those controls before any
+seed.
 
 Save the run and replay it with the same bundle format as repkv:
 

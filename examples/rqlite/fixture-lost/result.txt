@@ -1,0 +1,1 @@
+LOST WRITE read_from=node_1 raft_state=Leader after_cut=yes value_missing=yes key=1-0

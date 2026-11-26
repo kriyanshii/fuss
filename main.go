@@ -362,36 +362,7 @@ func runAdapter(adapter Adapter, targetFlag string, seed int64, n int, doKill bo
 			say("  dir=%s\n", result.dir)
 		}
 
-		ev := map[string]any{
-			"delay_ms": ms(result.delay),
-			"killed":   result.killed,
-			"status":   result.status,
-			"exit":     result.exit,
-			"took_ms":  ms(result.took),
-			"acks":     result.acks,
-		}
-		if len(result.topology) > 0 {
-			ev["topology"] = result.topology
-		}
-		if result.isolate != nil {
-			ev["isolate"] = result.isolate
-		}
-		if result.pause != nil {
-			ev["pause"] = result.pause
-		}
-		if result.check != nil {
-			ev["check"] = result.check
-		}
-		emit(map[string]any{
-			"type":     "trial",
-			"mode":     adapter.Name(),
-			"seed":     s,
-			"label":    result.phase,
-			"verdict":  result.verdict,
-			"dir":      result.dir,
-			"dir_kept": result.verdict != "PASS",
-			"evidence": ev,
-		})
+		emit(trialRecord(adapter.Name(), s, result))
 
 		if result.verdict == "PASS" {
 			os.RemoveAll(result.dir)
@@ -449,6 +420,46 @@ type adapterTrialResult struct {
 	isolate  map[string]any
 	pause    map[string]any
 	check    map[string]any
+	reason   string
+}
+
+// trialRecord is one -json trial line. reason sits next to verdict.
+// Socket details stay under evidence.isolate.unknown_owners.
+func trialRecord(mode string, seed int64, result *adapterTrialResult) map[string]any {
+	ev := map[string]any{
+		"delay_ms": ms(result.delay),
+		"killed":   result.killed,
+		"status":   result.status,
+		"exit":     result.exit,
+		"took_ms":  ms(result.took),
+		"acks":     result.acks,
+	}
+	if len(result.topology) > 0 {
+		ev["topology"] = result.topology
+	}
+	if result.isolate != nil {
+		ev["isolate"] = result.isolate
+	}
+	if result.pause != nil {
+		ev["pause"] = result.pause
+	}
+	if result.check != nil {
+		ev["check"] = result.check
+	}
+	rec := map[string]any{
+		"type":     "trial",
+		"mode":     mode,
+		"seed":     seed,
+		"label":    result.phase,
+		"verdict":  result.verdict,
+		"dir":      result.dir,
+		"dir_kept": result.verdict != "PASS",
+		"evidence": ev,
+	}
+	if result.reason != "" {
+		rec["reason"] = result.reason
+	}
+	return rec
 }
 
 func runAdapterTrial(adapter Adapter, seed int64, binaryPath string, doKill bool) (*adapterTrialResult, error) {
@@ -539,6 +550,7 @@ func runAdapterTrial(adapter Adapter, seed int64, binaryPath string, doKill bool
 		result.problems = cr.Problems
 		result.acks = cr.Evidence
 		result.verdict = verdictFromCheck(cr)
+		result.reason = cr.Reason
 	} else {
 		result.problems = adapter.Check(at, result.killed, result.phase)
 		if len(result.problems) > 0 {

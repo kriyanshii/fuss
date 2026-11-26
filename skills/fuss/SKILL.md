@@ -68,8 +68,12 @@ phrase the docs do not define, write down how it is being read.
 
 ### 2. Draft the YAML config
 
-Draft `<name>.yaml` from `skills/fuss/CONFIG.md`. Map the promise the person
-picked onto these parts:
+Draft `<name>.yaml` from `skills/fuss/CONFIG.md`. The etcd path from a
+guarantee to those fields is `skills/fuss/AUTHORING.md`. That file's proxy
+choice puts the PostgreSQL and etcd examples side by side: inbound is enough
+when the standby dials the primary, and etcd needs source attribution to cut
+both directions. The runnable PostgreSQL case is `examples/postgres`. Map the
+promise the person picked onto these parts:
 
 - **workload**: what gets acknowledged, and the line recorded outside the
   target when that acknowledgement arrives.
@@ -162,3 +166,8 @@ through it, including where it fell short of the rules.
 the annotated example in `CONFIG.md` copies. `toykv-fsync.yaml` is that file
 with `-fsync` added to `args`. Build and the two runs are in the repo README
 and in `examples/toykv/README.md`.
+
+`examples/postgres` is the replication-link example: one inbound cut, because
+the standby dials the primary. `examples/valkey` is the same cut for a
+primary and one replica. `skills/fuss/AUTHORING.md` puts that next to
+the etcd case, which needs a source tag to cut both directions.

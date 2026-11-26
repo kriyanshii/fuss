@@ -1,0 +1,251 @@
+# PostgreSQL 15.19: one primary, one hot standby. Replication goes through Fuss
+# proxies. Client sessions dial 127.0.0.1:${port} directly. The standby's WAL
+# stream dials ${node_proxy_addr_0}, the proxy in front of the primary.
+# synchronous_commit=remote_apply. Setup, the psql invocation, and why this
+# cut is inbound are in examples/postgres/README.md.
+# proxy_mode per_node, direction inbound: the standby dials the primary, so
+# cutting the primary's inbound proxy is the replication link.
+name: postgres
+binary:
+  default: postgres
+  extra:
+    - /usr/local/opt/postgresql@15/bin/postgres
+    - /opt/homebrew/opt/postgresql@15/bin/postgres
+topology:
+  nodes: 2
+  data_dir: "${dir}/node${i}"
+  ports:
+    base: 0
+  proxy_mode: per_node
+  peers:
+    port_name: replication
+    via_proxy: true
+  start:
+    - /bin/sh
+    - -c
+    - |
+      set -u
+      unset PGHOST PGPORT PGDATABASE PGUSER PGSERVICE PGSERVICEFILE PGOPTIONS PGDATA PGPASSFILE
+      BIN="${binary}"
+      PGDIR="$(dirname "$BIN")"
+      INITDB="$PGDIR/initdb"
+      PSQL="$PGDIR/psql"
+      BASEBACKUP="$PGDIR/pg_basebackup"
+      DIR="${dir}"
+      PORT="${port}"
+      DATA="${data_dir}"
+      PGDATA="$DATA/pg"
+      KEY="${seed}-0"
+      DBUSER="$(id -un)"
+      PROXY="${node_proxy_addr_0}"
+      PROXY_HOST="${PROXY%:*}"
+      PROXY_PORT="${PROXY##*:}"
+      export PGCONNECT_TIMEOUT=10
+      if [ ! -x "$INITDB" ] || [ ! -x "$PSQL" ] || [ ! -x "$BASEBACKUP" ]; then
+        echo "missing initdb, psql, or pg_basebackup next to $BIN" >&2
+        exit 1
+      fi
+      case "${i}" in
+        0)
+          "$INITDB" --no-sync --auth=trust --username="$DBUSER" -D "$PGDATA" > "$DATA/initdb.log" 2>&1
+          printf '%s\n' "$PORT" > "$DIR/pg_0"
+          (
+            log() { printf '%s\n' "$1" >> "$DIR/driver.log"; }
+            finish() { log "$1"; printf '%s\n' "$1" > "$DIR/result.txt"; printf '%s\n' DONE > "$DIR/drive_done"; exit 0; }
+            log "driver start key=$KEY"
+            ready=0
+            for _ in $(seq 1 300); do
+              if [ -s "$DIR/pg_0" ] && [ -s "$DIR/pg_1" ]; then ready=1; break; fi
+              sleep 0.2
+            done
+            if [ "$ready" != 1 ]; then finish "UNKNOWN reason=nodes_not_ready"; fi
+            PPORT=$(cat "$DIR/pg_0")
+            SPORT=$(cat "$DIR/pg_1")
+            log "ports primary=$PPORT standby=$SPORT"
+            streaming=0
+            line=""
+            for _ in $(seq 1 300); do
+              line=$("$PSQL" -X -w -h 127.0.0.1 -p "$PPORT" -d postgres -v ON_ERROR_STOP=1 -Atc "SELECT state FROM pg_stat_replication WHERE application_name = 'standby1'" 2>>"$DIR/driver.log" || true)
+              if [ "$line" = "streaming" ]; then streaming=1; break; fi
+              sleep 0.2
+            done
+            if [ "$streaming" != 1 ]; then
+              log "not streaming line=[$line]"
+              finish "UNKNOWN reason=not_streaming"
+            fi
+            if ! "$PSQL" -X -w -h 127.0.0.1 -p "$PPORT" -d postgres -v ON_ERROR_STOP=1 -c "ALTER SYSTEM SET synchronous_standby_names = 'standby1'" >>"$DIR/driver.log" 2>&1; then
+              finish "UNKNOWN reason=sync_config_failed"
+            fi
+            if ! "$PSQL" -X -w -h 127.0.0.1 -p "$PPORT" -d postgres -v ON_ERROR_STOP=1 -Atc "SELECT pg_reload_conf()" | grep -q t; then
+              finish "UNKNOWN reason=sync_config_failed"
+            fi
+            sync=0
+            mode=""
+            names=""
+            line=""
+            for _ in $(seq 1 150); do
+              line=$("$PSQL" -X -w -h 127.0.0.1 -p "$PPORT" -d postgres -v ON_ERROR_STOP=1 -Atc "SELECT state || ' ' || sync_state FROM pg_stat_replication WHERE application_name = 'standby1'" 2>>"$DIR/driver.log" || true)
+              mode=$("$PSQL" -X -w -h 127.0.0.1 -p "$PPORT" -d postgres -v ON_ERROR_STOP=1 -Atc "SHOW synchronous_commit" 2>>"$DIR/driver.log" || true)
+              names=$("$PSQL" -X -w -h 127.0.0.1 -p "$PPORT" -d postgres -v ON_ERROR_STOP=1 -Atc "SHOW synchronous_standby_names" 2>>"$DIR/driver.log" || true)
+              if [ "$line" = "streaming sync" ] && [ "$mode" = "remote_apply" ] && [ "$names" = "standby1" ]; then
+                sync=1
+                break
+              fi
+              sleep 0.2
+            done
+            if [ "$sync" != 1 ]; then
+              log "not sync line=[$line] mode=[$mode] names=[$names]"
+              finish "UNKNOWN reason=not_sync"
+            fi
+            # Ack only after this psql exits 0. ON_ERROR_STOP=1 makes a SQL error
+            # exit 3. Without it, a failed statement can abort the transaction,
+            # COMMIT rolls back, and psql can still exit 0. A timeout is not an ack.
+            if ! PGOPTIONS='-c statement_timeout=15s' "$PSQL" -X -w -h 127.0.0.1 -p "$PPORT" -d postgres -v ON_ERROR_STOP=1 <<SQL > "$DIR/put.out" 2>"$DIR/put.err"
+      BEGIN;
+      CREATE TABLE fuss_kv (k text PRIMARY KEY, v text);
+      INSERT INTO fuss_kv (k, v) VALUES ('$KEY', 'ok');
+      COMMIT;
+      SQL
+            then
+              log "write failed"
+              finish "UNKNOWN reason=write_failed"
+            fi
+            printf 'ack %s\n' "$KEY" >> "$DIR/runs.txt"
+            line=$("$PSQL" -X -w -h 127.0.0.1 -p "$PPORT" -d postgres -v ON_ERROR_STOP=1 -Atc "SELECT state || ' ' || sync_state FROM pg_stat_replication WHERE application_name = 'standby1'" 2>>"$DIR/driver.log" || true)
+            if [ "$line" != "streaming sync" ]; then
+              log "standby lost line=[$line]"
+              finish "UNKNOWN reason=standby_lost"
+            fi
+            printf '%s\n' "node_0" > "$DIR/leader_node"
+            printf '%s\n' NOW > "$DIR/cut_now"
+            applied=0
+            for _ in $(seq 1 200); do
+              if [ -s "$DIR/isolate_applied.json" ] && python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); ok=d.get("target")==sys.argv[2] and d.get("trigger_fired") is True and int(d.get("links_cut") or 0)>0; sys.exit(0 if ok else 1)' "$DIR/isolate_applied.json" node_0; then
+                applied=1
+                break
+              fi
+              if [ -s "$DIR/isolate_applied.json" ]; then
+                got=$(python3 -c 'import json,sys
+      try:
+          d=json.load(open(sys.argv[1]))
+      except Exception:
+          print("")
+          raise SystemExit
+      print(d.get("target") or "")' "$DIR/isolate_applied.json" || true)
+                if [ -n "$got" ] && [ "$got" != "node_0" ]; then
+                  finish "UNKNOWN reason=cut_missed_leader"
+                fi
+              fi
+              sleep 0.2
+            done
+            if [ "$applied" != 1 ]; then finish "UNKNOWN reason=cut_not_applied"; fi
+            if ! PGOPTIONS='-c statement_timeout=10s' "$PSQL" -X -w -h 127.0.0.1 -p "$SPORT" -d postgres -v ON_ERROR_STOP=1 -Atc "SELECT v FROM fuss_kv WHERE k = '$KEY'" > "$DIR/get.out" 2>"$DIR/get.err"; then
+              log "read failed"
+              finish "UNKNOWN reason=read_failed"
+            fi
+            val=$(tr -d '[:space:]' < "$DIR/get.out")
+            log "read val=[$val]"
+            case "$val" in
+              ok) finish "PASS read_from=node_1 standby_before_cut=sync after_cut=yes cut_target=node_0 key=$KEY" ;;
+              "") finish "LOST WRITE read_from=node_1 standby_before_cut=sync after_cut=yes value_missing=yes cut_target=node_0 key=$KEY" ;;
+              *) finish "UNKNOWN reason=read_unexpected" ;;
+            esac
+          ) &
+          exec "$BIN" -D "$PGDATA" \
+            -c listen_addresses=127.0.0.1 \
+            -c port="$PORT" \
+            -c unix_socket_directories= \
+            -c wal_level=replica \
+            -c max_wal_senders=10 \
+            -c max_replication_slots=10 \
+            -c hot_standby=on \
+            -c wal_keep_size=32 \
+            -c synchronous_commit=remote_apply
+          ;;
+        1)
+          printf '%s\n' "$PORT" > "$DIR/pg_1"
+          printf 'standby proxy=%s direct-wait-for-primary\n' "$PROXY" > "$DATA/setup.log"
+          ok=0
+          PPORT=""
+          for _ in $(seq 1 300); do
+            if [ -s "$DIR/pg_0" ]; then
+              PPORT=$(cat "$DIR/pg_0")
+              if "$PSQL" -X -w -h 127.0.0.1 -p "$PPORT" -d postgres -v ON_ERROR_STOP=1 -Atc 'SELECT 1' >/dev/null 2>&1; then
+                ok=1
+                break
+              fi
+            fi
+            sleep 0.2
+          done
+          if [ "$ok" != 1 ]; then
+            echo "primary never accepted connections" >> "$DATA/setup.log"
+            exit 1
+          fi
+          # One-shot base backup dials the primary's real port. The shell that
+          # runs pg_basebackup is replaced by exec postgres; the long-lived WAL
+          # stream is the standby process, and that stream dials the proxy.
+          bok=0
+          for _ in $(seq 1 20); do
+            rm -rf "$PGDATA"
+            if "$BASEBACKUP" -h 127.0.0.1 -p "$PPORT" -U "$DBUSER" -D "$PGDATA" --checkpoint=fast -w > "$DATA/basebackup.log" 2>&1; then
+              bok=1
+              break
+            fi
+            sleep 0.5
+          done
+          if [ "$bok" != 1 ]; then
+            echo "basebackup failed" >> "$DATA/setup.log"
+            exit 1
+          fi
+          touch "$PGDATA/standby.signal"
+          exec "$BIN" -D "$PGDATA" \
+            -c listen_addresses=127.0.0.1 \
+            -c port="$PORT" \
+            -c unix_socket_directories= \
+            -c hot_standby=on \
+            -c primary_conninfo="host=$PROXY_HOST port=$PROXY_PORT user=$DBUSER application_name=standby1 connect_timeout=10"
+          ;;
+        *)
+          echo "bad i=${i}" >&2
+          exit 1
+          ;;
+      esac
+  ready:
+    command:
+      - /bin/sh
+      - -c
+      - |
+        unset PGHOST PGPORT PGDATABASE PGUSER PGSERVICE PGOPTIONS PGDATA
+        "$(dirname "${binary}")/psql" -X -w -h 127.0.0.1 -p "${port}" -d postgres -v ON_ERROR_STOP=1 -Atc 'SELECT 1'
+    contains: "1"
+    timeout: 120s
+  stop_grace: 3s
+fault:
+  isolate:
+    node_file: "${dir}/leader_node"
+    direction: inbound
+  after:
+    file:
+      glob: "${dir}/cut_now"
+      contains: NOW
+      poll: 10ms
+      timeout: 60s
+kill:
+  at: file
+  file:
+    glob: "${dir}/drive_done"
+    contains: DONE
+    poll: 10ms
+    timeout: 150s
+check:
+  command:
+    command: ["/bin/cat", "${dir}/result.txt"]
+    as: out
+  rules:
+    - if: { out_contains: "LOST WRITE read_from=node_1 standby_before_cut=sync after_cut=yes value_missing=yes" }
+      verdict: "LOST WRITE"
+    - if: { out_contains: "PASS read_from=node_1 standby_before_cut=sync after_cut=yes" }
+      verdict: PASS
+    - if: { out_contains: "UNKNOWN" }
+      verdict: UNKNOWN
+    - else: FAIL

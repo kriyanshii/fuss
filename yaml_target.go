@@ -1499,8 +1499,9 @@ func (y *YAMLAdapter) checkIsolate(rt *topologyRuntime) CheckResult {
 			if rt.unknownOnCutLink() {
 				return CheckResult{
 					Verdict:  "UNKNOWN",
+					Reason:   "proxy_owner_unknown",
 					Evidence: 1,
-					Problems: []error{fmt.Errorf("fault.isolate: unknown owner on a cut link")},
+					Problems: []error{fmt.Errorf("fault.isolate: proxy_owner_unknown")},
 				}
 			}
 			return CheckResult{}
@@ -1834,14 +1835,18 @@ func (y *YAMLAdapter) CheckNamed(at AdapterTrial, killed bool, phase string) Che
 		if y.cfg.Fault.Isolate.active() {
 			if cr := y.checkIsolate(rt); cr.Verdict != "" {
 				// The scenario's own UNKNOWN (failed read, wrong leader, cut
-				// file missing) names the reason. PASS and LOST WRITE do not
-				// override a cut Fuss could not prove.
+				// file missing) names the reason in its result line. PASS and
+				// LOST WRITE do not override a cut Fuss could not prove.
+				// A proxy-owner failure keeps that line: the query can have
+				// succeeded, and the trial reason says the fault was not verified.
 				if y.usesRulesCheck() {
 					rules := y.checkRules(t)
 					if rules.Verdict == "UNKNOWN" {
 						return rules
 					}
-					delete(t.Data(), "check_vals")
+					if cr.Reason == "" {
+						delete(t.Data(), "check_vals")
+					}
 				}
 				return cr
 			}

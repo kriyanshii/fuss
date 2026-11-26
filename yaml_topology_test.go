@@ -984,8 +984,17 @@ func TestYAMLTopologyPerNodeOwnedUnknown(t *testing.T) {
 	_ = hold.Process.Kill()
 	_ = hold.Wait()
 	cr := a.CheckNamed(at, true, "topology")
-	if cr.Verdict != "UNKNOWN" {
-		t.Fatalf("verdict %s want UNKNOWN problems %v", cr.Verdict, cr.Problems)
+	if cr.Verdict != "UNKNOWN" || cr.Reason != "proxy_owner_unknown" {
+		t.Fatalf("verdict %s reason %q want UNKNOWN proxy_owner_unknown problems %v", cr.Verdict, cr.Reason, cr.Problems)
+	}
+	vals, _ := at.Data()["check_vals"].(map[string]any)
+	if vals["ready_files"] != 3 {
+		t.Fatalf("scenario check dropped: %#v", vals)
+	}
+	ev := rt.isolateEvidence()
+	unk, _ := ev["unknown_owners"].([]map[string]any)
+	if len(unk) == 0 || unk[0]["listen"] == "" {
+		t.Fatalf("socket details dropped: %#v", ev["unknown_owners"])
 	}
 }
 

@@ -96,9 +96,12 @@ func (t *BaseTrial) RecordContent() string {
 
 // CheckResult is what a YAML (or other named) check returns. The core copies
 // Verdict unless Evidence is 0 and Verdict is PASS (or empty), which becomes
-// UNKNOWN.
+// UNKNOWN. Reason, when set, is copied onto the trial JSON as a top-level
+// "reason". A proxy-owner failure uses it so the verdict says the fault was
+// not verified.
 type CheckResult struct {
 	Verdict  string
+	Reason   string
 	Problems []error
 	Evidence int
 }

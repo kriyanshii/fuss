@@ -62,6 +62,10 @@ rqlite v10.7.4, seed 1, on this machine: `PASS read_from=node_2 raft_state=Leade
 
 etcd v3.7.4, seeds 1 to 4 on this machine, all PASS. The cut target was `node_0`, `node_0`, `node_1`, and `node_2`. Each read came from a different member and included that leader's id (`leader_id`) and the cut target (`cut_target`). `links_cut` was 4 and `trigger_fired` was true. A saved seed-1 run is `examples/etcd/bundles/pass`.
 
+PostgreSQL 15.19 is a different fault: one primary, one standby, and an inbound cut of the proxy the standby dials. Seed 1 on this machine exited 0 with `"verdict":"PASS"` and `PASS read_from=node_1 standby_before_cut=sync after_cut=yes cut_target=node_0 key=1-0`. The cut link closed one connection and refused one reconnect (`closed_by_cut` 1, `refused_while_cut` 1). That is a replication-link interruption, not a promotion or a power loss. See `examples/postgres`.
+
+Valkey 9.2.0 is the same shape on a second program: one primary, one replica, and an inbound cut of the proxy the replica dials. Seed 1 on this machine exited 0 with `"verdict":"PASS"` and `PASS read_from=node_1 replica_before_cut=ok after_cut=yes cut_target=node_0 key=1-0`. The replica had already returned the value before the cut. `took_ms` was 6260.97. See `examples/valkey`.
+
 Save a run and replay it with the same bundle format:
 
 ```bash
@@ -76,10 +80,14 @@ The bundle stores the scenario, the Fuss revision, the target version and checks
 - repkv, seeds 1 to 10 on this machine: correct mode 10 PASS, bug mode 10 LOST WRITE, read-error mode 10 UNKNOWN. The PASS and LOST WRITE trials had an applied partition and a read from the surviving leader.
 - rqlite v10.7.4, seed 1: PASS after a strong read from `node_2`, with the cut applied (`links_cut=4`).
 - etcd v3.7.4, seeds 1 to 4: PASS after cutting the elected leader and reading the value from a survivor.
+- PostgreSQL 15.19, seed 1: PASS after an inbound cut of the primary's replication proxy. `node_1` was the synchronous standby before the cut, and the standby returned the acknowledged value. `took_ms` was 2350.743.
+- Valkey 9.2.0, seed 1: PASS after an inbound cut of the primary's replication proxy. The replica returned `ok` for key `1-0` before the cut and again after it. `took_ms` was 6260.97.
 
 Limits, stated plainly:
 - The rqlite fault is a symmetric isolate of `node_0` after that node has reported itself leader. rqlite still advertises one Raft address per node; `per_node_owned` tags the source process, so node 0's outbound heartbeats are refused and nodes 1 and 2 keep talking. There is no pause.
 - The etcd fault is a symmetric isolate of whichever member acknowledged the write. Fuss reads that name from `${dir}/leader_node` when the trigger fires. The member id in the result is the id etcd assigned at startup.
+- The PostgreSQL fault is an inbound cut of the primary after `node_1` was observed as the synchronous standby. The standby is not promoted. The primary is not killed. The same stream with `per_node_owned` and `direction: both` is `UNKNOWN` with `"reason":"proxy_owner_unknown"`, and the scenario line can still say the query succeeded.
+- The Valkey fault is an inbound cut of the primary after the replica's `GET` of key `1-0` returned `ok` and `master_link_status` was `up`. The replica is not promoted. The primary is not restarted.
 - A PASS is the documented guarantee for this one scenario and this one fault.
 - No new bugs found yet.
 
@@ -187,6 +195,12 @@ go build -o fuss .
 # Test etcd (YAML fixture; needs etcd v3.7.4, see examples/etcd)
 ./fuss -target-config=examples/etcd/etcd.yaml -n=1 -seed=1 -json
 
+# Test PostgreSQL (YAML fixture; needs PostgreSQL 15.19, see examples/postgres)
+./fuss -target-config=examples/postgres/postgres.yaml -n=1 -seed=1 -json
+
+# Test Valkey (YAML fixture; needs Valkey 9.2.0, see examples/valkey)
+./fuss -target-config=examples/valkey/valkey.yaml -target=/path/to/valkey-server -n=1 -seed=1 -json
+
 # Run tests
 go test ./...                          # Unit tests (no external binaries needed)
 go test -run TestDaguIntegration       # Dagu integration tests (needs dagu)
@@ -209,6 +223,13 @@ at startup (`fuss: <target> = … (from …)`), so a run never silently uses the
 wrong one.
 
 ## Testing your own program
+
+The etcd path from a documented guarantee to a scenario is
+`skills/fuss/AUTHORING.md`. That file also puts the PostgreSQL and etcd proxy
+choices side by side. Valkey uses the PostgreSQL choice: the replica dials
+the primary. Field names are in `skills/fuss/CONFIG.md`. The runnable
+PostgreSQL case is `examples/postgres`. The runnable Valkey case is
+`examples/valkey`.
 
 Copy `examples/toykv/toykv.yaml`, edit it with `skills/fuss/CONFIG.md`, and run:
 

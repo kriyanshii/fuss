@@ -337,6 +337,14 @@ shaped when `via_proxy` is true:
 
 Example: `proxy_mode: per_node`
 
+Which mode to use follows the connections the fault has to interrupt.
+`examples/postgres` is one inbound proxy: the standby dials the primary, so
+cutting that proxy is the replication link. `examples/valkey` is the same
+shape: the replica's `replicaof` dials the primary's proxy.
+`examples/etcd` needs source attribution so a two-way cut of the leader
+leaves the other pair up. The two shapes are side by side in
+`skills/fuss/AUTHORING.md`.
+
 ## `fault`
 
 Live fault while topology nodes keep running. Empty `isolate` disables it.
@@ -373,7 +381,15 @@ or destination is the isolated node and keeps every other connection. Evidence
 counts directed pairs (`links_cut` out of `links_total`, 6 for three nodes),
 and `accepted`, `refused_while_cut`, and `closed_by_cut` are counted per source
 node. An unknown owner on a cut link makes the trial `UNKNOWN`, not `PASS`.
-The process Fuss starts must own the peer sockets (`exec` the node binary); a shell wrapper's child is an unknown owner, and that correctly gives `UNKNOWN`.
+The trial JSON then has top-level `"reason":"proxy_owner_unknown"`.
+`evidence.isolate.unknown_owners` still lists each socket (`to`, `listen`,
+`remote`, `cut`). When the scenario's own rules are not `UNKNOWN`,
+`evidence.check` still holds that line, so a succeeded query stays visible.
+The verdict stays `UNKNOWN` because Fuss could not verify the fault. A
+scenario line that is already `UNKNOWN` keeps its own reason; it is not
+replaced by `proxy_owner_unknown`. The process Fuss starts must own the peer
+sockets (`exec` the node binary); a shell wrapper's child is an unknown
+owner, and that correctly gives `UNKNOWN`.
 
 **`fault.pause`** (string or object, default: empty). Sends `SIGSTOP` to one
 topology node's process after the same `fault.after` trigger as isolate.

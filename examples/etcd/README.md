@@ -1,5 +1,9 @@
 # etcd (v0 isolate)
 
+The path from the guarantee below to `etcd.yaml` is `skills/fuss/AUTHORING.md`.
+Why this scenario needs source attribution, and why the PostgreSQL example cuts
+only the primary's inbound proxy, is the proxy-choice section there.
+
 Three-node etcd cluster exercised through Fuss userspace proxies. Pin
 **etcd v3.7.4** (and the `etcdctl` shipped in that same archive). Not run in CI.
 

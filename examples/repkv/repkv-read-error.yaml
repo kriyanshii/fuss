@@ -1,0 +1,54 @@
+# Same three-node cut as repkv.yaml. The check dials a closed port after the
+# surviving leader is known, so a failed read stays UNKNOWN.
+name: repkv-read-error
+binary:
+  default: repkv
+  extra: ["./examples/repkv/repkv"]
+topology:
+  nodes: 3
+  data_dir: "${dir}/node${i}"
+  ports:
+    base: 0
+  peers:
+    port_name: raft
+    via_proxy: true
+  start:
+    - /bin/sh
+    - -c
+    - |
+      ${binary} -id ${i} -data-dir ${data_dir} -peer-listen 127.0.0.1:${port} -peer-addrs '${peer_addr_0},${peer_addr_1},${peer_addr_2}' -client 127.0.0.1:0 -mode correct -gate ${dir}/replicate &
+      pid=$!
+      if [ "${i}" = "0" ]; then
+        ${binary} -drive -dir ${dir} -n 3 -key ${seed}-0 -record ${dir}/runs.txt -cut ${dir}/cut_now -gate ${dir}/replicate -mode correct &
+      fi
+      wait $pid
+  ready:
+    file: "${data_dir}/ready"
+    contains: READY
+    timeout: 5s
+  stop_grace: 500ms
+fault:
+  isolate: node_0
+  after:
+    file:
+      glob: "${dir}/cut_now"
+      contains: NOW
+      poll: 10ms
+      timeout: 8s
+kill:
+  at: file
+  file:
+    glob: "${dir}/drive_done"
+    contains: DONE
+    poll: 10ms
+    timeout: 20s
+check:
+  command:
+    command: ["${binary}", "-verify", "-dir", "${dir}", "-n", "3", "-key", "${seed}-0", "-read-fault", "refused"]
+    as: out
+  rules:
+    - if: { out_contains: "LOST WRITE" }
+      verdict: "LOST WRITE"
+    - if: { out_contains: "UNKNOWN reason=read_error" }
+      verdict: UNKNOWN
+    - else: FAIL

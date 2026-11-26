@@ -39,15 +39,19 @@ kill:
     glob: "${dir}/drive_done"
     contains: DONE
     poll: 10ms
-    timeout: 10s
+    timeout: 20s
 check:
   command:
     command: ["${binary}", "-verify", "-dir", "${dir}", "-n", "3", "-key", "${seed}-0"]
     as: out
   rules:
-    - if: { out_contains: "LOST WRITE" }
+    - if: { out_contains: "LOST WRITE read_from=node_1 leader=self after_cut=yes value_missing=yes" }
       verdict: "LOST WRITE"
-    - if: { out_contains: "PASS" }
+    - if: { out_contains: "LOST WRITE read_from=node_2 leader=self after_cut=yes value_missing=yes" }
+      verdict: "LOST WRITE"
+    - if: { out_contains: "PASS read_from=node_1 leader=self after_cut=yes" }
+      verdict: PASS
+    - if: { out_contains: "PASS read_from=node_2 leader=self after_cut=yes" }
       verdict: PASS
     - if: { out_contains: "UNKNOWN" }
       verdict: UNKNOWN

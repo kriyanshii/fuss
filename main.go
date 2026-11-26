@@ -32,6 +32,8 @@ func main() {
 	// New adapter flag for selecting target
 	adapterName := flag.String("adapter", "", `target adapter: "dagu" (default), "rqlite", "fake", or examples/<name>/<name>.yaml`)
 	targetConfig := flag.String("target-config", "", "path to a YAML target config")
+	saveBundle := flag.String("save-bundle", "", "after one seed, write a replay bundle (scenario, revision, checksum, ack, cut, read) to this directory")
+	replayBundlePath := flag.String("replay-bundle", "", "replay a saved bundle and print the acknowledgement, applied partition, and read")
 
 	seed := flag.Int64("seed", 1, "first seed; the same seed replays the same run")
 	n := flag.Int("n", 1, "number of seeds to run, starting at -seed")
@@ -47,6 +49,20 @@ func main() {
 	measure := flag.Int("measure", 0, "if >0, run this many unkilled runs and print finalize timing; no verdicts")
 	measureStatus := flag.Bool("measure-status", true, "with -measure, also poll Dagu's status file (false shows Fuss's observer effect)")
 	flag.Parse()
+
+	if *replayBundlePath != "" {
+		if *targetConfig != "" || *adapterName != "" {
+			fatal(fmt.Errorf("-replay-bundle loads the scenario from the bundle"))
+		}
+		if *saveBundle != "" {
+			fatal(fmt.Errorf("-save-bundle and -replay-bundle cannot be set together"))
+		}
+		os.Exit(replaySavedBundle(*replayBundlePath, *jsonFlag))
+	}
+	if *saveBundle != "" && *n != 1 {
+		fatal(fmt.Errorf("-save-bundle records one seed; -n must be 1"))
+	}
+	bundleRun.saveDir = *saveBundle
 
 	if *targetConfig != "" && *adapterName != "" {
 		fatal(fmt.Errorf("-target-config and -adapter cannot be set together"))
@@ -305,6 +321,14 @@ func runAdapter(adapter Adapter, targetFlag string, seed int64, n int, doKill bo
 		emit(map[string]any{"type": "control", "name": ctlName, "ok": true})
 	}
 
+	scenarioPath := ""
+	if y, ok := adapter.(*YAMLAdapter); ok {
+		scenarioPath = y.path
+	}
+	if bundleRun.saveDir != "" && scenarioPath == "" {
+		fatal(fmt.Errorf("-save-bundle needs a YAML target"))
+	}
+
 	// Run trials
 	failed := 0
 	acks := 0
@@ -312,6 +336,18 @@ func runAdapter(adapter Adapter, targetFlag string, seed int64, n int, doKill bo
 		result, err := runAdapterTrial(adapter, s, bin, doKill)
 		if err != nil {
 			fatal(err)
+		}
+		if bundleRun.saveDir != "" || bundleRun.want != nil {
+			facts := collectReplayFacts(result, bin)
+			if bundleRun.saveDir != "" {
+				if err := writeReplayBundle(bundleRun.saveDir, scenarioPath, bin, adapter.Name(), s, facts); err != nil {
+					fatal(err)
+				}
+			}
+			if bundleRun.want != nil {
+				got := facts
+				bundleRun.got = &got
+			}
 		}
 		acks += result.acks
 		if result.verdict != "PASS" {
@@ -376,6 +412,18 @@ func runAdapter(adapter Adapter, targetFlag string, seed int64, n int, doKill bo
 		"acks":  acks,
 	})
 
+	if bundleRun.want != nil {
+		printReplayReport(bundleRun.want, bundleRun.got, bundleRun.pinNode)
+		if bundleRun.got == nil {
+			return exitSetup
+		}
+		if err := replayMatches(bundleRun.want, *bundleRun.got, bundleRun.pinNode); err != nil {
+			fmt.Fprintf(os.Stderr, "replay: %s\n", err)
+			return exitFail
+		}
+		return exitPass
+	}
+
 	if failed > 0 {
 		return exitFail
 	}
@@ -383,20 +431,20 @@ func runAdapter(adapter Adapter, targetFlag string, seed int64, n int, doKill bo
 }
 
 type adapterTrialResult struct {
-	dir       string
-	verdict   string
-	phase     string
-	killed    bool
-	delay     time.Duration
-	took      time.Duration
-	exit      int
-	status    string
-	problems  []error
-	acks      int
-	topology  []map[string]any
-	isolate   map[string]any
-	pause     map[string]any
-	check     map[string]any
+	dir      string
+	verdict  string
+	phase    string
+	killed   bool
+	delay    time.Duration
+	took     time.Duration
+	exit     int
+	status   string
+	problems []error
+	acks     int
+	topology []map[string]any
+	isolate  map[string]any
+	pause    map[string]any
+	check    map[string]any
 }
 
 func runAdapterTrial(adapter Adapter, seed int64, binaryPath string, doKill bool) (*adapterTrialResult, error) {

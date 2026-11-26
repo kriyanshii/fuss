@@ -1,29 +1,89 @@
 # fuss
 
-Seeded crash testing for unmodified binaries, as a skill for Claude Code,
-Cursor, Codex and Gemini CLI. Every reported bug replays from its seed, 10 of
-10.
+Test a real distributed system against a documented guarantee. Define the cluster, fault, and check in one scenario file, then replay the run.
 
-Fuss uses a **target adapter architecture** to test different programs. Currently
-supported targets:
+## Three nodes
 
-- **toykv**: demo KV in `examples/toykv` (YAML). Default loses acked writes; `-fsync` does not
-- **Dagu**: DAG workflow scheduler (original target) - tests zombie detection, retry, human tasks
-- **rqlite**: 3-node YAML fixture in `examples/rqlite` (pinned version; local `rqlited` on PATH)
-- **fake**: Test adapter for development and unit tests
+repkv is a small replicated key-value store in this repository. Correct mode acknowledges a write only after a follower has it. Bug mode acknowledges first and replicates later.
 
-A new target is a YAML file. See [Testing your own program](#testing-your-own-program).
+```bash
+git clone https://github.com/kriyanshii/fuss.git
+cd fuss
+go build -o fuss .
+go build -o examples/repkv/repkv ./examples/repkv
+
+./fuss -target-config=examples/repkv/repkv.yaml -seed=1 -n=10 -json
+./fuss -target-config=examples/repkv/repkv-bug.yaml -seed=1 -n=10 -json
+```
+
+Correct mode prints `"verdict":"PASS"`. The check read the value from the surviving leader after Fuss applied the partition. Bug mode prints `"verdict":"LOST WRITE"`. That read succeeded, and the value was missing.
+
+On this machine, seeds 1 to 10: correct mode 10 PASS, bug mode 10 LOST WRITE. Each trial's `-json` line carries `evidence.isolate` for the cut and `evidence.check.out` for the read. A correct-mode read looks like:
+
+```
+PASS read_from=node_1 leader=self after_cut=yes
+```
+
+A bug-mode read looks like:
+
+```
+LOST WRITE read_from=node_1 leader=self after_cut=yes value_missing=yes
+```
+
+`read_from` is `node_1` or `node_2`, the leader that remains after `node_0` is cut. A failed read is `UNKNOWN` with a reason (`examples/repkv/repkv-read-error.yaml`, 10 UNKNOWN on this machine, `reason=read_error`).
+
+Replay the saved bug-mode failure from a clean checkout:
+
+```bash
+./examples/repkv/replay.sh
+```
+
+The command rebuilds Fuss and repkv, runs the saved scenario and seed, and prints the acknowledgement, the applied partition, and the read:
+
+```
+ack: key=1-0
+cut: target=node_0 direction=both links_cut=4 trigger_fired=true
+read: key=1-0 read_from=node_1 status=ok found=false
+verdict: LOST WRITE
+```
+
+That block is a replay on this machine. Exit 0 means the new run showed those three facts, the read named the same key as the acknowledgement, and the verdict matched. repkv pins `node_0`, so the cut target must be the same node. An etcd scenario that writes the leader into `node_file` prints `saved=` and `replay=` targets. A different index still passes when that index was the leader before the cut.
+
+## The same file, on rqlite and etcd
+
+rqlite and etcd use the same shape: three processes, one acknowledged write, a symmetric partition, then a read from a new leader. rqlite cuts `node_0` after that node has reported itself leader. etcd writes the elected leader's name to `${dir}/leader_node` and Fuss cuts that member. Fuss writes `${dir}/isolate_applied.json` when the cut is applied. The scenario reads only after that file names the intended member with `trigger_fired` true and `links_cut` greater than 0. A timeout, a failed query, or a malformed body is `UNKNOWN` with a reason. `LOST WRITE` requires a successful read that shows the value is missing. If etcd's leader changes between the acknowledgement and the cut, the verdict is `UNKNOWN` and there is no post-cut read.
+
+```bash
+./fuss -target-config=examples/rqlite/rqlite.yaml -seed=1 -n=1 -json
+./fuss -target-config=examples/etcd/etcd.yaml -seed=1 -n=1 -json
+```
+
+rqlite v10.7.4, seed 1, on this machine: `PASS read_from=node_2 raft_state=Leader after_cut=yes`. The write body was checked before the acknowledgement. Replaying `examples/rqlite/bundles/pass` printed `ack: key=1-0`, a 4-link cut of `node_0`, and `read: key=1-0 read_from=node_1 status=ok found=true`.
+
+etcd v3.7.4, seeds 1 to 4 on this machine, all PASS. The cut target was `node_0`, `node_0`, `node_1`, and `node_2`. Each read came from a different member and included that leader's id (`leader_id`) and the cut target (`cut_target`). `links_cut` was 4 and `trigger_fired` was true. A saved seed-1 run is `examples/etcd/bundles/pass`.
+
+Save a run and replay it with the same bundle format:
+
+```bash
+./fuss -target-config=examples/rqlite/rqlite.yaml -seed=1 -n=1 -save-bundle=/tmp/rqlite-bundle
+./examples/rqlite/replay.sh /tmp/rqlite-bundle
+```
+
+The bundle stores the scenario, the Fuss revision, the target version and checksum, the seed, the acknowledgement, the cut, and the read.
 
 ## What Fuss has shown so far
 
-- repkv (a tiny 3-node KV fixture in examples/repkv): the correct mode passes 10/10. The bug mode, which acks before replicating, gives LOST WRITE 10/10 after the leader is isolated.
-- rqlite (pinned version in examples/rqlite/README.md): 3 real rqlited processes, one row written and acked, the leader isolated both ways (`per_node_owned`, no pause), a new leader elected, and the row read back at level=strong. PASS 10/10.
-- etcd v3.7.4, symmetric isolate of the leader, no pause, PASS 10/10.
+- repkv, seeds 1 to 10 on this machine: correct mode 10 PASS, bug mode 10 LOST WRITE, read-error mode 10 UNKNOWN. The PASS and LOST WRITE trials had an applied partition and a read from the surviving leader.
+- rqlite v10.7.4, seed 1: PASS after a strong read from `node_2`, with the cut applied (`links_cut=4`).
+- etcd v3.7.4, seeds 1 to 4: PASS after cutting the elected leader and reading the value from a survivor.
 
 Limits, stated plainly:
-- The rqlite fault is a symmetric isolate of the leader. rqlite still advertises one Raft address per node; `per_node_owned` tags the source process, so node 0’s outbound heartbeats are refused and nodes 1 and 2 keep talking. There is no pause.
-- A PASS confirms rqlite's documented guarantee for this one scenario. It does not prove rqlite correct.
+- The rqlite fault is a symmetric isolate of `node_0` after that node has reported itself leader. rqlite still advertises one Raft address per node; `per_node_owned` tags the source process, so node 0's outbound heartbeats are refused and nodes 1 and 2 keep talking. There is no pause.
+- The etcd fault is a symmetric isolate of whichever member acknowledged the write. Fuss reads that name from `${dir}/leader_node` when the trigger fires. The member id in the result is the id etcd assigned at startup.
+- A PASS is the documented guarantee for this one scenario and this one fault.
 - No new bugs found yet.
+
+Fuss is also a skill for Claude Code, Cursor, Codex, and Gemini CLI. The skill runs this same loop. People pick the promise and approve the check. Verdicts come from Fuss. See [Why the AI never judges](#why-the-ai-never-judges).
 
 ## Five minutes
 
@@ -81,6 +141,8 @@ until you cut a tag; `@v0` in the example is the ref you would use after that.
 Every trial's `verdict` must match `expected-verdict` (default `PASS`). Set it
 to lock in a known failure such as toykv's `LOST WRITE`.
 
+The repository workflow also runs repkv on Linux and macOS: correct mode, bug mode, and a read that is forced to fail. The job checks the verdict, that the partition landed, and that a PASS or LOST WRITE read came from the surviving leader. The failed read must be UNKNOWN.
+
 ## Why the AI never judges
 
 An agent running the skill can suggest promises to test, draft code and draft
@@ -112,8 +174,18 @@ go build -o fuss .
 # Test Dagu (requires Dagu binary)
 ./fuss -adapter=dagu -dag=one -target=/path/to/dagu -n=10
 
-# Test rqlite (YAML fixture; needs rqlited v10.7.4 on PATH, local only)
-./fuss -target-config=examples/rqlite/rqlite.yaml -n=10 -seed=1 -json
+# Three-node repkv (correct, then the lost-write bug)
+./fuss -target-config=examples/repkv/repkv.yaml -n=10 -seed=1 -json
+./fuss -target-config=examples/repkv/repkv-bug.yaml -n=10 -seed=1 -json
+
+# Replay the saved repkv failure
+./examples/repkv/replay.sh
+
+# Test rqlite (YAML fixture; needs rqlited v10.7.4, see examples/rqlite)
+./fuss -target-config=examples/rqlite/rqlite.yaml -n=1 -seed=1 -json
+
+# Test etcd (YAML fixture; needs etcd v3.7.4, see examples/etcd)
+./fuss -target-config=examples/etcd/etcd.yaml -n=1 -seed=1 -json
 
 # Run tests
 go test ./...                          # Unit tests (no external binaries needed)

@@ -346,6 +346,16 @@ one node and leaves the process running.
 
 - String form: `isolate: node_0` (direction defaults to `both`).
 - Object form: `isolate: { node: node_0, direction: inbound }`.
+- Runtime target: `isolate: { node_file: ${dir}/leader_node, direction: both }`.
+  When the trigger fires, Fuss reads the first line of that file and cuts
+  that node. The scenario writes `node_0`, `node_1`, or `node_2` after it
+  has seen which member is leader, then writes the trigger file. `node` and
+  `node_file` cannot both be set. A missing, empty, or unreadable file cuts
+  nothing, and the trial is `UNKNOWN`. Replay of a `node_file` scenario
+  accepts a different node index when that index was the leader before a
+  two-way cut and another member read the same key. A scenario that sets
+  `node` still requires that same index. If the leader changes before the
+  cut and the applied target is not that leader, the trial is `UNKNOWN`.
 
 **`fault.isolate.direction`** (string, default: `both`). Which links to cut:
 
@@ -387,6 +397,11 @@ reports `closed_by_cut` or `refused_while_cut` growth, the check verdict is
 `UNKNOWN` (never `PASS`). Trial JSON `evidence.isolate` records
 `proxy_mode`, `direction`, `links_cut`, `links_total`, `trigger_fired`,
 `cut_time`, and per-link `stats_before` / `stats_after`.
+When the cut has been applied, Fuss also writes `${dir}/isolate_applied.json`
+(`target`, `direction`, `links_cut`, `links_total`, `trigger_fired`, `cut_time`).
+A scenario that reads after the cut waits for that file and treats a missing
+file, `trigger_fired` false, or `links_cut` of 0 as `UNKNOWN`. The read is
+not a verdict until that evidence is there.
 Example: `after: { file: { glob: "${dir}/cut_now", contains: NOW, poll: 10ms, timeout: 5s } }`
 
 ## `check`

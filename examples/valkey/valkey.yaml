@@ -1,0 +1,206 @@
+# Valkey 9.2.0: one primary, one replica. The replica dials ${node_proxy_addr_0}.
+# Clients dial 127.0.0.1:${port}. proxy_mode per_node, direction inbound.
+# See examples/valkey/README.md.
+name: valkey
+binary:
+  default: valkey-server
+  extra:
+    - /tmp/valkey-9.2.0/src/valkey-server
+topology:
+  nodes: 2
+  data_dir: "${dir}/node${i}"
+  ports:
+    base: 0
+  proxy_mode: per_node
+  peers:
+    port_name: replication
+    via_proxy: true
+  start:
+    - /bin/sh
+    - -c
+    - |
+      set -u
+      unset VALKEYCLI_HOST VALKEYCLI_PORT VALKEYCLI_AUTH VALKEYCLI_USER
+      BIN="${binary}"
+      CLI="$(dirname "$BIN")/valkey-cli"
+      DIR="${dir}"
+      PORT="${port}"
+      DATA="${data_dir}"
+      KEY="${seed}-0"
+      PROXY="${node_proxy_addr_0}"
+      PROXY_HOST="${PROXY%:*}"
+      PROXY_PORT="${PROXY##*:}"
+      if [ ! -x "$CLI" ]; then
+        echo "missing valkey-cli next to $BIN" >&2
+        exit 1
+      fi
+      mkdir -p "$DATA"
+      vcli() {
+        "$CLI" -h 127.0.0.1 -p "$1" -t 2 --no-raw -e "${@:2}"
+      }
+      link_up() {
+        vcli "$1" INFO replication 2>/dev/null | awk -F: '/^master_link_status:/{gsub(/\r/,"",$2); print $2}'
+      }
+      case "${i}" in
+        0)
+          (
+            log() { printf '%s\n' "$1" >> "$DIR/driver.log"; }
+            finish() { log "$1"; printf '%s\n' "$1" > "$DIR/result.txt"; printf '%s\n' DONE > "$DIR/drive_done"; exit 0; }
+            log "driver start key=$KEY"
+            ready=0
+            for _ in $(seq 1 150); do
+              if vcli "$PORT" PING >/dev/null 2>&1 && [ -s "$DIR/vk_1" ] && vcli "$(cat "$DIR/vk_1")" PING >/dev/null 2>&1; then
+                ready=1
+                break
+              fi
+              sleep 0.2
+            done
+            if [ "$ready" != 1 ]; then finish "UNKNOWN reason=nodes_not_ready"; fi
+            SPORT=$(cat "$DIR/vk_1")
+            log "ports primary=$PORT standby=$SPORT"
+            seen=0
+            link=""
+            for _ in $(seq 1 150); do
+              link=$(link_up "$SPORT")
+              if [ "$link" = "up" ]; then
+                seen=1
+                break
+              fi
+              sleep 0.2
+            done
+            if [ "$seen" != 1 ]; then
+              log "link never up link=[$link]"
+              finish "UNKNOWN reason=replication_not_confirmed"
+            fi
+            if ! out=$(vcli "$PORT" SET "$KEY" ok 2>"$DIR/put.err"); then
+              log "write failed"
+              finish "UNKNOWN reason=write_failed"
+            fi
+            if [ "$out" != "OK" ]; then
+              log "write line=[$out]"
+              finish "UNKNOWN reason=write_failed"
+            fi
+            seen=0
+            line=""
+            link=""
+            for _ in $(seq 1 150); do
+              link=$(link_up "$SPORT")
+              line=$(vcli "$SPORT" GET "$KEY" 2>>"$DIR/driver.log" || true)
+              if [ "$link" = "up" ] && [ "$line" = '"ok"' ]; then
+                seen=1
+                break
+              fi
+              sleep 0.2
+            done
+            if [ "$seen" != 1 ]; then
+              log "not confirmed after set link=[$link] line=[$line]"
+              finish "UNKNOWN reason=replication_not_confirmed"
+            fi
+            link=$(link_up "$SPORT")
+            line=$(vcli "$SPORT" GET "$KEY" 2>>"$DIR/driver.log" || true)
+            if [ "$link" != "up" ] || [ "$line" != '"ok"' ]; then
+              log "replica lost link=[$link] line=[$line]"
+              finish "UNKNOWN reason=replica_lost"
+            fi
+            printf 'ack %s\n' "$KEY" >> "$DIR/runs.txt"
+            printf '%s\n' "node_0" > "$DIR/leader_node"
+            printf '%s\n' NOW > "$DIR/cut_now"
+            applied=0
+            for _ in $(seq 1 200); do
+              if [ -s "$DIR/isolate_applied.json" ] && python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); ok=d.get("target")==sys.argv[2] and d.get("trigger_fired") is True and int(d.get("links_cut") or 0)>0; sys.exit(0 if ok else 1)' "$DIR/isolate_applied.json" node_0; then
+                applied=1
+                break
+              fi
+              if [ -s "$DIR/isolate_applied.json" ]; then
+                got=$(python3 -c 'import json,sys
+      try:
+          d=json.load(open(sys.argv[1]))
+      except Exception:
+          print("")
+          raise SystemExit
+      print(d.get("target") or "")' "$DIR/isolate_applied.json" || true)
+                if [ -n "$got" ] && [ "$got" != "node_0" ]; then
+                  finish "UNKNOWN reason=cut_missed_leader"
+                fi
+              fi
+              sleep 0.2
+            done
+            if [ "$applied" != 1 ]; then finish "UNKNOWN reason=cut_not_applied"; fi
+            if ! line=$(vcli "$SPORT" GET "$KEY" 2>"$DIR/get.err"); then
+              log "read failed"
+              finish "UNKNOWN reason=read_failed"
+            fi
+            log "read line=[$line]"
+            case "$line" in
+              '"ok"') finish "PASS read_from=node_1 replica_before_cut=ok after_cut=yes cut_target=node_0 key=$KEY" ;;
+              '(nil)') finish "LOST WRITE read_from=node_1 replica_before_cut=ok after_cut=yes value_missing=yes cut_target=node_0 key=$KEY" ;;
+              *) finish "UNKNOWN reason=read_unexpected" ;;
+            esac
+          ) &
+          exec "$BIN" \
+            --bind 127.0.0.1 \
+            --port "$PORT" \
+            --protected-mode yes \
+            --daemonize no \
+            --dir "$DATA" \
+            --dbfilename dump.rdb \
+            --logfile "$DATA/valkey.log" \
+            --replica-serve-stale-data yes
+          ;;
+        1)
+          printf '%s\n' "$PORT" > "$DIR/vk_1"
+          exec "$BIN" \
+            --bind 127.0.0.1 \
+            --port "$PORT" \
+            --protected-mode yes \
+            --daemonize no \
+            --dir "$DATA" \
+            --dbfilename dump.rdb \
+            --logfile "$DATA/valkey.log" \
+            --replica-serve-stale-data yes \
+            --replicaof "$PROXY_HOST" "$PROXY_PORT"
+          ;;
+        *)
+          echo "bad i=${i}" >&2
+          exit 1
+          ;;
+      esac
+  ready:
+    command:
+      - /bin/sh
+      - -c
+      - |
+        unset VALKEYCLI_HOST VALKEYCLI_PORT VALKEYCLI_AUTH VALKEYCLI_USER
+        "$(dirname "${binary}")/valkey-cli" -h 127.0.0.1 -p "${port}" -t 2 --no-raw -e PING
+    contains: "PONG"
+    timeout: 30s
+  stop_grace: 3s
+fault:
+  isolate:
+    node_file: "${dir}/leader_node"
+    direction: inbound
+  after:
+    file:
+      glob: "${dir}/cut_now"
+      contains: NOW
+      poll: 10ms
+      timeout: 60s
+kill:
+  at: file
+  file:
+    glob: "${dir}/drive_done"
+    contains: DONE
+    poll: 10ms
+    timeout: 90s
+check:
+  command:
+    command: ["/bin/cat", "${dir}/result.txt"]
+    as: out
+  rules:
+    - if: { out_contains: "LOST WRITE read_from=node_1 replica_before_cut=ok after_cut=yes value_missing=yes" }
+      verdict: "LOST WRITE"
+    - if: { out_contains: "PASS read_from=node_1 replica_before_cut=ok after_cut=yes" }
+      verdict: PASS
+    - if: { out_contains: "UNKNOWN" }
+      verdict: UNKNOWN
+    - else: FAIL

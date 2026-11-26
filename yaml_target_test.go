@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -347,4 +348,30 @@ func TestStartArgsReuseOnEmptyRestart(t *testing.T) {
 func mustRead(p string) string {
 	b, _ := os.ReadFile(p)
 	return string(b)
+}
+
+func TestWriteIsolateApplied(t *testing.T) {
+	dir := t.TempDir()
+	writeIsolateApplied(dir, map[string]any{
+		"target":        "node_0",
+		"direction":     "both",
+		"links_cut":     4,
+		"links_total":   6,
+		"trigger_fired": true,
+		"cut_time":      "2026-11-25T00:00:00Z",
+	})
+	b, err := os.ReadFile(filepath.Join(dir, "isolate_applied.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc isolateAppliedDoc
+	if err := json.Unmarshal(b, &doc); err != nil {
+		t.Fatal(err)
+	}
+	if doc.Target != "node_0" || doc.Direction != "both" || doc.LinksCut != 4 || doc.LinksTotal != 6 || !doc.TriggerFired {
+		t.Fatalf("%+v", doc)
+	}
+	if _, err := os.Stat(filepath.Join(dir, ".isolate_applied.json.tmp")); !os.IsNotExist(err) {
+		t.Fatalf("temp file left behind: %v", err)
+	}
 }

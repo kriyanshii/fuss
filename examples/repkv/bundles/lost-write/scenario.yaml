@@ -1,0 +1,58 @@
+name: repkv-bug
+binary:
+  default: repkv
+  extra: ["./examples/repkv/repkv"]
+topology:
+  nodes: 3
+  data_dir: "${dir}/node${i}"
+  ports:
+    base: 0
+  peers:
+    port_name: raft
+    via_proxy: true
+  start:
+    - /bin/sh
+    - -c
+    - |
+      ${binary} -id ${i} -data-dir ${data_dir} -peer-listen 127.0.0.1:${port} -peer-addrs '${peer_addr_0},${peer_addr_1},${peer_addr_2}' -client 127.0.0.1:0 -mode bug -gate ${dir}/replicate &
+      pid=$!
+      if [ "${i}" = "0" ]; then
+        ${binary} -drive -dir ${dir} -n 3 -key ${seed}-0 -record ${dir}/runs.txt -cut ${dir}/cut_now -gate ${dir}/replicate -mode bug &
+      fi
+      wait $pid
+  ready:
+    file: "${data_dir}/ready"
+    contains: READY
+    timeout: 5s
+  stop_grace: 500ms
+fault:
+  isolate: node_0
+  after:
+    file:
+      glob: "${dir}/cut_now"
+      contains: NOW
+      poll: 10ms
+      timeout: 8s
+kill:
+  at: file
+  file:
+    glob: "${dir}/drive_done"
+    contains: DONE
+    poll: 10ms
+    timeout: 20s
+check:
+  command:
+    command: ["${binary}", "-verify", "-dir", "${dir}", "-n", "3", "-key", "${seed}-0"]
+    as: out
+  rules:
+    - if: { out_contains: "LOST WRITE read_from=node_1 leader=self after_cut=yes value_missing=yes" }
+      verdict: "LOST WRITE"
+    - if: { out_contains: "LOST WRITE read_from=node_2 leader=self after_cut=yes value_missing=yes" }
+      verdict: "LOST WRITE"
+    - if: { out_contains: "PASS read_from=node_1 leader=self after_cut=yes" }
+      verdict: PASS
+    - if: { out_contains: "PASS read_from=node_2 leader=self after_cut=yes" }
+      verdict: PASS
+    - if: { out_contains: "UNKNOWN" }
+      verdict: UNKNOWN
+    - else: FAIL

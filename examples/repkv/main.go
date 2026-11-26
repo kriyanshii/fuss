@@ -40,6 +40,7 @@ func main() {
 	cutNode := flag.String("cut-node", "node_0", "verify: isolate_applied.json target")
 	readFault := flag.String("read-fault", "", "verify: refused dials a closed port after the leader is known")
 	porcupineCheck := flag.Bool("porcupine", false, "verify: judge the recorded client history with Porcupine")
+	schedule := flag.String("schedule", "", "before, pending, or after; when the cut is applied relative to the write")
 	version := flag.Bool("version", false, "print repkv and exit")
 	renderHistoryPath := flag.String("render-history", "", "print a saved history JSONL and exit")
 	checkHistoryPath := flag.String("check-history", "", "decide whether a client history JSONL admits a legal order, then exit")
@@ -95,12 +96,14 @@ func main() {
 	}
 
 	switch {
+	case *verify:
+		os.Exit(runVerify(*dir, *n, *key, *cutNode, *readFault, *porcupineCheck, *initialValue, *schedule))
+	case *schedule != "":
+		os.Exit(runSchedule(*dir, *n, *key, *cut, *gate, *schedule))
 	case *inflight:
 		os.Exit(runInflight(*dir, *n, *key, *cut, *gate))
 	case *drive:
 		os.Exit(runDrive(*dir, *n, *key, *record, *cut, *gate, *mode))
-	case *verify:
-		os.Exit(runVerify(*dir, *n, *key, *cutNode, *readFault, *porcupineCheck, *initialValue))
 	default:
 		if *dataDir == "" || *peerListen == "" {
 			fmt.Fprintln(os.Stderr, "repkv: -data-dir and -peer-listen required")
@@ -442,6 +445,79 @@ func (n *node) gateLoop() {
 // then reports a timeout instead of a response.
 const inflightClientTimeout = 2 * time.Second
 
+// runSchedule is one write and one later read. The schedule names the gate
+// that decides when cut_now is written, relative to that write.
+func runSchedule(dir string, n int, key, cut, gate, schedule string) int {
+	defer func() {
+		_ = os.WriteFile(filepath.Join(dir, "drive_done"), []byte("DONE\n"), 0o644)
+	}()
+	clients, ok := waitClients(dir, n, 5*time.Second)
+	if !ok {
+		return 1
+	}
+	if !waitLeader(clients[0], 3*time.Second) {
+		fmt.Fprintf(os.Stderr, "schedule %s: node 0 not leader\n", schedule)
+		return 1
+	}
+	rec := openRecorder(filepath.Join(dir, "client.jsonl"))
+	switch schedule {
+	case "before":
+		// The cut file is the gate. The write is invoked only after Fuss
+		// has recorded the applied cut.
+		_ = os.WriteFile(cut, []byte("NOW\n"), 0o644)
+		_ = waitIsolateApplied(dir, "node_0", 10*time.Second)
+		clientWrite(rec, clients[0], key, "v", 3*time.Second)
+	case "pending":
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			clientWrite(rec, clients[0], key, "v", inflightClientTimeout)
+		}()
+		if err := waitFile(gate, 5*time.Second); err != nil {
+			fmt.Fprintf(os.Stderr, "schedule pending: replication not confirmed: %v\n", err)
+			<-done
+			return 0
+		}
+		_ = os.WriteFile(cut, []byte("NOW\n"), 0o644)
+		<-done
+		_ = waitIsolateApplied(dir, "node_0", 8*time.Second)
+	case "after":
+		// The acknowledgement is the gate. cut_now is written only after
+		// the client has observed success.
+		if clientWrite(rec, clients[0], key, "v", 3*time.Second) != "ok" {
+			fmt.Fprintln(os.Stderr, "schedule after: write was not acknowledged")
+			return 0
+		}
+		_ = os.WriteFile(cut, []byte("NOW\n"), 0o644)
+		_ = waitIsolateApplied(dir, "node_0", 8*time.Second)
+	default:
+		fmt.Fprintf(os.Stderr, "schedule %q\n", schedule)
+		return 1
+	}
+	return 0
+}
+
+func clientWrite(rec *recorder, addr, key, value string, timeout time.Duration) string {
+	put := &http.Client{Timeout: timeout}
+	req, err := http.NewRequest(http.MethodPut, "http://"+addr+"/k/"+key, strings.NewReader(value))
+	if err != nil {
+		rec.start("w1", "write", key, value, "")
+		rec.end("w1", "write", "error", "", err.Error(), false)
+		return "error"
+	}
+	rec.start("w1", "write", key, value, "")
+	resp, err := put.Do(req)
+	status := 0
+	if resp != nil {
+		status = resp.StatusCode
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+	}
+	obs := observeHTTP(err, status)
+	rec.end("w1", "write", obs, "", errText(err), false)
+	return obs
+}
+
 func runInflight(dir string, n int, key, cut, gate string) int {
 	defer func() {
 		_ = os.WriteFile(filepath.Join(dir, "drive_done"), []byte("DONE\n"), 0o644)
@@ -666,14 +742,26 @@ func appliedOK(doc isolateApplied, target string) bool {
 // that client history is linearizable. The cut is not an input to that
 // answer. Fuss reports the experiment UNKNOWN when it cannot verify the cut,
 // even if this line says the history is legal.
-func runVerifyHistory(dir string, n int, key, initial string) int {
+func runVerifyHistory(dir string, n int, key, initial, schedule string) int {
+	report := func(prefix string) int {
+		saved := writeSavedHistory(dir)
+		if schedule != "" {
+			fmt.Print(scheduleCheck(saved, initial, schedule))
+			return 0
+		}
+		if prefix != "" {
+			fmt.Printf("%stranslation effect=optional bound=open\n%s", prefix, saved)
+			return 0
+		}
+		fmt.Print(formatHistoryCheck(saved, initial))
+		return 0
+	}
 	rec := openRecorder(filepath.Join(dir, "client.jsonl"))
 	clients := make([]string, n)
 	for i := 0; i < n; i++ {
 		b, err := os.ReadFile(filepath.Join(dir, fmt.Sprintf("node%d", i), "client"))
 		if err != nil {
-			fmt.Printf("history unknown reason=no_client\ntranslation effect=optional bound=open\n%s", writeSavedHistory(dir))
-			return 0
+			return report("history unknown reason=no_client\n")
 		}
 		clients[i] = strings.TrimSpace(string(b))
 	}
@@ -692,8 +780,7 @@ func runVerifyHistory(dir string, n int, key, initial string) int {
 		}
 	}
 	if newLead < 1 {
-		fmt.Printf("history unknown reason=no_read\ntranslation effect=optional bound=open\n%s", writeSavedHistory(dir))
-		return 0
+		return report("history unknown reason=no_read\n")
 	}
 	httpClient := &http.Client{Timeout: 2 * time.Second}
 	from := fmt.Sprintf("node_%d", newLead)
@@ -721,18 +808,15 @@ func runVerifyHistory(dir string, n int, key, initial string) int {
 		missing = true
 	}
 	rec.end("r1", "read", obs, readValue, errText(err), missing)
-	saved := writeSavedHistory(dir)
-	if obs != "ok" {
-		fmt.Printf("history unknown reason=read_%s\ntranslation effect=optional bound=open\n%s", obs, saved)
-		return 0
+	if schedule == "" && obs != "ok" {
+		return report(fmt.Sprintf("history unknown reason=read_%s\n", obs))
 	}
-	fmt.Print(formatHistoryCheck(saved, initial))
-	return 0
+	return report("")
 }
 
-func runVerify(dir string, n int, key, cutNode, readFault string, porcupineOn bool, initial string) int {
+func runVerify(dir string, n int, key, cutNode, readFault string, porcupineOn bool, initial, schedule string) int {
 	if porcupineOn {
-		return runVerifyHistory(dir, n, key, initial)
+		return runVerifyHistory(dir, n, key, initial, schedule)
 	}
 	defer writeSavedHistory(dir)
 	if cutNode == "" {

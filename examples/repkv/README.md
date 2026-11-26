@@ -100,5 +100,19 @@ cut on its own. If the cut cannot be verified, the experiment verdict is
 `UNKNOWN` even when the history is legal. The trial JSON keeps the history
 line in `evidence.check.out` and the cut in `evidence.isolate`.
 
+`schedules.sh` runs that same write and post-cut read at three gates.
+`before` writes `cut_now` and waits for the applied cut before the client
+invokes the write. `pending` invokes the write, waits until it has replicated,
+then cuts while the response is still held. `after` waits until the client
+observes success, then cuts. Each run saves `history.jsonl` and `cut.json`.
+The experiment is `PASS` only when the requested window occurred, Porcupine
+says the history is legal, and a read started after the cut. A missing
+post-cut read keeps the history line and the experiment is `UNKNOWN`.
+
+```sh
+./examples/repkv/schedules.sh
+./examples/repkv/schedules.sh pending
+```
+
 `repkv-read-error.yaml` is the same cluster and cut. The check dials a closed
 port after the new leader is known, and the verdict is `UNKNOWN reason=read_error`.

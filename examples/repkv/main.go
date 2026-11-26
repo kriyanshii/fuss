@@ -23,6 +23,7 @@ const electionTimeout = 250 * time.Millisecond
 
 func main() {
 	drive := flag.Bool("drive", false, "PUT then fire isolate trigger")
+	inflight := flag.Bool("inflight", false, "replicate, cut the leader, and let the client time out before any response")
 	verify := flag.Bool("verify", false, "GET key from new leader among nodes 1..n-1")
 	id := flag.Int("id", 0, "node index")
 	dataDir := flag.String("data-dir", "", "node data directory")
@@ -39,14 +40,31 @@ func main() {
 	cutNode := flag.String("cut-node", "node_0", "verify: isolate_applied.json target")
 	readFault := flag.String("read-fault", "", "verify: refused dials a closed port after the leader is known")
 	version := flag.Bool("version", false, "print repkv and exit")
+	renderHistoryPath := flag.String("render-history", "", "print a saved history JSONL and exit")
 	flag.Parse()
 
 	if *version {
 		fmt.Println("repkv")
 		os.Exit(0)
 	}
+	if *renderHistoryPath != "" {
+		b, err := os.ReadFile(*renderHistoryPath)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(2)
+		}
+		text, err := renderHistory(b)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(2)
+		}
+		fmt.Println(text)
+		os.Exit(0)
+	}
 
 	switch {
+	case *inflight:
+		os.Exit(runInflight(*dir, *n, *key, *cut, *gate))
 	case *drive:
 		os.Exit(runDrive(*dir, *n, *key, *record, *cut, *gate, *mode))
 	case *verify:
@@ -150,6 +168,23 @@ func (n *node) handleK(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "not leader", http.StatusServiceUnavailable)
 			return
 		}
+		// hold: the write is on every follower before the client is answered.
+		// The handler then waits until the client gives up, so the response
+		// is still outstanding when Fuss cuts the leader.
+		if n.mode == "hold" {
+			if !n.replicateEvery(key, val) {
+				http.Error(w, "replicate failed", http.StatusServiceUnavailable)
+				return
+			}
+			n.mu.Lock()
+			n.store[key] = val
+			n.mu.Unlock()
+			if n.gate != "" {
+				_ = os.WriteFile(n.gate, []byte("REPLICATED\n"), 0o644)
+			}
+			<-r.Context().Done()
+			return
+		}
 		if n.mode == "bug" {
 			n.mu.Lock()
 			n.store[key] = val
@@ -170,6 +205,20 @@ func (n *node) handleK(w http.ResponseWriter, r *http.Request) {
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
 	}
+}
+
+func (n *node) replicateEvery(key, val string) bool {
+	need, okN := 0, 0
+	for j, addr := range n.peers {
+		if j == n.id || addr == "" {
+			continue
+		}
+		need++
+		if sendRepl(addr, key, val) {
+			okN++
+		}
+	}
+	return need > 0 && okN == need
 }
 
 func (n *node) replicateAll(key, val string) bool {
@@ -356,6 +405,110 @@ func (n *node) gateLoop() {
 	}
 }
 
+// inflightClientTimeout is long enough for replication and the cut to
+// finish while the PUT is still waiting, and short enough that the client
+// then reports a timeout instead of a response.
+const inflightClientTimeout = 2 * time.Second
+
+func runInflight(dir string, n int, key, cut, gate string) int {
+	defer func() {
+		_ = os.WriteFile(filepath.Join(dir, "drive_done"), []byte("DONE\n"), 0o644)
+	}()
+	clients, ok := waitClients(dir, n, 5*time.Second)
+	if !ok {
+		return 1
+	}
+	if !waitLeader(clients[0], 3*time.Second) {
+		fmt.Fprintln(os.Stderr, "inflight: node 0 not leader")
+		return 1
+	}
+	rec := openRecorder()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		put := &http.Client{Timeout: inflightClientTimeout}
+		req, err := http.NewRequest(http.MethodPut, "http://"+clients[0]+"/k/"+key, strings.NewReader("v"))
+		if err != nil {
+			rec.end("w1", "write", "error", "", err.Error(), false)
+			return
+		}
+		rec.start("w1", "write", key, "v", "")
+		resp, err := put.Do(req)
+		status := 0
+		if resp != nil {
+			status = resp.StatusCode
+			resp.Body.Close()
+		}
+		rec.end("w1", "write", observeHTTP(err, status), "", errText(err), false)
+	}()
+	if err := waitFile(gate, 5*time.Second); err != nil {
+		fmt.Fprintf(os.Stderr, "inflight: replication not confirmed: %v\n", err)
+		<-done
+		return 0
+	}
+	_ = os.WriteFile(cut, []byte("NOW\n"), 0o644)
+	<-done
+	_ = waitIsolateApplied(dir, "node_0", 8*time.Second)
+	return 0
+}
+
+func waitClients(dir string, n int, timeout time.Duration) ([]string, bool) {
+	clients := make([]string, n)
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		ok := true
+		for i := 0; i < n; i++ {
+			b, err := os.ReadFile(filepath.Join(dir, fmt.Sprintf("node%d", i), "client"))
+			if err != nil {
+				ok = false
+				break
+			}
+			clients[i] = strings.TrimSpace(string(b))
+		}
+		if ok {
+			return clients, true
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	for i, c := range clients {
+		if c == "" {
+			fmt.Fprintf(os.Stderr, "drive: no client for node %d\n", i)
+		}
+	}
+	return nil, false
+}
+
+func waitLeader(client string, timeout time.Duration) bool {
+	poll := &http.Client{Timeout: 300 * time.Millisecond}
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		resp, err := poll.Get("http://" + client + "/leader")
+		if err == nil {
+			b, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if strings.TrimSpace(string(b)) == "0" {
+				return true
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	return false
+}
+
+func waitFile(path string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for {
+		st, err := os.Stat(path)
+		if err == nil && st.Size() > 0 {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("%s not written", path)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 func runDrive(dir string, n int, key, record, cut, gate, mode string) int {
 	// Always release the trial. A stuck dial must not hold the kill file
 	// until Fuss treats the run as a broken setup.
@@ -406,16 +559,20 @@ func runDrive(dir string, n int, key, record, cut, gate, mode string) int {
 		time.Sleep(20 * time.Millisecond)
 	}
 
+	rec := openRecorder()
 	req, _ := http.NewRequest(http.MethodPut, "http://"+clients[0]+"/k/"+key, strings.NewReader("v"))
+	rec.start("w1", "write", key, "v", "")
 	resp, err := put.Do(req)
-	if err != nil || resp.StatusCode != 200 {
-		if resp != nil {
-			resp.Body.Close()
-		}
+	status := 0
+	if resp != nil {
+		status = resp.StatusCode
+		resp.Body.Close()
+	}
+	rec.end("w1", "write", observeHTTP(err, status), "", errText(err), false)
+	if err != nil || status != 200 {
 		fmt.Fprintf(os.Stderr, "drive: PUT failed: %v\n", err)
 		return 1
 	}
-	resp.Body.Close()
 	if record != "" {
 		f, err := os.OpenFile(record, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 		if err == nil {
@@ -437,8 +594,11 @@ func runDrive(dir string, n int, key, record, cut, gate, mode string) int {
 
 type isolateApplied struct {
 	Target       string `json:"target"`
+	Direction    string `json:"direction"`
 	LinksCut     int    `json:"links_cut"`
+	LinksTotal   int    `json:"links_total"`
 	TriggerFired bool   `json:"trigger_fired"`
+	CutTime      string `json:"cut_time,omitempty"`
 }
 
 func waitIsolateApplied(dir, target string, timeout time.Duration) error {
@@ -471,6 +631,7 @@ func appliedOK(doc isolateApplied, target string) bool {
 }
 
 func runVerify(dir string, n int, key, cutNode, readFault string) int {
+	defer writeSavedHistory(dir)
 	if cutNode == "" {
 		cutNode = "node_0"
 	}
@@ -509,9 +670,13 @@ func runVerify(dir string, n int, key, cutNode, readFault string) int {
 	}
 	client := &http.Client{Timeout: 2 * time.Second}
 	url := "http://" + clients[newLead] + "/k/" + key
+	from := fmt.Sprintf("node_%d", newLead)
 	if readFault == "refused" {
 		url = "http://127.0.0.1:1/k/" + key
+		from = "node_refused"
 	}
+	rec := openRecorder()
+	rec.start("r1", "read", key, "", from)
 	resp, err := client.Get(url)
 	var status int
 	var body string
@@ -525,6 +690,16 @@ func runVerify(dir string, n int, key, cutNode, readFault string) int {
 			body = string(b)
 		}
 	}
+	obs := observeHTTP(err, status)
+	readValue := ""
+	missing := false
+	if obs == "ok" && status == http.StatusOK {
+		readValue = strings.TrimSpace(body)
+	}
+	if obs == "ok" && status == http.StatusNotFound {
+		missing = true
+	}
+	rec.end("r1", "read", obs, readValue, errText(err), missing)
 	kind, reason := classifyRead(status, body, err, "v")
 	fmt.Println(verifyLine(kind, reason, newLead, key))
 	return 0

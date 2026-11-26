@@ -77,14 +77,28 @@ start. Exit 0 prints one legal order. Exit 1 prints why none exists.
 ```
 
 The same JSONL files are the controls for a Porcupine register. A timed-out
-write recorded as a failure rejects a later read of the new value. The same
-write recorded as a success bounded by the timeout rejects a later read of
-the old value. Extending that write's interval past the other operations, and
-letting the model apply it or not, accepts both, including a write that
-becomes visible only after the timeout (`timeout-late-write.jsonl`).
-Overlapping writes are legal when every later read matches one order, and
-illegal when the reads require two (`overlap-agree.jsonl`,
-`overlap-disagree.jsonl`).
+write has two assumptions, and they are named separately. The effect is
+`none` (the write did not happen), `required` (it must take effect), or
+`optional` (it may be omitted). The bound is `timeout` (if it takes effect,
+it does so by the client timeout) or `open` (it may take effect later).
+
+`required` and `timeout` together reject a later read of the old value,
+because the write is required to take effect, not only because the timeout
+is a bound. `optional` and `timeout` still allow that read by omitting the
+write, and reject a read of the old value followed by a read of the new one
+(`timeout-late-write.jsonl`). Leaving the bound `open` accepts that late
+write. A timed-out write of `1` followed by reads of `1` then `0`
+(`timeout-then-revert.jsonl`) is illegal under every combination: one
+ordering still has to explain the whole history. Overlapping writes are
+legal when every later read matches one order, and illegal when the reads
+require two (`overlap-agree.jsonl`, `overlap-disagree.jsonl`).
+
+`repkv-inflight.yaml` feeds its recorded JSONL to Porcupine with
+`effect=optional` and `bound=open`. The check prints `history legal` or
+`history illegal`. That line is the history verdict. Fuss still verifies the
+cut on its own. If the cut cannot be verified, the experiment verdict is
+`UNKNOWN` even when the history is legal. The trial JSON keeps the history
+line in `evidence.check.out` and the cut in `evidence.isolate`.
 
 `repkv-read-error.yaml` is the same cluster and cut. The check dials a closed
 port after the new leader is known, and the verdict is `UNKNOWN reason=read_error`.

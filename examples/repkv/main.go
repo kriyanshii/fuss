@@ -39,6 +39,7 @@ func main() {
 	cut := flag.String("cut", "", "isolate trigger file (drive)")
 	cutNode := flag.String("cut-node", "node_0", "verify: isolate_applied.json target")
 	readFault := flag.String("read-fault", "", "verify: refused dials a closed port after the leader is known")
+	porcupineCheck := flag.Bool("porcupine", false, "verify: judge the recorded client history with Porcupine")
 	version := flag.Bool("version", false, "print repkv and exit")
 	renderHistoryPath := flag.String("render-history", "", "print a saved history JSONL and exit")
 	checkHistoryPath := flag.String("check-history", "", "decide whether a client history JSONL admits a legal order, then exit")
@@ -87,7 +88,7 @@ func main() {
 	case *drive:
 		os.Exit(runDrive(*dir, *n, *key, *record, *cut, *gate, *mode))
 	case *verify:
-		os.Exit(runVerify(*dir, *n, *key, *cutNode, *readFault))
+		os.Exit(runVerify(*dir, *n, *key, *cutNode, *readFault, *porcupineCheck, *initialValue))
 	default:
 		if *dataDir == "" || *peerListen == "" {
 			fmt.Fprintln(os.Stderr, "repkv: -data-dir and -peer-listen required")
@@ -441,7 +442,7 @@ func runInflight(dir string, n int, key, cut, gate string) int {
 		fmt.Fprintln(os.Stderr, "inflight: node 0 not leader")
 		return 1
 	}
-	rec := openRecorder()
+	rec := openRecorder(filepath.Join(dir, "client.jsonl"))
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -649,7 +650,78 @@ func appliedOK(doc isolateApplied, target string) bool {
 	return doc.TriggerFired && doc.LinksCut > 0 && doc.Target == target
 }
 
-func runVerify(dir string, n int, key, cutNode, readFault string) int {
+// runVerifyHistory records the post-cut read, then asks Porcupine whether
+// that client history is linearizable. The cut is not an input to that
+// answer. Fuss reports the experiment UNKNOWN when it cannot verify the cut,
+// even if this line says the history is legal.
+func runVerifyHistory(dir string, n int, key, initial string) int {
+	rec := openRecorder(filepath.Join(dir, "client.jsonl"))
+	clients := make([]string, n)
+	for i := 0; i < n; i++ {
+		b, err := os.ReadFile(filepath.Join(dir, fmt.Sprintf("node%d", i), "client"))
+		if err != nil {
+			fmt.Printf("history unknown reason=no_client\ntranslation effect=optional bound=open\n%s", writeSavedHistory(dir))
+			return 0
+		}
+		clients[i] = strings.TrimSpace(string(b))
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	newLead := -1
+	for time.Now().Before(deadline) && newLead < 0 {
+		for i := 1; i < n; i++ {
+			id, err := leaderID(clients[i])
+			if err == nil && id == i {
+				newLead = i
+				break
+			}
+		}
+		if newLead < 0 {
+			time.Sleep(50 * time.Millisecond)
+		}
+	}
+	if newLead < 1 {
+		fmt.Printf("history unknown reason=no_read\ntranslation effect=optional bound=open\n%s", writeSavedHistory(dir))
+		return 0
+	}
+	httpClient := &http.Client{Timeout: 2 * time.Second}
+	from := fmt.Sprintf("node_%d", newLead)
+	rec.start("r1", "read", key, "", from)
+	resp, err := httpClient.Get("http://" + clients[newLead] + "/k/" + key)
+	var status int
+	var body string
+	if err == nil {
+		status = resp.StatusCode
+		b, rerr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		resp.Body.Close()
+		if rerr != nil {
+			err = rerr
+		} else {
+			body = string(b)
+		}
+	}
+	obs := observeHTTP(err, status)
+	readValue := ""
+	missing := false
+	if obs == "ok" && status == http.StatusOK {
+		readValue = strings.TrimSpace(body)
+	}
+	if obs == "ok" && status == http.StatusNotFound {
+		missing = true
+	}
+	rec.end("r1", "read", obs, readValue, errText(err), missing)
+	saved := writeSavedHistory(dir)
+	if obs != "ok" {
+		fmt.Printf("history unknown reason=read_%s\ntranslation effect=optional bound=open\n%s", obs, saved)
+		return 0
+	}
+	fmt.Print(formatHistoryCheck(saved, initial))
+	return 0
+}
+
+func runVerify(dir string, n int, key, cutNode, readFault string, porcupineOn bool, initial string) int {
+	if porcupineOn {
+		return runVerifyHistory(dir, n, key, initial)
+	}
 	defer writeSavedHistory(dir)
 	if cutNode == "" {
 		cutNode = "node_0"

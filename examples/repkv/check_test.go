@@ -38,6 +38,11 @@ func TestHistoryControls(t *testing.T) {
 			"Legal ordering: the timed-out write took effect before `r2`.",
 		},
 		{
+			"testdata/histories/timeout-then-revert.jsonl",
+			false,
+			"Violation: no single ordering agrees with every read.",
+		},
+		{
 			"testdata/histories/overlap-agree.jsonl",
 			true,
 			"Legal ordering: w1 then w2 then r1 then r2.",

@@ -640,6 +640,94 @@ check:
 	}
 }
 
+func TestUnprovenCutKeepsALegalHistory(t *testing.T) {
+	buildTopologyHold(t)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "legal-history.yaml")
+	body := []byte(`
+name: legal-history-unproven-cut
+binary:
+  default: hold
+  extra: ["./testdata/yaml/topology/hold"]
+topology:
+  nodes: 3
+  data_dir: "${dir}/node${i}"
+  ports:
+    base: 0
+  peers:
+    port_name: raft
+    via_proxy: true
+  start: ["${binary}", "${data_dir}", "${port}", "${peers}"]
+  ready:
+    file: "${data_dir}/ready"
+    contains: READY
+    timeout: 2s
+  stop_grace: 200ms
+fault:
+  isolate: node_0
+  after:
+    file:
+      glob: "${dir}/cut_now"
+      contains: NOW
+      poll: 10ms
+      timeout: 200ms
+check:
+  command:
+    command: ["/bin/sh", "-c", "printf '%s\n' 'history legal'"]
+    as: out
+  rules:
+    - if: { out_contains: "history illegal" }
+      verdict: ILLEGAL
+    - if: { out_contains: "history legal" }
+      verdict: PASS
+    - else: FAIL
+`)
+	if err := os.WriteFile(path, body, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	a, err := LoadYAMLTarget(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bin, _, err := a.ResolveBinary("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	trialDir := t.TempDir()
+	at, err := a.Init(1, trialDir, bin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	log, err := os.Create(filepath.Join(trialDir, "log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer log.Close()
+	hold, err := a.Start(at, log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rt := at.Data()["topology"].(*topologyRuntime)
+	t.Cleanup(func() {
+		a.stopTopology(rt)
+		if hold.Process != nil {
+			_ = hold.Process.Kill()
+			_ = hold.Wait()
+		}
+	})
+	_ = hold.Process.Kill()
+	_ = hold.Wait()
+	cr := a.CheckNamed(at, true, "topology")
+	if cr.Verdict != "UNKNOWN" {
+		t.Fatalf("verdict %s want UNKNOWN problems %v", cr.Verdict, cr.Problems)
+	}
+	vals, _ := at.Data()["check_vals"].(map[string]any)
+	out, _ := vals["out"].(string)
+	if !strings.Contains(out, "history legal") {
+		t.Fatalf("check out %q", out)
+	}
+}
+
 func TestYAMLTopologyIsolateNodeFile(t *testing.T) {
 	buildTopologyHold(t)
 	a, err := LoadYAMLTarget("testdata/yaml/topology/isolate_node_file.yaml")

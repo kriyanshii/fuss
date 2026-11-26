@@ -35,7 +35,8 @@ topology:
         (
           DIR="${dir}"
           KEY="${seed}-0"
-          RESULT="${DIR}/result.txt"
+          # ${home} is ${dir}/home. plant_dir copies a fixture onto that same directory.
+          RESULT="${home}/result.txt"
           CUT="${DIR}/cut_now"
           DONE="${DIR}/drive_done"
           wait_http() {
@@ -218,7 +219,15 @@ kill:
     timeout: 45s
 check:
   command:
-    command: ["/bin/cat", "${dir}/result.txt"]
+    command:
+      - /bin/sh
+      - -c
+      - |
+        if [ -f "${home}/result.txt" ]; then
+          cat "${home}/result.txt"
+        else
+          printf '%s\n' "UNKNOWN reason=result_absent"
+        fi
     as: out
   rules:
     - if: { out_contains: "LOST WRITE read_from=node_1 raft_state=Leader after_cut=yes value_missing=yes" }
@@ -233,3 +242,9 @@ check:
     - if: { out_contains: "UNKNOWN" }
       verdict: UNKNOWN
     - else: FAIL
+controls:
+  lost_write:
+    plant_dir: fixture-lost
+    expect_verdict: "LOST WRITE"
+  result_absent:
+    expect_verdict: UNKNOWN

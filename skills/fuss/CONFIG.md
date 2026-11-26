@@ -515,9 +515,17 @@ exactly as written, with no template expansion. For an ack check the line
 has to start with `ack `. Example: `plant_record: "ack planted\n"`
 
 **`plant_dir`** (string, default: empty). A directory copied over the trial
-home after that home is replaced. Resolved as the given path, then as that
-path next to the config file. It must be a directory. Not expanded.
+home after that home is replaced. The trial home is `${home}`, the
+directory `${dir}/home`. Resolved as the given path, then as that path
+next to the config file. It must be a directory. Not expanded.
 Example: `plant_dir: testdata/yaml/plant/fixture`
+
+A live result and a control have to use that same path. The driver writes
+`${home}/result.txt`. The check reads `${home}/result.txt`. A fixture file
+`result.txt` therefore lands on the path the checker reads. `examples/rqlite`
+plants a LOST WRITE line that way, and a second control plants nothing. The
+check prints `UNKNOWN reason=result_absent` when the file is missing. A
+missing file is not a lost write. Both paths are in `skills/fuss/AUTHORING.md`.
 
 **`expect_verdict`** (string, default: `FAIL`). The check verdict must equal
 this. Any other verdict makes `RunControl` return `control BROKEN: ...`.

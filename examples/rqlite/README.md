@@ -57,7 +57,12 @@ Timeout (`http` code `000`) → `UNKNOWN reason=read_timeout`. Any other HTTP
 status → `UNKNOWN reason=read_failed`. A statement `error` →
 `UNKNOWN reason=read_error`. Unparseable JSON → `UNKNOWN reason=read_malformed`.
 Check rules require the full PASS or LOST WRITE line. Trial JSON
-`evidence.check.out` carries that line.
+`evidence.check.out` carries that line. The line is written to
+`${home}/result.txt` (`${dir}/home/result.txt`). A control plants the same
+path: `examples/rqlite/fixture-lost/result.txt` is a LOST WRITE line and must
+be judged `LOST WRITE`. A control with no planted file must be judged
+`UNKNOWN` with `reason=result_absent`. Fuss runs those controls before any
+seed.
 
 Save the run and replay it with the same bundle format as repkv:
 

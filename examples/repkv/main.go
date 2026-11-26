@@ -39,10 +39,25 @@ func main() {
 	cutNode := flag.String("cut-node", "node_0", "verify: isolate_applied.json target")
 	readFault := flag.String("read-fault", "", "verify: refused dials a closed port after the leader is known")
 	version := flag.Bool("version", false, "print repkv and exit")
+	renderHistoryPath := flag.String("render-history", "", "print a saved history JSONL and exit")
 	flag.Parse()
 
 	if *version {
 		fmt.Println("repkv")
+		os.Exit(0)
+	}
+	if *renderHistoryPath != "" {
+		b, err := os.ReadFile(*renderHistoryPath)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(2)
+		}
+		text, err := renderHistory(b)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(2)
+		}
+		fmt.Println(text)
 		os.Exit(0)
 	}
 
@@ -406,16 +421,20 @@ func runDrive(dir string, n int, key, record, cut, gate, mode string) int {
 		time.Sleep(20 * time.Millisecond)
 	}
 
+	rec := openRecorder()
 	req, _ := http.NewRequest(http.MethodPut, "http://"+clients[0]+"/k/"+key, strings.NewReader("v"))
+	rec.start("w1", "write", key, "v", "")
 	resp, err := put.Do(req)
-	if err != nil || resp.StatusCode != 200 {
-		if resp != nil {
-			resp.Body.Close()
-		}
+	status := 0
+	if resp != nil {
+		status = resp.StatusCode
+		resp.Body.Close()
+	}
+	rec.end("w1", "write", observeHTTP(err, status), "", errText(err), false)
+	if err != nil || status != 200 {
 		fmt.Fprintf(os.Stderr, "drive: PUT failed: %v\n", err)
 		return 1
 	}
-	resp.Body.Close()
 	if record != "" {
 		f, err := os.OpenFile(record, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 		if err == nil {
@@ -437,8 +456,11 @@ func runDrive(dir string, n int, key, record, cut, gate, mode string) int {
 
 type isolateApplied struct {
 	Target       string `json:"target"`
+	Direction    string `json:"direction"`
 	LinksCut     int    `json:"links_cut"`
+	LinksTotal   int    `json:"links_total"`
 	TriggerFired bool   `json:"trigger_fired"`
+	CutTime      string `json:"cut_time,omitempty"`
 }
 
 func waitIsolateApplied(dir, target string, timeout time.Duration) error {
@@ -471,6 +493,7 @@ func appliedOK(doc isolateApplied, target string) bool {
 }
 
 func runVerify(dir string, n int, key, cutNode, readFault string) int {
+	defer writeSavedHistory(dir)
 	if cutNode == "" {
 		cutNode = "node_0"
 	}
@@ -509,9 +532,13 @@ func runVerify(dir string, n int, key, cutNode, readFault string) int {
 	}
 	client := &http.Client{Timeout: 2 * time.Second}
 	url := "http://" + clients[newLead] + "/k/" + key
+	from := fmt.Sprintf("node_%d", newLead)
 	if readFault == "refused" {
 		url = "http://127.0.0.1:1/k/" + key
+		from = "node_refused"
 	}
+	rec := openRecorder()
+	rec.start("r1", "read", key, "", from)
 	resp, err := client.Get(url)
 	var status int
 	var body string
@@ -525,6 +552,16 @@ func runVerify(dir string, n int, key, cutNode, readFault string) int {
 			body = string(b)
 		}
 	}
+	obs := observeHTTP(err, status)
+	readValue := ""
+	missing := false
+	if obs == "ok" && status == http.StatusOK {
+		readValue = strings.TrimSpace(body)
+	}
+	if obs == "ok" && status == http.StatusNotFound {
+		missing = true
+	}
+	rec.end("r1", "read", obs, readValue, errText(err), missing)
 	kind, reason := classifyRead(status, body, err, "v")
 	fmt.Println(verifyLine(kind, reason, newLead, key))
 	return 0

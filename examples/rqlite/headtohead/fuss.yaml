@@ -1,0 +1,94 @@
+# Launch, cut, and package only. The client is headtohead/workload.py.
+name: rqlite-headtohead
+binary:
+  default: rqlited
+  extra: ["/usr/local/bin/rqlited"]
+topology:
+  nodes: 3
+  data_dir: "${dir}/node${i}"
+  ports:
+    base: 0
+    names: [raft, http]
+  proxy_mode: per_node_owned
+  peers:
+    port_name: raft
+    via_proxy: true
+  start:
+    - /bin/sh
+    - -c
+    - |
+      set -e
+      case "${i}" in
+        0) ADV='${node_proxy_addr_0}' ;;
+        1) ADV='${node_proxy_addr_1}' ;;
+        2) ADV='${node_proxy_addr_2}' ;;
+        *) echo "bad i=${i}" >&2; exit 1 ;;
+      esac
+      HTTP="${addr_http}"
+      echo "$HTTP" > "${dir}/http_${i}"
+      RAFT="${addr_raft}"
+      JOIN0='${node_proxy_addr_0}'
+      if [ "${i}" = "0" ]; then
+        python3 examples/rqlite/headtohead/workload.py "${dir}" "${seed}-0" &
+        exec ${binary} -node-id "node_${i}" \
+          -http-addr "$HTTP" \
+          -raft-addr "$RAFT" \
+          -raft-adv-addr "$ADV" \
+          "${data_dir}/rqlite"
+      else
+        for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do
+          [ -f "${dir}/http_0" ] && break
+          sleep 0.2
+        done
+        exec ${binary} -node-id "node_${i}" \
+          -http-addr "$HTTP" \
+          -raft-addr "$RAFT" \
+          -raft-adv-addr "$ADV" \
+          -join "$JOIN0" \
+          -join-attempts 30 \
+          -join-interval 500ms \
+          "${data_dir}/rqlite"
+      fi
+  ready:
+    command:
+      - /bin/sh
+      - -c
+      - curl -sf "http://$(cat ${dir}/http_${i})/readyz"
+    contains: "node ok"
+    timeout: 30s
+  stop_grace: 2s
+fault:
+  isolate:
+    node: node_0
+    direction: both
+  after:
+    file:
+      glob: "${dir}/cut_now"
+      contains: NOW
+      poll: 10ms
+      timeout: 20s
+kill:
+  at: file
+  file:
+    glob: "${dir}/drive_done"
+    contains: DONE
+    poll: 10ms
+    timeout: 45s
+check:
+  command:
+    command:
+      - ./examples/repkv/repkv
+      - -check-history
+      - ${dir}/history.jsonl
+      - -porcupine
+      - -initial
+      - ""
+    as: out
+  rules:
+    - if: { out_contains: "history unknown" }
+      verdict: UNKNOWN
+    - if: { out_contains: "history illegal" }
+      verdict: ILLEGAL
+    - if: { out_contains: "history legal" }
+      verdict: PASS
+    - else: FAIL

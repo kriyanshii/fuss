@@ -70,6 +70,18 @@ func main() {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(2)
 		}
+		if *porcupineCheck {
+			text := formatHistoryCheck(b, *initialValue)
+			fmt.Print(text)
+			switch {
+			case strings.HasPrefix(text, "history legal"):
+				os.Exit(0)
+			case strings.HasPrefix(text, "history illegal"):
+				os.Exit(1)
+			default:
+				os.Exit(2)
+			}
+		}
 		legal, text, err := checkHistory(b, *initialValue)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, err)

@@ -114,7 +114,11 @@ func toPorcupine(ops []histOp, mode string) []porcupine.Operation {
 		in := regInput{write: op.op == "write", value: op.value}
 		out := op.value
 		ret := op.end.UnixNano()
-		if op.op == "write" && op.observe != "ok" {
+		if op.op == "write" && op.observe == "rejected" {
+			// A refusal is a completed failure in every translation. It is not
+			// a timeout, so none of the timeout assumptions apply.
+			out = "fail"
+		} else if op.op == "write" && op.observe != "ok" {
 			switch mode {
 			case effectNone:
 				out = "fail"

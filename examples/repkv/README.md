@@ -44,7 +44,12 @@ the path is explicit.
 `history.sh` runs the existing after-ack scenario once and writes a JSONL
 history. Each client operation is two lines with the same `id`: `phase` `start`
 immediately before the request, and `phase` `end` when the client sees `ok`,
-`timeout`, or `error`. A successful read's end line includes `value`. The cut
+`timeout`, `rejected`, or `error`. `rejected` is an HTTP error from the server:
+the client records that the write did not take effect. repkv's PUT returns
+503 before it stores the key when it is not leader or replication fails, and
+that response is `rejected`. `error` is a transport failure with no HTTP
+response, so the write may still have taken effect and the checker treats it
+like a timeout. A successful read's end line includes `value`. The cut
 line is Fuss's `isolate_applied.json` (`target`, `cut_time`), not a time the
 driver guessed.
 
@@ -113,6 +118,13 @@ post-cut read keeps the history line and the experiment is `UNKNOWN`.
 ./examples/repkv/schedules.sh
 ./examples/repkv/schedules.sh pending
 ```
+
+`go test -run TestFussRefusesTheWrongScheduleExperiment` is the outer check
+that a legal history is not enough. Withholding the cut leaves the history
+legal and the Fuss verdict `UNKNOWN`. Requesting `pending` when the cut is
+after the acknowledgement is `UNKNOWN` even though the cut landed and the
+read succeeded. An acknowledged write, the right cut, and a stale read is
+`ILLEGAL`.
 
 `repkv-read-error.yaml` is the same cluster and cut. The check dials a closed
 port after the new leader is known, and the verdict is `UNKNOWN reason=read_error`.

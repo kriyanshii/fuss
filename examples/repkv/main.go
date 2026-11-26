@@ -71,6 +71,18 @@ func main() {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(2)
 		}
+		if *schedule != "" {
+			text := scheduleCheck(b, *initialValue, *schedule)
+			fmt.Print(text)
+			switch {
+			case strings.HasPrefix(text, "experiment illegal"):
+				os.Exit(1)
+			case strings.HasPrefix(text, "experiment pass"), strings.HasPrefix(text, "experiment unknown"):
+				os.Exit(0)
+			default:
+				os.Exit(2)
+			}
+		}
 		if *porcupineCheck {
 			text := formatHistoryCheck(b, *initialValue)
 			fmt.Print(text)
@@ -508,13 +520,18 @@ func clientWrite(rec *recorder, addr, key, value string, timeout time.Duration) 
 	rec.start("w1", "write", key, value, "")
 	resp, err := put.Do(req)
 	status := 0
+	detail := ""
 	if resp != nil {
 		status = resp.StatusCode
-		io.Copy(io.Discard, resp.Body)
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 256))
 		resp.Body.Close()
+		detail = strings.TrimSpace(string(b))
+	}
+	if err != nil {
+		detail = err.Error()
 	}
 	obs := observeHTTP(err, status)
-	rec.end("w1", "write", obs, "", errText(err), false)
+	rec.end("w1", "write", obs, "", detail, false)
 	return obs
 }
 

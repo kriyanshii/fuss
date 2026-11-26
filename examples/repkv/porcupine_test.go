@@ -59,6 +59,69 @@ func TestPorcupineTimeoutTranslations(t *testing.T) {
 	}
 }
 
+func TestRejectedWriteIsNotATimeout(t *testing.T) {
+	rejectedNew := hist(
+		`{"kind":"client","id":"w1","phase":"start","op":"write","key":"k","value":"1","at":"2026-11-26T00:00:00Z"}`,
+		`{"kind":"client","id":"w1","phase":"end","op":"write","observe":"rejected","at":"2026-11-26T00:00:01Z"}`,
+		`{"kind":"client","id":"r1","phase":"start","op":"read","key":"k","at":"2026-11-26T00:00:02Z"}`,
+		`{"kind":"client","id":"r1","phase":"end","op":"read","observe":"ok","value":"1","at":"2026-11-26T00:00:03Z"}`,
+	)
+	rejectedOld := hist(
+		`{"kind":"client","id":"w1","phase":"start","op":"write","key":"k","value":"1","at":"2026-11-26T00:00:00Z"}`,
+		`{"kind":"client","id":"w1","phase":"end","op":"write","observe":"rejected","at":"2026-11-26T00:00:01Z"}`,
+		`{"kind":"client","id":"r1","phase":"start","op":"read","key":"k","at":"2026-11-26T00:00:02Z"}`,
+		`{"kind":"client","id":"r1","phase":"end","op":"read","observe":"ok","value":"0","at":"2026-11-26T00:00:03Z"}`,
+	)
+	transportNew := hist(
+		`{"kind":"client","id":"w1","phase":"start","op":"write","key":"k","value":"1","at":"2026-11-26T00:00:00Z"}`,
+		`{"kind":"client","id":"w1","phase":"end","op":"write","observe":"error","at":"2026-11-26T00:00:01Z"}`,
+		`{"kind":"client","id":"r1","phase":"start","op":"read","key":"k","at":"2026-11-26T00:00:02Z"}`,
+		`{"kind":"client","id":"r1","phase":"end","op":"read","observe":"ok","value":"1","at":"2026-11-26T00:00:03Z"}`,
+	)
+	for _, mode := range []string{effectNone, effectRequiredBound, effectOptionalBound, effectOptionalOpen} {
+		if porcupineLegal(mustOps(t, rejectedNew), mode, "0") {
+			t.Errorf("%s accepted a rejected write followed by the new value", mode)
+		}
+		if !porcupineLegal(mustOps(t, rejectedOld), mode, "0") {
+			t.Errorf("%s rejected a refused write followed by the old value", mode)
+		}
+	}
+	if !porcupineLegal(mustOps(t, transportNew), effectOptionalOpen, "0") {
+		t.Fatal("optional-open rejected a transport error followed by the new value")
+	}
+	if porcupineLegal(mustOps(t, transportNew), effectNone, "0") {
+		t.Fatal("effect none accepted a transport error followed by the new value")
+	}
+	legal, text, err := checkHistory(rejectedNew, "0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if legal || !strings.Contains(text, "the rejected write `w1` did not take effect") {
+		t.Fatalf("reference checker: legal=%v text=%s", legal, text)
+	}
+	legal, _, err = checkHistory(rejectedOld, "0")
+	if err != nil || !legal {
+		t.Fatalf("reference checker old value: legal=%v err=%v", legal, err)
+	}
+	legal, _, err = checkHistory(transportNew, "0")
+	if err != nil || !legal {
+		t.Fatalf("reference checker transport: legal=%v err=%v", legal, err)
+	}
+}
+
+func hist(lines ...string) []byte {
+	return []byte(strings.Join(lines, "\n") + "\n")
+}
+
+func mustOps(t *testing.T, data []byte) []histOp {
+	t.Helper()
+	ops, err := parseHistory(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ops
+}
+
 func TestHistoryLineUsesTheOpenTranslation(t *testing.T) {
 	revert, err := os.ReadFile("testdata/histories/timeout-then-revert.jsonl")
 	if err != nil {

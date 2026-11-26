@@ -60,6 +60,8 @@ rqlite and etcd use the same shape: three processes, one acknowledged write, a s
 
 rqlite v10.7.4, seed 1, on this machine: `PASS read_from=node_2 raft_state=Leader after_cut=yes`. The write body was checked before the acknowledgement. Replaying `examples/rqlite/bundles/pass` printed `ack: key=1-0`, a 4-link cut of `node_0`, and `read: key=1-0 read_from=node_1 status=ok found=true`.
 
+The checked example is [`examples/rqlite`](examples/rqlite). The live result and the control both read `${home}/result.txt`. A planted LOST WRITE line must be judged LOST WRITE, and a missing result file is UNKNOWN. Raft listens on `${addr_raft}` through the proxy. HTTP listens on `${addr_http}` and is not proxied.
+
 etcd v3.7.4, seeds 1 to 4 on this machine, all PASS. The cut target was `node_0`, `node_0`, `node_1`, and `node_2`. Each read came from a different member and included that leader's id (`leader_id`) and the cut target (`cut_target`). `links_cut` was 4 and `trigger_fired` was true. A saved seed-1 run is `examples/etcd/bundles/pass`.
 
 Save a run and replay it with the same bundle format:

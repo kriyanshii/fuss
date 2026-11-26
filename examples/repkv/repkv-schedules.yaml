@@ -1,0 +1,64 @@
+# One write and one post-cut read. REPKV_SCHEDULE selects the gate:
+# before, pending, or after.
+name: repkv
+binary:
+  default: repkv
+  extra: ["./examples/repkv/repkv"]
+topology:
+  nodes: 3
+  data_dir: "${dir}/node${i}"
+  ports:
+    base: 0
+  peers:
+    port_name: raft
+    via_proxy: true
+  start:
+    - /bin/sh
+    - -c
+    - |
+      sched="${REPKV_SCHEDULE}"
+      mode=correct
+      if [ "$sched" = "pending" ]; then
+        mode=hold
+      fi
+      ${binary} -id ${i} -data-dir ${data_dir} -peer-listen 127.0.0.1:${port} -peer-addrs '${peer_addr_0},${peer_addr_1},${peer_addr_2}' -client 127.0.0.1:0 -mode "$mode" -gate ${dir}/replicated &
+      pid=$!
+      if [ "${i}" = "0" ]; then
+        ${binary} -schedule "$sched" -dir ${dir} -n 3 -key ${seed}-0 -cut ${dir}/cut_now -gate ${dir}/replicated &
+      fi
+      wait $pid
+  ready:
+    file: "${data_dir}/ready"
+    contains: READY
+    timeout: 5s
+  stop_grace: 500ms
+fault:
+  isolate: node_0
+  after:
+    file:
+      glob: "${dir}/cut_now"
+      contains: NOW
+      poll: 10ms
+      timeout: 12s
+kill:
+  at: file
+  file:
+    glob: "${dir}/drive_done"
+    contains: DONE
+    poll: 10ms
+    timeout: 30s
+check:
+  command:
+    command:
+      - /bin/sh
+      - -c
+      - exec ${binary} -verify -porcupine -schedule "$REPKV_SCHEDULE" -dir ${dir} -n 3 -key ${seed}-0 -initial ""
+    as: out
+  rules:
+    - if: { out_contains: "experiment unknown" }
+      verdict: UNKNOWN
+    - if: { out_contains: "experiment illegal" }
+      verdict: ILLEGAL
+    - if: { out_contains: "experiment pass" }
+      verdict: PASS
+    - else: FAIL

@@ -60,14 +60,20 @@ def is_timeout(err):
 
 
 def observe(status, err):
-    """ok completed, timeout gave up, rejected is an HTTP refusal, error has no HTTP response."""
+    """ok completed the call. timeout means the client gave up.
+
+    rejected is a statement result whose own error field says the write
+    did not apply. A top-level error such as "leadership lost while
+    committing log" stays error: that response can arrive after the write
+    is already committed. A transport failure is error for the same reason.
+    """
     if err is not None:
         if is_timeout(err):
             return "timeout"
         return "error"
     if status == 200:
         return "ok"
-    return "rejected"
+    return "error"
 
 
 def http_addr(i):
@@ -135,12 +141,26 @@ def wait_cut():
     return None
 
 
+def statement_refused(body):
+    """True when rqlite returned a statement error and no top-level commit error."""
+    try:
+        doc = json.loads(body)
+    except json.JSONDecodeError:
+        return False
+    if doc.get("error"):
+        return False
+    results = doc.get("results")
+    if not isinstance(results, list) or not results or not isinstance(results[0], dict):
+        return False
+    return bool(results[0].get("error"))
+
+
 def record_write(status, body, err):
     obs = observe(status, err)
     if obs == "ok" and not insert_ok(body):
-        obs = "rejected"
+        obs = "rejected" if statement_refused(body) else "error"
     detail = "" if err is None else str(err)
-    if obs == "rejected" and err is None:
+    if err is None and obs in ("rejected", "error") and body:
         detail = body.decode("utf-8", "replace")[:256]
     emit({
         "kind": "client", "id": "w1", "phase": "end", "op": "write",

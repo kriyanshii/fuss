@@ -310,6 +310,21 @@ func (n *node) replicateAll(key, val string) bool {
 }
 
 func sendRepl(addr string, leader int, key, val string) bool {
+	// A follower can miss the first dial, or reject REPL until the next
+	// heartbeat restores the leader id. One miss must not fail the commit:
+	// the driver only opens the cut after this write is acknowledged.
+	for attempt := 0; attempt < 4; attempt++ {
+		if attempt > 0 {
+			time.Sleep(40 * time.Millisecond)
+		}
+		if sendReplOnce(addr, leader, key, val) {
+			return true
+		}
+	}
+	return false
+}
+
+func sendReplOnce(addr string, leader int, key, val string) bool {
 	c, err := net.DialTimeout("tcp", addr, 200*time.Millisecond)
 	if err != nil {
 		return false
@@ -761,17 +776,37 @@ func runDrive(dir string, n int, key, record, cut, gate, mode string) int {
 	}
 
 	rec := openRecorder()
-	req, _ := http.NewRequest(http.MethodPut, "http://"+clients[0]+"/k/"+key, strings.NewReader("v"))
-	rec.start("w1", "write", key, "v", "")
-	resp, err := put.Do(req)
-	status := 0
-	if resp != nil {
-		status = resp.StatusCode
-		resp.Body.Close()
+	// Retry a refused replicate. Under load one follower dial can miss, and
+	// the cut file is written only after the ack. Giving up on the first
+	// miss ends the trial with no partition.
+	var status int
+	var err error
+	deadline = time.Now().Add(5 * time.Second)
+	for {
+		req, reqErr := http.NewRequest(http.MethodPut, "http://"+clients[0]+"/k/"+key, strings.NewReader("v"))
+		if reqErr != nil {
+			err = reqErr
+			break
+		}
+		var resp *http.Response
+		resp, err = put.Do(req)
+		status = 0
+		if resp != nil {
+			status = resp.StatusCode
+			resp.Body.Close()
+		}
+		if err == nil && status == 200 {
+			break
+		}
+		if time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(40 * time.Millisecond)
 	}
+	rec.start("w1", "write", key, "v", "")
 	rec.end("w1", "write", observeHTTP(err, status), "", errText(err), false)
 	if err != nil || status != 200 {
-		fmt.Fprintf(os.Stderr, "drive: PUT failed: %v\n", err)
+		fmt.Fprintf(os.Stderr, "drive: PUT failed: %v status %d\n", err, status)
 		return 1
 	}
 	if record != "" {

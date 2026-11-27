@@ -1,6 +1,6 @@
-// repkv is a tiny three-node replicated KV for Fuss isolate scenarios.
+// repkv is a tiny three-node replicated KV for Fuss scenarios.
 // Each node has a client HTTP port (PUT/GET /k/...) and a peer TCP port.
-// Peer traffic is meant to go through Fuss proxies; client ports stay direct.
+// Peer traffic is meant to go through Fuss proxies. Client ports can too.
 package main
 
 import (
@@ -131,6 +131,7 @@ type node struct {
 	gate    string
 	peers   []string // index -> dial addr; peers[id] == ""
 	mu      sync.Mutex
+	writeMu sync.Mutex // one leader put at a time, so followers cannot reorder them
 	store   map[string]string
 	leader  int
 	lastHB  time.Time
@@ -240,14 +241,11 @@ func (n *node) handleK(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusOK)
 			return
 		}
-		// correct: ack only after at least one follower confirms; we ask all.
-		if !n.replicateAll(key, val) {
+		// correct: ack only after every follower has stored this value.
+		if !n.commit(key, val) {
 			http.Error(w, "replicate failed", http.StatusServiceUnavailable)
 			return
 		}
-		n.mu.Lock()
-		n.store[key] = val
-		n.mu.Unlock()
 		w.WriteHeader(http.StatusOK)
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
@@ -261,39 +259,84 @@ func (n *node) replicateEvery(key, val string) bool {
 			continue
 		}
 		need++
-		if sendRepl(addr, key, val) {
+		if sendRepl(addr, n.id, key, val) {
 			okN++
 		}
 	}
 	return need > 0 && okN == need
 }
 
+// commit replicates val to every follower, then stores it locally.
+// A partial replicate is rolled back so a failed ack cannot leak onto one peer.
+func (n *node) commit(key, val string) bool {
+	n.writeMu.Lock()
+	defer n.writeMu.Unlock()
+	if !n.replicateAll(key, val) {
+		return false
+	}
+	n.mu.Lock()
+	n.store[key] = val
+	n.mu.Unlock()
+	return true
+}
+
 func (n *node) replicateAll(key, val string) bool {
-	okN := 0
+	n.mu.Lock()
+	prev, had := n.store[key]
+	lead := n.id
+	n.mu.Unlock()
+	var applied []string
+	need := 0
 	for j, addr := range n.peers {
 		if j == n.id || addr == "" {
 			continue
 		}
-		if sendRepl(addr, key, val) {
-			okN++
+		need++
+		if sendRepl(addr, lead, key, val) {
+			applied = append(applied, addr)
 		}
 	}
-	return okN >= 1
+	if len(applied) == need {
+		return true
+	}
+	for _, addr := range applied {
+		if had {
+			sendRepl(addr, lead, key, prev)
+		} else {
+			sendDel(addr, lead, key)
+		}
+	}
+	return false
 }
 
-func sendRepl(addr, key, val string) bool {
+func sendRepl(addr string, leader int, key, val string) bool {
 	c, err := net.DialTimeout("tcp", addr, 200*time.Millisecond)
 	if err != nil {
 		return false
 	}
 	defer c.Close()
 	_ = c.SetDeadline(time.Now().Add(500 * time.Millisecond))
-	_, err = fmt.Fprintf(c, "REPL %s %s\n", key, val)
+	_, err = fmt.Fprintf(c, "REPL %d %s %s\n", leader, key, val)
 	if err != nil {
 		return false
 	}
 	line, err := bufio.NewReader(c).ReadString('\n')
 	return err == nil && strings.TrimSpace(line) == "REPL_OK"
+}
+
+func sendDel(addr string, leader int, key string) bool {
+	c, err := net.DialTimeout("tcp", addr, 200*time.Millisecond)
+	if err != nil {
+		return false
+	}
+	defer c.Close()
+	_ = c.SetDeadline(time.Now().Add(500 * time.Millisecond))
+	_, err = fmt.Fprintf(c, "DEL %d %s\n", leader, key)
+	if err != nil {
+		return false
+	}
+	line, err := bufio.NewReader(c).ReadString('\n')
+	return err == nil && strings.TrimSpace(line) == "DEL_OK"
 }
 
 func acceptPeers(ln net.Listener, n *node) {
@@ -330,14 +373,45 @@ func handlePeer(c net.Conn, n *node) {
 		}
 		_, _ = io.WriteString(c, "OK\n")
 	case "REPL":
+		if len(parts) < 4 {
+			return
+		}
+		lead, convErr := strconv.Atoi(parts[1])
+		if convErr != nil {
+			return
+		}
+		key, val := parts[2], strings.Join(parts[3:], " ")
+		n.mu.Lock()
+		cur := n.leader
+		if cur == lead {
+			n.store[key] = val
+		}
+		n.mu.Unlock()
+		if cur != lead {
+			_, _ = io.WriteString(c, "REPL_NO\n")
+			return
+		}
+		_, _ = io.WriteString(c, "REPL_OK\n")
+	case "DEL":
 		if len(parts) < 3 {
 			return
 		}
-		key, val := parts[1], strings.Join(parts[2:], " ")
+		lead, convErr := strconv.Atoi(parts[1])
+		if convErr != nil {
+			return
+		}
+		key := parts[2]
 		n.mu.Lock()
-		n.store[key] = val
+		cur := n.leader
+		if cur == lead {
+			delete(n.store, key)
+		}
 		n.mu.Unlock()
-		_, _ = io.WriteString(c, "REPL_OK\n")
+		if cur != lead {
+			_, _ = io.WriteString(c, "DEL_NO\n")
+			return
+		}
+		_, _ = io.WriteString(c, "DEL_OK\n")
 	case "PING":
 		_, _ = io.WriteString(c, "PONG\n")
 	case "WHO":
@@ -447,7 +521,9 @@ func (n *node) gateLoop() {
 		n.pending = map[string]string{}
 		n.mu.Unlock()
 		for k, v := range pending {
+			n.writeMu.Lock()
 			_ = n.replicateAll(k, v)
+			n.writeMu.Unlock()
 		}
 	}
 }

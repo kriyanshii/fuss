@@ -12,20 +12,27 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"fuss/history"
 )
 
 // bundleCLI is set from main. saveDir writes one bundle after a single seed.
+// failedDir writes one bundle per non-PASS seed, under seed-<seed>/.
 // want, when set, is a saved bundle the run must reproduce.
 type bundleCLI struct {
-	saveDir string
-	want    *replayBundle
-	got     *replayFacts
+	saveDir   string
+	failedDir string
+	want      *replayBundle
+	got       *replayFacts
 	// pinNode is true when the scenario names fault.isolate.node.
 	// A node_file scenario isolates whoever was leader, so the node index may change.
 	pinNode bool
 }
 
 var bundleRun bundleCLI
+
+// exportEDNPath is set from -export-edn. One seed writes a Jepsen history there.
+var exportEDNPath string
 
 // replayBundle is the portable record of one seeded run.
 // format 1. scenario.yaml sits next to bundle.json.
@@ -83,12 +90,17 @@ type bundleRead struct {
 }
 
 type replayFacts struct {
-	Verdict  string
-	Ack      bundleAck
-	Cut      bundleCut
-	Read     bundleRead
-	Version  string
-	Checksum string
+	Verdict       string
+	Ack           bundleAck
+	Cut           bundleCut
+	Read          bundleRead
+	Version       string
+	Checksum      string
+	Nemesis       []NemesisEvent
+	HasNemesis    bool
+	History       []history.OpRecord
+	HasHistory    bool
+	PorcupineHTML []byte
 }
 
 func fileSHA256(path string) (string, error) {
@@ -217,7 +229,12 @@ func collectReplayFacts(result *adapterTrialResult, binaryPath string) replayFac
 	}
 	var cut bundleCut
 	var read bundleRead
+	var nemesis []NemesisEvent
+	var hist []history.OpRecord
+	var porcupineHTML []byte
 	verdict := ""
+	hasNemesis := false
+	hasHistory := false
 	if result != nil {
 		verdict = result.verdict
 		cut = cutFromEvidence(result.isolate)
@@ -231,15 +248,25 @@ func collectReplayFacts(result *adapterTrialResult, binaryPath string) replayFac
 		}
 		// cut_target in the check line is the member the scenario observed as leader.
 		cut.LeaderNode = lineField(read.Text, "cut_target=")
+		nemesis = result.nemesis
+		hasNemesis = result.nemesisRan
+		hist = result.history
+		hasHistory = result.hasHistory
+		porcupineHTML = result.porcupineHTML
 	}
 	sum, _ := fileSHA256(binaryPath)
 	return replayFacts{
-		Verdict:  verdict,
-		Ack:      ack,
-		Cut:      cut,
-		Read:     read,
-		Version:  probeVersion(binaryPath),
-		Checksum: sum,
+		Verdict:       verdict,
+		Ack:           ack,
+		Cut:           cut,
+		Read:          read,
+		Version:       probeVersion(binaryPath),
+		Checksum:      sum,
+		Nemesis:       nemesis,
+		HasNemesis:    hasNemesis,
+		History:       hist,
+		HasHistory:    hasHistory,
+		PorcupineHTML: porcupineHTML,
 	}
 }
 
@@ -299,7 +326,90 @@ func writeReplayBundle(dir, scenarioPath, binaryPath, targetName string, seed in
 		return err
 	}
 	body = append(body, '\n')
-	return os.WriteFile(filepath.Join(dir, "bundle.json"), body, 0o644)
+	if err := os.WriteFile(filepath.Join(dir, "bundle.json"), body, 0o644); err != nil {
+		return err
+	}
+	if facts.HasNemesis {
+		if err := writeNemesisEvents(dir, facts.Nemesis); err != nil {
+			return err
+		}
+	}
+	if facts.HasHistory {
+		if err := writeHistoryFiles(dir, facts.History, facts.Nemesis); err != nil {
+			return err
+		}
+	}
+	if len(facts.PorcupineHTML) > 0 {
+		if err := os.WriteFile(filepath.Join(dir, "porcupine.html"), facts.PorcupineHTML, 0o644); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// copyTrialLog adds the trial's combined stdout/stderr to a bundle directory.
+func copyTrialLog(bundleDir, trialDir string) error {
+	src := filepath.Join(trialDir, "target.log")
+	in, err := os.Open(src)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	defer in.Close()
+	out, err := os.Create(filepath.Join(bundleDir, "target.log"))
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+	_, err = io.Copy(out, in)
+	return err
+}
+
+func writeHistoryFiles(dir string, ops []history.OpRecord, nemesis []NemesisEvent) error {
+	body, err := history.WriteJSONL(ops)
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(filepath.Join(dir, "history.jsonl"), body, 0o644); err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(dir, "history.edn"), history.WriteEDN(ops, nemesisRecords(nemesis)), 0o644)
+}
+
+func writeEDNFile(path string, facts replayFacts) error {
+	return os.WriteFile(path, history.WriteEDN(facts.History, nemesisRecords(facts.Nemesis)), 0o644)
+}
+
+func nemesisRecords(events []NemesisEvent) []history.NemesisRecord {
+	out := make([]history.NemesisRecord, len(events))
+	for i, e := range events {
+		out[i] = history.NemesisRecord{
+			TimestampNS: e.TimestampNS,
+			Action:      e.Action,
+			Targets:     e.Targets,
+			Mode:        e.Mode,
+			Direction:   e.Direction,
+			Flow:        e.Flow,
+			Details:     e.Details,
+		}
+	}
+	return out
+}
+
+// writeNemesisEvents writes the trial's nemesis log. Timestamps are
+// nanoseconds since the schedule started.
+func writeNemesisEvents(dir string, events []NemesisEvent) error {
+	if events == nil {
+		events = []NemesisEvent{}
+	}
+	body, err := json.MarshalIndent(events, "", "  ")
+	if err != nil {
+		return err
+	}
+	body = append(body, '\n')
+	return os.WriteFile(filepath.Join(dir, "nemesis_events.json"), body, 0o644)
 }
 
 func loadReplayBundle(dir string) (*replayBundle, error) {
@@ -431,19 +541,30 @@ func printReplayReport(want *replayBundle, got *replayFacts, pinNode bool) {
 	fmt.Printf("verdict: %s\n", got.Verdict)
 }
 
-func replaySavedBundle(dir string, json bool) int {
+// openReplayBundle loads a directory written by -save-bundle or
+// -save-failed-bundle and checks scenario.yaml against the saved checksum.
+func openReplayBundle(dir string) (*replayBundle, error) {
 	b, err := loadReplayBundle(dir)
 	if err != nil {
-		fatal(err)
+		return nil, err
 	}
 	scenario := filepath.Join(dir, "scenario.yaml")
 	sum, err := fileSHA256(scenario)
 	if err != nil {
-		fatal(err)
+		return nil, err
 	}
 	if sum != b.ScenarioSHA256 {
-		fatal(fmt.Errorf("scenario.yaml checksum %s, bundle says %s", sum, b.ScenarioSHA256))
+		return nil, fmt.Errorf("scenario.yaml checksum %s, bundle says %s", sum, b.ScenarioSHA256)
 	}
+	return b, nil
+}
+
+func replaySavedBundle(dir string, json bool) int {
+	b, err := openReplayBundle(dir)
+	if err != nil {
+		fatal(err)
+	}
+	scenario := filepath.Join(dir, "scenario.yaml")
 	adapter, err := LoadYAMLTarget(scenario)
 	if err != nil {
 		fatal(err)

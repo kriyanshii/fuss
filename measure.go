@@ -180,3 +180,131 @@ func runMeasure(seed int64, n int, watchStatus bool) {
 		fmt.Printf("%-16s min=%-8v p50=%-8v p90=%-8v max=%-8v not-seen=%d\n", name, q(0), q(0.5), q(0.9), q(1), missing[name])
 	}
 }
+
+// propertyTally counts one property across the -n run.
+// Fault marks sometimes assertions that calibration (-kill=false) must not fail.
+type propertyTally struct {
+	Name    string
+	Kind    string
+	MinHits int
+	Fault   bool
+	Hits    int
+	Trials  int
+}
+
+func (y *YAMLAdapter) propertyTallies() []propertyTally {
+	var out []propertyTally
+	add := func(list []yamlProperty, kind string) {
+		for _, p := range list {
+			out = append(out, propertyTally{
+				Name:    p.Name,
+				Kind:    kind,
+				MinHits: p.MinHits,
+				Fault:   p.faultAssertion(),
+			})
+		}
+	}
+	add(y.cfg.Properties.Always, "always")
+	add(y.cfg.Properties.Eventually, "eventually")
+	add(y.cfg.Properties.Sometimes, "sometimes")
+	return out
+}
+
+func (t propertyTally) minHits() int {
+	if t.MinHits <= 0 {
+		return 1
+	}
+	return t.MinHits
+}
+
+// passed reports whether the tally meets its bar. skipped is a sometimes
+// fault assertion that missed min_hits during calibration and is not a failure.
+func (t propertyTally) passed(calibration bool) (ok bool, skipped bool) {
+	if t.Kind == "sometimes" {
+		if calibration && t.Fault && t.Hits < t.minHits() {
+			return true, true
+		}
+		return t.Hits >= t.minHits(), false
+	}
+	return t.Trials > 0 && t.Hits == t.Trials, false
+}
+
+func observeProperties(tallies []propertyTally, outcomes []PropertyOutcome) {
+	if len(tallies) == 0 {
+		return
+	}
+	hit := map[string]bool{}
+	for _, o := range outcomes {
+		hit[o.Name] = o.Hit
+	}
+	for i := range tallies {
+		tallies[i].Trials++
+		if hit[tallies[i].Name] {
+			tallies[i].Hits++
+		}
+	}
+}
+
+func unmetSometimes(tallies []propertyTally, calibration bool) []propertyTally {
+	var out []propertyTally
+	for _, t := range tallies {
+		if t.Kind != "sometimes" || t.Trials == 0 {
+			continue
+		}
+		ok, skipped := t.passed(calibration)
+		if !ok && !skipped {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
+func propertySummaries(tallies []propertyTally, calibration bool) []map[string]any {
+	if len(tallies) == 0 {
+		return nil
+	}
+	out := make([]map[string]any, 0, len(tallies))
+	for _, t := range tallies {
+		ok, skipped := t.passed(calibration)
+		m := map[string]any{
+			"name":         t.Name,
+			"kind":         t.Kind,
+			"hits":         t.Hits,
+			"total_trials": t.Trials,
+			"passed":       ok,
+		}
+		if t.Kind == "sometimes" {
+			m["min_hits"] = t.minHits()
+		}
+		if skipped {
+			m["skipped"] = "calibration"
+		}
+		out = append(out, m)
+	}
+	return out
+}
+
+func formatPropertySummary(tallies []propertyTally, calibration bool) string {
+	var b strings.Builder
+	b.WriteString("properties:")
+	for _, t := range tallies {
+		ok, skipped := t.passed(calibration)
+		switch {
+		case t.Kind == "sometimes" && skipped:
+			fmt.Fprintf(&b, "\n  %s sometimes %d/%d hits (min %d) skipped (calibration, -kill=false)", t.Name, t.Hits, t.Trials, t.minHits())
+		case t.Kind == "sometimes":
+			state := "pass"
+			if !ok {
+				state = "UNMET_SOMETIMES"
+			}
+			fmt.Fprintf(&b, "\n  %s sometimes %d/%d hits (min %d) %s", t.Name, t.Hits, t.Trials, t.minHits(), state)
+		default:
+			state := "pass"
+			if !ok {
+				state = "fail"
+			}
+			fmt.Fprintf(&b, "\n  %s %s %d/%d %s", t.Name, t.Kind, t.Hits, t.Trials, state)
+		}
+	}
+	return b.String()
+}

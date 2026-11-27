@@ -159,6 +159,34 @@ trial record after a response whose status is `ack_status`. The ack check
 only parses lines with the prefix `ack `, and `wait_first_ack` only looks
 for `ack `. Example: `record: "ack ${key}\n"`
 
+### `driver: http_kv`
+
+Used with `nemesis` and the porcupine / set / eventually_available checks.
+`${key}`, `${value}`, and `${old}` are the op fields. `${key_b64}`,
+`${value_b64}`, and `${old_b64}` are those strings in standard base64.
+A 301, 302, 307, or 308 is followed with the same method and body.
+
+**`put` / `get` / `cas`** (objects). `method`, `url`, `body`. `headers` is a
+string map, expanded the same way as `body`. `value_from` and `error_from`
+are expanded the same way, then read as a dotted JSON path (`kvs.0.value`
+indexes an array, `${key}` is that op's key). On a 2xx get, a missing path
+is an absent value, not a failed call. `value_encoding: base64` decodes the
+string at that path and requires `value_from`. A non-empty string at
+`error_from` is a refusal (`fail`) even when the status is 2xx.
+
+Example:
+
+```yaml
+get:
+  method: POST
+  url: "http://${target}/v3/kv/range"
+  headers:
+    Content-Type: application/json
+  body: '{"key":"${key_b64}","serializable":true}'
+  value_from: kvs.0.value
+  value_encoding: base64
+```
+
 ## `kill`
 
 `LoadYAMLTarget` accepts `kill.at` of empty, `delay`, or `file`. Anything

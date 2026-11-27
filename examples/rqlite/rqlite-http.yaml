@@ -1,0 +1,96 @@
+# rqlite v10.7.4: http_kv against /db/execute and /db/query?level=strong.
+# Isolate uses reset. Blackhole-then-heal resumes a spliced TCP stream; see notes/friction.md.
+# Not run in CI.
+name: rqlite-http
+binary:
+  default: rqlited
+  extra: ["./examples/rqlite/rqlited"]
+topology:
+  nodes: 3
+  client_via_proxy: true
+  data_dir: "${dir}/node${i}"
+  ports:
+    base: 0
+  proxy_mode: per_node_owned
+  peers:
+    port_name: raft
+    via_proxy: true
+  start:
+    - /bin/sh
+    - -c
+    - |
+      set -e
+      if [ "${i}" = "0" ]; then
+        exec ${binary} -node-id "node_${i}" \
+          -http-addr "127.0.0.1:${client_port}" \
+          -http-adv-addr "${client_proxy}" \
+          -raft-addr "127.0.0.1:${port}" \
+          -raft-adv-addr "${node_proxy_addr_0}" \
+          "${data_dir}/rqlite"
+      fi
+      exec ${binary} -node-id "node_${i}" \
+        -http-addr "127.0.0.1:${client_port}" \
+        -http-adv-addr "${client_proxy}" \
+        -raft-addr "127.0.0.1:${port}" \
+        -raft-adv-addr "${node_proxy_addr_${i}}" \
+        -join "${node_proxy_addr_0}" \
+        -join-attempts 30 \
+        -join-interval 500ms \
+        "${data_dir}/rqlite"
+  ready:
+    command:
+      - /bin/sh
+      - -c
+      - |
+        curl -sf "http://127.0.0.1:${client_port}/readyz" | grep -q "node ok" || exit 1
+        if [ "${i}" = "0" ]; then
+          curl -sf -XPOST "http://127.0.0.1:${client_port}/db/execute" \
+            -H "Content-Type: application/json" \
+            -d '["CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT)"]' >/dev/null
+        fi
+        echo "node ok"
+    contains: "node ok"
+    timeout: 30s
+  stop_grace: 2s
+nemesis:
+  warmup: 2s
+  duration: 6s
+  interval: 3s
+  quiet_period: 5s
+  actions:
+    - type: isolate_node
+      target: "2"
+      mode: reset
+      direction: both
+    - type: kill_node
+      target: "1"
+      restart_delay: 1s
+workload:
+  driver: http_kv
+  workers: 3
+  rate: 20
+  keyspace: 1
+  timeout: 800ms
+  targets: "${client_addrs}"
+  put:
+    method: POST
+    url: "http://${target}/db/execute?redirect"
+    headers:
+      Content-Type: application/json
+    body: '[["INSERT OR REPLACE INTO kv(k,v) VALUES(?,?)","${key}","${value}"]]'
+    error_from: results.0.error
+  get:
+    method: GET
+    url: "http://${target}/db/query?level=strong&redirect&q=SELECT%20v%20FROM%20kv%20WHERE%20k%3D%27${key}%27"
+    value_from: results.0.values.0.0
+    error_from: results.0.error
+check:
+  porcupine:
+    timeout: 20s
+  set: {}
+  eventually_available:
+    n: 1
+properties:
+  sometimes:
+    - name: fault_during_inflight
+      fault_during_inflight: {}

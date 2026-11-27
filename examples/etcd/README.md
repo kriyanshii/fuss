@@ -57,3 +57,27 @@ Each trial had `links_cut` 4 and `trigger_fired` true. The read came from a memb
 `examples/etcd/bundles/pass` is the seed-1 run generated from `c83a551`. Fuss `-json` verdict was `PASS`. The leader id was `1691087835951997378`, Fuss cut `node_0` (`links_cut` 4, `trigger_fired` true, direction `both`), and the linearizable get of key `1-0` from `node_1` returned the value.
 
 `-save-bundle` and `-replay-bundle` use the same bundle format as `examples/repkv/bundles/lost-write`. The replay prints `ack: key=...` and `read: key=...` and fails when those keys differ. It also prints the saved cut target and the replayed cut target. A later run may elect a different member. The replay still passes when that member was the leader before a two-way cut and a different member returned the key. A cut of a follower does not pass. If the leader changes before the cut, the trial is `UNKNOWN` with `reason=leader_changed` or `reason=cut_missed_leader`.
+
+## http_kv reads
+
+`etcd-serializable.yaml` and `etcd-linearizable.yaml` drive the same three-node cluster through `http_kv` against the gRPC gateway (`POST /v3/kv/put` and `POST /v3/kv/range`). Clients use `client_via_proxy`. Peer links use `per_node_owned`. Node 2's `--election-timeout` is `10000` so it does not win the first election. The nemesis blackholes that node for 5s. Ready is `GET /livez`.
+
+On this machine, etcd v3.7.4, seed 1, blackhole. Heal closes a connection that discarded bytes, instead of forwarding later bytes on that socket.
+
+| Config | Fuss verdict | Reason |
+| --- | --- | --- |
+| `etcd-serializable.yaml` | `NONLINEARIZABLE` | `nonlinearizable` |
+| `etcd-linearizable.yaml` | `PASS` | |
+
+Every node's evidence `ready` was true. Node 2's `exit_status` was `-1` and `stop` was `SIGTERM`. `fault_during_inflight` hits were 1. The serializable bundle is `notes/runs/etcd-blackhole-s` and contains `porcupine.html`. The linearizable bundle is `notes/runs/etcd-blackhole-l`.
+
+An earlier seed 1 of the same blackhole configs was `UNKNOWN` with `reason` `nodes_not_ready`. Node 2's `exit_status` was `2`. **Reading:** that trial's `target.log` panicked in `raft.(*raftLog).maybeAppend`. The kept log from this serializable trial has no `panic`. Fuss did not score that earlier panic.
+
+The same configs with `mode: reset` (the copies in `notes/runs/etcd-serializable-reset.yaml` and `notes/runs/etcd-linearizable-reset.yaml`) close the sockets instead of resuming them. Seed 1:
+
+| Config | Fuss verdict | Reason |
+| --- | --- | --- |
+| serializable, reset | `NONLINEARIZABLE` | `nonlinearizable` |
+| linearizable, reset | `PASS` | |
+
+`fault_during_inflight` hit on both reset trials. The serializable bundle is `notes/runs/etcd-reset-s` and contains `porcupine.html`. The linearizable bundle is `notes/runs/etcd-reset-l`. Neither pair is a claim that etcd broke its linearizable promise. The API page says a serializable range may be stale.

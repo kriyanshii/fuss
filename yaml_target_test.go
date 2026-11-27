@@ -220,6 +220,65 @@ func TestHraftdYAMLLoads(t *testing.T) {
 	}
 }
 
+func TestConsulYAMLLoads(t *testing.T) {
+	consistent, err := LoadYAMLTarget("examples/consul/consul-consistent.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	stale, err := LoadYAMLTarget("examples/consul/consul-stale.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, a := range []*YAMLAdapter{consistent, stale} {
+		topo := a.cfg.Topology
+		if topo.Nodes != 3 || !topo.ClientViaProxy || !topo.Peers.ViaProxy || topo.Peers.PortName != "server" {
+			t.Fatalf("%s topology %+v", a.cfg.Name, topo)
+		}
+		if topo.ProxyMode != "per_node_owned" {
+			t.Fatalf("%s proxy_mode %s", a.cfg.Name, topo.ProxyMode)
+		}
+		if len(topo.Ports.Names) != 2 || topo.Ports.Names[0] != "server" || topo.Ports.Names[1] != "serf" {
+			t.Fatalf("%s names %+v", a.cfg.Name, topo.Ports.Names)
+		}
+		w := a.cfg.Workload
+		if w.Driver != "http_kv" || w.Workers != 4 || w.Keyspace != 3 || w.timeout != 1500*time.Millisecond {
+			t.Fatalf("%s workload %+v timeout %s", a.cfg.Name, w, w.timeout)
+		}
+		if w.Targets != "${client_addrs}" || w.Put.Method != "PUT" || w.Get.ValueFrom != "" {
+			t.Fatalf("%s calls put=%+v get=%+v", a.cfg.Name, w.Put, w.Get)
+		}
+		n := a.cfg.Nemesis
+		if n.warmup != 4*time.Second || n.duration != 25*time.Second || n.interval != 3*time.Second || n.quiet != 5*time.Second {
+			t.Fatalf("%s nemesis warmup %s duration %s interval %s quiet %s", a.cfg.Name, n.warmup, n.duration, n.interval, n.quiet)
+		}
+		weights := map[string]int{}
+		modes := map[string]string{}
+		for _, act := range n.Actions {
+			weights[act.Type] = act.Weight
+			modes[act.Type] = act.Mode
+		}
+		if weights["isolate_node"] != 3 || modes["isolate_node"] != "blackhole" || weights["partition_halves"] != 2 || modes["partition_halves"] != "reset" || weights["kill_node"] != 2 || weights["heal_all"] != 2 {
+			t.Fatalf("%s weights %+v modes %+v", a.cfg.Name, weights, modes)
+		}
+		p := a.cfg.Properties
+		if len(p.Always) != 2 || p.Always[0].Name != "porcupine" || p.Always[0].Porcupine.timeout != 10*time.Second || p.Always[1].Name != "set" {
+			t.Fatalf("%s always %+v", a.cfg.Name, p.Always)
+		}
+		if len(p.Eventually) != 1 || p.Eventually[0].Eventually == nil || p.Eventually[0].Eventually.N != 5 {
+			t.Fatalf("%s eventually %+v", a.cfg.Name, p.Eventually)
+		}
+		if len(p.Sometimes) != 3 || p.Sometimes[0].Name != "fault_during_inflight" || p.Sometimes[1].Name != "info_ops_observed" || p.Sometimes[2].Name != "fault_action_fired_isolate_node" || p.Sometimes[2].FaultActionFired.Action != "isolate_node" {
+			t.Fatalf("%s sometimes %+v", a.cfg.Name, p.Sometimes)
+		}
+	}
+	if consistent.cfg.Workload.Get.URL != "http://${target}/v1/kv/${key}?consistent&raw" {
+		t.Fatalf("consistent get %s", consistent.cfg.Workload.Get.URL)
+	}
+	if stale.cfg.Workload.Get.URL != "http://${target}/v1/kv/${key}?stale&raw" {
+		t.Fatalf("stale get %s", stale.cfg.Workload.Get.URL)
+	}
+}
+
 func TestRqliteResultControls(t *testing.T) {
 	a, err := LoadYAMLTarget("examples/rqlite/rqlite.yaml")
 	if err != nil {

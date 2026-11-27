@@ -202,8 +202,17 @@ func (n *node) handleK(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
 		n.mu.Lock()
+		isLeader := n.leader == n.id
 		v, ok := n.store[key]
 		n.mu.Unlock()
+		// Followers apply REPL before the leader stores the value and acks.
+		// A local read there can see an in-flight write that a later read
+		// of the leader still misses. Correct-mode reads are the leader's
+		// committed store. Bug mode keeps the local read.
+		if n.mode == "correct" && !isLeader {
+			http.Error(w, "not leader", http.StatusServiceUnavailable)
+			return
+		}
 		if !ok {
 			http.NotFound(w, r)
 			return

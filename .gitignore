@@ -13,3 +13,4 @@ PROJECT_CONTEXT.md
 /examples/etcd/etcd
 /examples/etcd/etcdctl
 /examples/hraftd/hraftd
+/examples/consul/consul

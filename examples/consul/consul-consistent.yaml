@@ -1,0 +1,89 @@
+# Consul server cluster. GET /v1/kv uses ?consistent (linearizable).
+# Raft listen is ports.server (${port_server}), fronted by the peer proxy.
+# Serf LAN is ${port_serf} and is not proxied (TCP and UDP). HTTP is ${client_port}.
+# Not run in CI.
+name: consul-consistent
+binary:
+  default: consul
+  extra: ["./examples/consul/consul"]
+topology:
+  nodes: 3
+  client_via_proxy: true
+  data_dir: "${dir}/node${i}"
+  ports:
+    base: 0
+    client_base: 0
+    names: [server, serf]
+  proxy_mode: per_node_owned
+  peers:
+    port_name: server
+    via_proxy: true
+  start:
+    - /bin/sh
+    - examples/consul/start-node.sh
+    - "${i}"
+    - "${dir}"
+    - "${data_dir}"
+    - "${binary}"
+    - "${port_server}"
+    - "${port_serf}"
+    - "${client_port}"
+  ready:
+    command:
+      - /bin/sh
+      - -c
+      - curl -sf "http://127.0.0.1:${client_port}/v1/status/leader"
+    contains: "127.0.0.1"
+    timeout: 30s
+  stop_grace: 2s
+nemesis:
+  warmup: 4s
+  duration: 25s
+  interval: 3s
+  quiet_period: 5s
+  actions:
+    - type: isolate_node
+      target: random
+      mode: blackhole
+      weight: 3
+    - type: partition_halves
+      mode: reset
+      weight: 2
+    - type: kill_node
+      target: random
+      restart_delay: 2s
+      weight: 2
+    - type: heal_all
+      weight: 2
+workload:
+  driver: http_kv
+  workers: 4
+  rate: 20
+  keyspace: 3
+  timeout: 1500ms
+  targets: "${client_addrs}"
+  put:
+    method: PUT
+    url: "http://${target}/v1/kv/${key}"
+    headers:
+      Content-Type: text/plain
+    body: "${value}"
+  get:
+    method: GET
+    url: "http://${target}/v1/kv/${key}?consistent&raw"
+properties:
+  always:
+    - porcupine:
+        timeout: 10s
+    - set: {}
+  eventually:
+    - eventually_available:
+        n: 5
+  sometimes:
+    - fault_during_inflight: {}
+      min_hits: 1
+    - info_ops_observed: {}
+      min_hits: 1
+    - fault_action_fired:
+        action: isolate_node
+      min_hits: 1

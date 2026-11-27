@@ -79,3 +79,64 @@ func diedOfKill(cmd *exec.Cmd) bool {
 	ws, ok := cmd.ProcessState.Sys().(syscall.WaitStatus)
 	return ok && ws.Signaled() && ws.Signal() == syscall.SIGKILL
 }
+
+// pickWeighted chooses an index with probability proportional to weights.
+// Non-positive weights are skipped. The draw comes from r, never the global generator.
+func pickWeighted(r *rand.Rand, weights []int) int {
+	total := 0
+	for _, w := range weights {
+		if w > 0 {
+			total += w
+		}
+	}
+	if total <= 0 || r == nil {
+		return 0
+	}
+	pick := r.Intn(total)
+	for i, w := range weights {
+		if w <= 0 {
+			continue
+		}
+		if pick < w {
+			return i
+		}
+		pick -= w
+	}
+	return len(weights) - 1
+}
+
+// pickNodeIndex chooses a node index in [0, n).
+func pickNodeIndex(r *rand.Rand, n int) int {
+	if n <= 1 || r == nil {
+		return 0
+	}
+	return r.Intn(n)
+}
+
+// pickMinority shuffles node indexes with r and returns the smaller half.
+// A cluster of one node has no minority. The caller sorts for display.
+func pickMinority(r *rand.Rand, n int) []int {
+	if n <= 1 {
+		return nil
+	}
+	idx := make([]int, n)
+	for i := range idx {
+		idx[i] = i
+	}
+	if r != nil {
+		r.Shuffle(len(idx), func(i, j int) { idx[i], idx[j] = idx[j], idx[i] })
+	}
+	minorN := n / 2
+	out := make([]int, minorN)
+	copy(out, idx[:minorN])
+	return out
+}
+
+// deriveRand returns a generator whose seed is one draw from r.
+// Each proxy link stores its own generator, so degraded jitter cannot race the scheduler.
+func deriveRand(r *rand.Rand) *rand.Rand {
+	if r == nil {
+		return nil
+	}
+	return rand.New(rand.NewSource(r.Int63()))
+}

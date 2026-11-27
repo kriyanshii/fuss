@@ -9,6 +9,15 @@ import (
 	"time"
 )
 
+// PropertyOutcome is one property on one trial. Hit means the always or
+// eventually check passed, or the sometimes condition was observed.
+type PropertyOutcome struct {
+	Name string `json:"name"`
+	Kind string `json:"kind"`
+	Hit  bool   `json:"hit"`
+	Note string `json:"note,omitempty"`
+}
+
 // trial is one attack: Dagu started in a fresh home and possibly killed.
 type trial struct {
 	seed    int64
@@ -25,6 +34,15 @@ type trial struct {
 	took    time.Duration
 	exit    int
 	waitErr error
+}
+
+// failedBundleSeedDir is the directory for one non-PASS seed.
+// A PASS trial returns an empty path so the caller writes nothing.
+func failedBundleSeedDir(root string, seed int64, verdict string) string {
+	if root == "" || verdict == "PASS" {
+		return ""
+	}
+	return filepath.Join(root, fmt.Sprintf("seed-%d", seed))
 }
 
 // How runTrial kills Dagu.
@@ -142,4 +160,61 @@ func waitOpening(t trial, done <-chan struct{}) bool {
 		}
 	}
 	return true
+}
+
+// nemesisFireCount is how many actions fit in duration, starting at the
+// opening of the window and then every interval, while the offset is still
+// inside the window. The count does not depend on how long an action takes.
+func nemesisFireCount(duration, interval time.Duration) int {
+	if duration <= 0 {
+		return 0
+	}
+	if interval <= 0 {
+		return 1
+	}
+	n := 0
+	for t := time.Duration(0); t < duration; t += interval {
+		n++
+		if n > 1_000_000 {
+			break
+		}
+	}
+	return n
+}
+
+// scheduleNemesis waits out warmup, fires a planned action at each interval,
+// then calls recover at the end of duration. quiet is slept after recover and
+// before ready, which is the last step before checks.
+func scheduleNemesis(warmup, duration, interval, quiet time.Duration, fires int, fire func(int), recover func(), ready func()) (quietStart, quietEnd time.Time) {
+	if warmup > 0 {
+		time.Sleep(warmup)
+	}
+	window := time.Now()
+	for i := 0; i < fires; i++ {
+		due := window
+		if interval > 0 {
+			due = window.Add(time.Duration(i) * interval)
+		}
+		if wait := time.Until(due); wait > 0 {
+			time.Sleep(wait)
+		}
+		if fire != nil {
+			fire(i)
+		}
+	}
+	if wait := time.Until(window.Add(duration)); wait > 0 {
+		time.Sleep(wait)
+	}
+	if recover != nil {
+		recover()
+	}
+	quietStart = time.Now()
+	if quiet > 0 {
+		time.Sleep(quiet)
+	}
+	quietEnd = time.Now()
+	if ready != nil {
+		ready()
+	}
+	return quietStart, quietEnd
 }

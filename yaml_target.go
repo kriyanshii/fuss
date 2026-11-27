@@ -23,35 +23,38 @@ import (
 )
 
 type yamlTarget struct {
-	Name     string                 `yaml:"name"`
-	Binary   yamlBinary             `yaml:"binary"`
-	Args     []string               `yaml:"args"`
-	Env      map[string]string      `yaml:"env"`
-	DataDir  string                 `yaml:"data_dir"`
-	PortBase int                    `yaml:"port_base"`
-	PortMod  int                    `yaml:"port_mod"`
-	Start    yamlStart              `yaml:"start"`
-	Health   yamlHealth             `yaml:"health"`
-	Workload yamlWorkload           `yaml:"workload"`
-	Kill     yamlKill               `yaml:"kill"`
-	Restart  yamlRestart            `yaml:"restart"`
-	Steps    []yamlStep             `yaml:"steps"`
-	Topology yamlTopology           `yaml:"topology"`
-	Fault    yamlFault              `yaml:"fault"`
-	Check    yamlCheck              `yaml:"check"`
-	Controls map[string]yamlControl `yaml:"controls"`
+	Name       string                 `yaml:"name"`
+	Binary     yamlBinary             `yaml:"binary"`
+	Args       []string               `yaml:"args"`
+	Env        map[string]string      `yaml:"env"`
+	DataDir    string                 `yaml:"data_dir"`
+	PortBase   int                    `yaml:"port_base"`
+	PortMod    int                    `yaml:"port_mod"`
+	Start      yamlStart              `yaml:"start"`
+	Health     yamlHealth             `yaml:"health"`
+	Workload   yamlWorkload           `yaml:"workload"`
+	Kill       yamlKill               `yaml:"kill"`
+	Restart    yamlRestart            `yaml:"restart"`
+	Steps      []yamlStep             `yaml:"steps"`
+	Topology   yamlTopology           `yaml:"topology"`
+	Fault      yamlFault              `yaml:"fault"`
+	Nemesis    yamlNemesis            `yaml:"nemesis"`
+	Check      yamlCheck              `yaml:"check"`
+	Properties yamlProperties         `yaml:"properties"`
+	Controls   map[string]yamlControl `yaml:"controls"`
 }
 
 // yamlTopology starts N peer processes for one trial. Empty Nodes means no topology.
 type yamlTopology struct {
-	Nodes     int           `yaml:"nodes"`
-	DataDir   string        `yaml:"data_dir"`
-	Ports     yamlTopoPorts `yaml:"ports"`
-	Peers     yamlTopoPeers `yaml:"peers"`
-	ProxyMode string        `yaml:"proxy_mode"` // "per_pair" (default), "per_node", or "per_node_owned"
-	Start     []string      `yaml:"start"`
-	Ready     yamlTopoReady `yaml:"ready"`
-	StopGrace string        `yaml:"stop_grace"`
+	Nodes          int           `yaml:"nodes"`
+	DataDir        string        `yaml:"data_dir"`
+	Ports          yamlTopoPorts `yaml:"ports"`
+	Peers          yamlTopoPeers `yaml:"peers"`
+	ProxyMode      string        `yaml:"proxy_mode"` // "per_pair" (default), "per_node", or "per_node_owned"
+	ClientViaProxy bool          `yaml:"client_via_proxy"`
+	Start          []string      `yaml:"start"`
+	Ready          yamlTopoReady `yaml:"ready"`
+	StopGrace      string        `yaml:"stop_grace"`
 }
 
 // yamlTopoPeers routes peer traffic through Fuss proxy.Link when ViaProxy is set.
@@ -172,9 +175,63 @@ type yamlFaultAfter struct {
 	File yamlKillFile `yaml:"file"`
 }
 
+// yamlNemesis is a seeded sequence of faults. It replaces a single fault: block.
+// Random draws use the trial *rand.Rand. direction chooses links; flow chooses
+// the byte direction inside a link.
+type yamlNemesis struct {
+	SeedFromTrial bool                `yaml:"seed_from_trial"`
+	Warmup        string              `yaml:"warmup"`
+	Duration      string              `yaml:"duration"`
+	Interval      string              `yaml:"interval"`
+	QuietPeriod   string              `yaml:"quiet_period"`
+	NodeFile      string              `yaml:"node_file"`
+	Actions       []yamlNemesisAction `yaml:"actions"`
+
+	warmup   time.Duration
+	duration time.Duration
+	interval time.Duration
+	quiet    time.Duration
+}
+
+func (n yamlNemesis) active() bool { return len(n.Actions) > 0 }
+
+// yamlNemesisAction is one weighted step. target is leader, random, or a node index.
+type yamlNemesisAction struct {
+	Type          string  `yaml:"type"`
+	Target        string  `yaml:"target"`
+	NodeFile      string  `yaml:"node_file"`
+	Mode          string  `yaml:"mode"`
+	Direction     string  `yaml:"direction"`
+	Flow          string  `yaml:"flow"`
+	Latency       string  `yaml:"latency"`
+	Jitter        string  `yaml:"jitter"`
+	DropRate      float64 `yaml:"drop_rate"`
+	Weight        int     `yaml:"weight"`
+	RestartDelay  string  `yaml:"restart_delay"`
+	PauseDuration string  `yaml:"pause_duration"`
+
+	latency      time.Duration
+	jitter       time.Duration
+	restartDelay time.Duration
+	pauseFor     time.Duration
+}
+
+// NemesisEvent is one fired action. TimestampNS is nanoseconds since the
+// schedule started, including warmup.
+type NemesisEvent struct {
+	TimestampNS int64    `json:"timestamp_ns"`
+	Action      string   `json:"action"`
+	Targets     []string `json:"targets,omitempty"`
+	Mode        string   `json:"mode,omitempty"`
+	Direction   string   `json:"direction,omitempty"`
+	Flow        string   `json:"flow,omitempty"`
+	Details     string   `json:"details,omitempty"`
+}
+
 type yamlTopoPorts struct {
-	Base  int      `yaml:"base"`  // 0 means pick a free port per node
-	Names []string `yaml:"names"` // extra per-node ports; ${port} stays the original listen port
+	Base       int      `yaml:"base"`        // 0 means pick a free port per node
+	ClientBase int      `yaml:"client_base"` // 0 means a free client port per node when client_via_proxy is set
+	Names      []string `yaml:"names"`       // extra per-node ports; ${port} stays the original listen port
 }
 
 // yamlTopoReady is a per-node readiness check. File (path exists, optional
@@ -211,10 +268,38 @@ type yamlHTTP struct {
 }
 
 type yamlWorkload struct {
-	Until        string   `yaml:"until"`
-	WaitFirstAck bool     `yaml:"wait_first_ack"`
-	HTTP         yamlHTTP `yaml:"http"`
-	Ack          yamlAck  `yaml:"ack"`
+	Until        string           `yaml:"until"`
+	WaitFirstAck bool             `yaml:"wait_first_ack"`
+	HTTP         yamlHTTP         `yaml:"http"`
+	Ack          yamlAck          `yaml:"ack"`
+	Driver       string           `yaml:"driver"`
+	Workers      int              `yaml:"workers"`
+	Rate         float64          `yaml:"rate"`
+	Keyspace     int              `yaml:"keyspace"`
+	Timeout      string           `yaml:"timeout"`
+	Targets      string           `yaml:"targets"`
+	Put          yamlKVCall       `yaml:"put"`
+	Get          yamlKVCall       `yaml:"get"`
+	Cas          yamlKVCall       `yaml:"cas"`
+	Exec         yamlExecWorkload `yaml:"exec"`
+	timeout      time.Duration
+}
+
+type yamlKVCall struct {
+	Method        string            `yaml:"method"`
+	URL           string            `yaml:"url"`
+	Body          string            `yaml:"body"`
+	Headers       map[string]string `yaml:"headers"`
+	ValueFrom     string            `yaml:"value_from"`
+	ValueEncoding string            `yaml:"value_encoding"`
+	ErrorFrom     string            `yaml:"error_from"`
+}
+
+type yamlExecWorkload struct {
+	Command []string `yaml:"command"`
+	Put     []string `yaml:"put"`
+	Get     []string `yaml:"get"`
+	Cas     []string `yaml:"cas"`
 }
 
 type yamlAck struct {
@@ -259,13 +344,69 @@ type yamlStep struct {
 }
 
 type yamlCheck struct {
-	ForEach     string        `yaml:"for_each"`
-	HTTP        yamlHTTP      `yaml:"http"`
-	MissVerdict string        `yaml:"miss_verdict"`
-	FileCount   yamlFileCount `yaml:"file_count"`
-	RecordCount yamlRecCount  `yaml:"record_count"`
-	Command     yamlCmdCheck  `yaml:"command"`
-	Rules       []yamlRule    `yaml:"rules"`
+	ForEach     string               `yaml:"for_each"`
+	HTTP        yamlHTTP             `yaml:"http"`
+	MissVerdict string               `yaml:"miss_verdict"`
+	FileCount   yamlFileCount        `yaml:"file_count"`
+	RecordCount yamlRecCount         `yaml:"record_count"`
+	Command     yamlCmdCheck         `yaml:"command"`
+	Rules       []yamlRule           `yaml:"rules"`
+	Porcupine   *yamlPorcupineCheck  `yaml:"porcupine"`
+	Set         *yamlSetCheck        `yaml:"set"`
+	Eventually  *yamlEventuallyCheck `yaml:"eventually_available"`
+}
+
+// yamlProperties is optional coverage next to check:. always and eventually
+// must pass on every trial. sometimes is counted across the -n run.
+type yamlProperties struct {
+	Always     []yamlProperty `yaml:"always"`
+	Eventually []yamlProperty `yaml:"eventually"`
+	Sometimes  []yamlProperty `yaml:"sometimes"`
+}
+
+type yamlProperty struct {
+	Name                string `yaml:"name"`
+	MinHits             int    `yaml:"min_hits"`
+	yamlCheck           `yaml:",inline"`
+	FaultDuringInflight *yamlFlag             `yaml:"fault_during_inflight"`
+	InfoOpsObserved     *yamlFlag             `yaml:"info_ops_observed"`
+	FaultActionFired    *yamlFaultActionFired `yaml:"fault_action_fired"`
+	LeaderChanged       *yamlLeaderChanged    `yaml:"leader_changed"`
+}
+
+// yamlFlag is present when the key is set to {} or true.
+type yamlFlag struct{ on bool }
+
+func (f *yamlFlag) UnmarshalYAML(n *yaml.Node) error {
+	f.on = true
+	if n.Kind == yaml.ScalarNode {
+		switch strings.ToLower(strings.TrimSpace(n.Value)) {
+		case "false", "no", "0":
+			f.on = false
+		}
+	}
+	return nil
+}
+
+func (f *yamlFlag) enabled() bool { return f != nil && f.on }
+
+type yamlFaultActionFired struct {
+	Action string `yaml:"action"`
+}
+
+type yamlLeaderChanged struct {
+	NodeFile string `yaml:"node_file"`
+}
+
+type yamlPorcupineCheck struct {
+	Timeout string `yaml:"timeout"`
+	timeout time.Duration
+}
+
+type yamlSetCheck struct{}
+
+type yamlEventuallyCheck struct {
+	N int `yaml:"n"`
 }
 
 type yamlFileCount struct {
@@ -341,6 +482,11 @@ func LoadYAMLTarget(path string) (*YAMLAdapter, error) {
 		return nil, fmt.Errorf("target-config %s: topology.proxy_mode %s requires topology.peers.via_proxy", path, mode)
 	}
 	cfg.Topology.ProxyMode = mode
+	if cfg.Topology.ClientViaProxy && cfg.Topology.Nodes > 0 && cfg.Topology.Ports.Base > 0 && cfg.Topology.Ports.ClientBase > 0 {
+		if portRangesOverlap(cfg.Topology.Ports.Base, cfg.Topology.Ports.ClientBase, cfg.Topology.Nodes) {
+			return nil, fmt.Errorf("target-config %s: topology.ports.base and topology.ports.client_base ranges overlap", path)
+		}
+	}
 
 	dir := cfg.Fault.Isolate.direction()
 	switch dir {
@@ -376,7 +522,357 @@ func LoadYAMLTarget(path string) (*YAMLAdapter, error) {
 			return nil, fmt.Errorf("target-config %s: steps[%q].delay %q: %w", path, st.Name, st.Delay, err)
 		}
 	}
+	if err := validateNemesis(path, &cfg); err != nil {
+		return nil, err
+	}
+	if err := validateWorkload(path, &cfg); err != nil {
+		return nil, err
+	}
+	if err := validateProperties(path, &cfg); err != nil {
+		return nil, err
+	}
 	return &YAMLAdapter{path: path, cfg: cfg}, nil
+}
+
+func validateNemesis(path string, cfg *yamlTarget) error {
+	n := &cfg.Nemesis
+	if !n.active() {
+		return nil
+	}
+	if cfg.Fault.Isolate.active() || cfg.Fault.Pause.active() {
+		return fmt.Errorf("target-config %s: nemesis and fault are mutually exclusive", path)
+	}
+	if cfg.Kill.At == "file" {
+		return fmt.Errorf("target-config %s: nemesis and kill.at file are mutually exclusive", path)
+	}
+	if cfg.Topology.Nodes <= 0 {
+		return fmt.Errorf("target-config %s: nemesis requires topology.nodes", path)
+	}
+	var err error
+	if n.warmup, err = parseNemesisDuration(path, "warmup", n.Warmup, true); err != nil {
+		return err
+	}
+	if n.duration, err = parseNemesisDuration(path, "duration", n.Duration, false); err != nil {
+		return err
+	}
+	if n.interval, err = parseNemesisDuration(path, "interval", n.Interval, false); err != nil {
+		return err
+	}
+	if n.quiet, err = parseNemesisDuration(path, "quiet_period", n.QuietPeriod, true); err != nil {
+		return err
+	}
+	for i := range n.Actions {
+		if err := validateNemesisAction(path, cfg, &n.Actions[i]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateProperties(path string, cfg *yamlTarget) error {
+	p := &cfg.Properties
+	if len(p.Always) == 0 && len(p.Eventually) == 0 && len(p.Sometimes) == 0 {
+		return nil
+	}
+	seen := map[string]bool{}
+	claim := func(name string) error {
+		if seen[name] {
+			return fmt.Errorf("target-config %s: properties name %q is duplicated", path, name)
+		}
+		seen[name] = true
+		return nil
+	}
+	for i := range p.Always {
+		prop := &p.Always[i]
+		prop.Name = prop.defaultName("always")
+		if err := claim(prop.Name); err != nil {
+			return err
+		}
+		if prop.sometimesEvaluators() > 0 {
+			return fmt.Errorf("target-config %s: properties.always %q cannot use a sometimes evaluator", path, prop.Name)
+		}
+		if prop.Eventually != nil {
+			return fmt.Errorf("target-config %s: properties.always %q: eventually_available belongs under properties.eventually", path, prop.Name)
+		}
+		if !prop.hasAlwaysChecker() {
+			return fmt.Errorf("target-config %s: properties.always %q needs porcupine, set, or a rule check", path, prop.Name)
+		}
+		if prop.hasRuleCheck() && (prop.Porcupine != nil || prop.Set != nil) {
+			return fmt.Errorf("target-config %s: properties.always %q mixes a rule check with porcupine or set", path, prop.Name)
+		}
+		if err := prop.parsePorcupineTimeout(path, "properties.always"); err != nil {
+			return err
+		}
+	}
+	for i := range p.Eventually {
+		prop := &p.Eventually[i]
+		prop.Name = prop.defaultName("eventually")
+		if err := claim(prop.Name); err != nil {
+			return err
+		}
+		if prop.Eventually == nil || prop.Porcupine != nil || prop.Set != nil || prop.hasRuleCheck() || prop.sometimesEvaluators() > 0 {
+			return fmt.Errorf("target-config %s: properties.eventually %q needs only eventually_available", path, prop.Name)
+		}
+	}
+	for i := range p.Sometimes {
+		prop := &p.Sometimes[i]
+		if prop.MinHits < 0 {
+			return fmt.Errorf("target-config %s: properties.sometimes min_hits must be >= 0", path)
+		}
+		if prop.MinHits == 0 {
+			prop.MinHits = 1
+		}
+		prop.Name = prop.defaultName("sometimes")
+		if err := claim(prop.Name); err != nil {
+			return err
+		}
+		if prop.sometimesEvaluators() != 1 {
+			return fmt.Errorf("target-config %s: properties.sometimes %q needs exactly one of fault_during_inflight, info_ops_observed, fault_action_fired, leader_changed", path, prop.Name)
+		}
+		if prop.hasAlwaysChecker() || prop.Eventually != nil {
+			return fmt.Errorf("target-config %s: properties.sometimes %q cannot include a check", path, prop.Name)
+		}
+		if prop.FaultActionFired != nil && !knownNemesisAction(prop.FaultActionFired.Action) {
+			return fmt.Errorf("target-config %s: properties.sometimes %q fault_action_fired.action %q is not a nemesis action", path, prop.Name, prop.FaultActionFired.Action)
+		}
+		if prop.LeaderChanged != nil && strings.TrimSpace(prop.LeaderChanged.NodeFile) == "" {
+			return fmt.Errorf("target-config %s: properties.sometimes %q leader_changed.node_file is required", path, prop.Name)
+		}
+	}
+	needsHistory, needsRead := false, false
+	for _, prop := range append(append([]yamlProperty{}, p.Always...), p.Eventually...) {
+		if prop.Porcupine != nil || prop.Set != nil || prop.Eventually != nil {
+			needsHistory = true
+		}
+		if prop.Porcupine != nil || prop.Set != nil {
+			needsRead = true
+		}
+	}
+	if needsHistory && strings.TrimSpace(cfg.Workload.Driver) == "" {
+		return fmt.Errorf("target-config %s: properties porcupine, set, and eventually_available require workload.driver", path)
+	}
+	if needsRead && cfg.Workload.Driver == "http_kv" && cfg.Workload.Get.URL == "" {
+		return fmt.Errorf("target-config %s: properties porcupine and set need workload.get", path)
+	}
+	if needsRead && cfg.Workload.Driver == "exec_op" && len(cfg.Workload.Exec.Get) == 0 && len(cfg.Workload.Exec.Command) == 0 {
+		return fmt.Errorf("target-config %s: properties porcupine and set need workload.exec.get", path)
+	}
+	return nil
+}
+
+func knownNemesisAction(action string) bool {
+	switch action {
+	case "isolate_node", "isolate_client", "partition_halves", "kill_node", "pause_node", "heal_all":
+		return true
+	default:
+		return false
+	}
+}
+
+func (p yamlProperty) hasRuleCheck() bool {
+	return len(p.Rules) > 0 || p.FileCount.Glob != "" || p.RecordCount.Contains != "" || len(p.Command.Command) > 0
+}
+
+func (p yamlProperty) hasAlwaysChecker() bool {
+	return p.Porcupine != nil || p.Set != nil || p.hasRuleCheck()
+}
+
+func (p yamlProperty) sometimesEvaluators() int {
+	n := 0
+	if p.FaultDuringInflight.enabled() {
+		n++
+	}
+	if p.InfoOpsObserved.enabled() {
+		n++
+	}
+	if p.FaultActionFired != nil {
+		n++
+	}
+	if p.LeaderChanged != nil {
+		n++
+	}
+	return n
+}
+
+func (p yamlProperty) faultAssertion() bool {
+	return p.FaultDuringInflight.enabled() || p.FaultActionFired != nil
+}
+
+func (p yamlProperty) defaultName(kind string) string {
+	if name := strings.TrimSpace(p.Name); name != "" {
+		return name
+	}
+	switch {
+	case p.Porcupine != nil:
+		return "porcupine"
+	case p.Set != nil:
+		return "set"
+	case p.Eventually != nil:
+		return "eventually_available"
+	case p.hasRuleCheck():
+		return "rules"
+	case p.FaultDuringInflight.enabled():
+		return "fault_during_inflight"
+	case p.InfoOpsObserved.enabled():
+		return "info_ops_observed"
+	case p.FaultActionFired != nil && p.FaultActionFired.Action != "":
+		return "fault_action_fired_" + p.FaultActionFired.Action
+	case p.LeaderChanged != nil:
+		return "leader_changed"
+	default:
+		return kind
+	}
+}
+
+func (p *yamlProperty) parsePorcupineTimeout(path, where string) error {
+	if p.Porcupine == nil {
+		return nil
+	}
+	raw := strings.TrimSpace(p.Porcupine.Timeout)
+	if raw == "" {
+		p.Porcupine.timeout = 5 * time.Second
+		return nil
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil || d < 0 {
+		return fmt.Errorf("target-config %s: %s %q porcupine.timeout %q", path, where, p.Name, p.Porcupine.Timeout)
+	}
+	p.Porcupine.timeout = d
+	return nil
+}
+
+func parseNemesisDuration(path, field, raw string, allowEmpty bool) (time.Duration, error) {
+	if strings.TrimSpace(raw) == "" {
+		if allowEmpty {
+			return 0, nil
+		}
+		return 0, fmt.Errorf("target-config %s: nemesis.%s is required", path, field)
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		return 0, fmt.Errorf("target-config %s: nemesis.%s %q: %w", path, field, raw, err)
+	}
+	if d <= 0 {
+		return 0, fmt.Errorf("target-config %s: nemesis.%s must be > 0", path, field)
+	}
+	return d, nil
+}
+
+func validateNemesisAction(path string, cfg *yamlTarget, a *yamlNemesisAction) error {
+	switch a.Type {
+	case "isolate_node", "isolate_client", "partition_halves", "kill_node", "pause_node", "heal_all":
+	default:
+		return fmt.Errorf("target-config %s: nemesis action type %q is not supported", path, a.Type)
+	}
+	if a.Weight <= 0 {
+		a.Weight = 1
+	}
+	if a.Type == "isolate_client" && !cfg.Topology.ClientViaProxy {
+		return fmt.Errorf("target-config %s: isolate_client requires topology.client_via_proxy", path)
+	}
+	needsMode := a.Type == "isolate_node" || a.Type == "isolate_client" || a.Type == "partition_halves"
+	if needsMode {
+		switch a.Mode {
+		case "reset", "blackhole", "degraded":
+		default:
+			return fmt.Errorf("target-config %s: nemesis %s mode %q not supported (reset, blackhole, or degraded)", path, a.Type, a.Mode)
+		}
+	}
+	if a.Direction == "" {
+		if a.Type == "isolate_node" || a.Type == "partition_halves" {
+			a.Direction = "both"
+		}
+	} else {
+		switch a.Direction {
+		case "both", "inbound", "outbound":
+		default:
+			return fmt.Errorf("target-config %s: nemesis direction %q not supported (both, inbound, or outbound)", path, a.Direction)
+		}
+	}
+	if a.Flow == "" {
+		if needsMode {
+			a.Flow = "both"
+		}
+	} else {
+		switch a.Flow {
+		case "both", "a_to_b", "b_to_a":
+		default:
+			return fmt.Errorf("target-config %s: nemesis flow %q not supported (both, a_to_b, or b_to_a)", path, a.Flow)
+		}
+	}
+	if cfg.Topology.ProxyMode == "per_node" && a.Type == "isolate_node" && a.Direction != "inbound" {
+		return fmt.Errorf("target-config %s: topology.proxy_mode per_node nemesis isolate_node requires direction inbound", path)
+	}
+	if a.DropRate < 0 || a.DropRate > 1 {
+		return fmt.Errorf("target-config %s: nemesis drop_rate %v not in [0,1]", path, a.DropRate)
+	}
+	var err error
+	if a.latency, err = optionalNemesisDuration(path, "latency", a.Latency); err != nil {
+		return err
+	}
+	if a.jitter, err = optionalNemesisDuration(path, "jitter", a.Jitter); err != nil {
+		return err
+	}
+	if a.Type == "kill_node" {
+		if a.restartDelay, err = optionalNemesisDuration(path, "restart_delay", a.RestartDelay); err != nil {
+			return err
+		}
+	}
+	if a.Type == "pause_node" {
+		if strings.TrimSpace(a.PauseDuration) == "" {
+			return fmt.Errorf("target-config %s: pause_node requires pause_duration", path)
+		}
+		if a.pauseFor, err = optionalNemesisDuration(path, "pause_duration", a.PauseDuration); err != nil {
+			return err
+		}
+		if a.pauseFor <= 0 {
+			return fmt.Errorf("target-config %s: pause_duration must be > 0", path)
+		}
+	}
+	switch a.Type {
+	case "isolate_node", "isolate_client", "kill_node", "pause_node":
+		if err := validateNemesisTarget(path, cfg, a); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func optionalNemesisDuration(path, field, raw string) (time.Duration, error) {
+	if strings.TrimSpace(raw) == "" {
+		return 0, nil
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		return 0, fmt.Errorf("target-config %s: nemesis %s %q: %w", path, field, raw, err)
+	}
+	if d < 0 {
+		return 0, fmt.Errorf("target-config %s: nemesis %s must be >= 0", path, field)
+	}
+	return d, nil
+}
+
+func validateNemesisTarget(path string, cfg *yamlTarget, a *yamlNemesisAction) error {
+	switch strings.TrimSpace(a.Target) {
+	case "random":
+		return nil
+	case "leader":
+		if strings.TrimSpace(a.NodeFile) == "" && strings.TrimSpace(cfg.Nemesis.NodeFile) == "" {
+			return fmt.Errorf("target-config %s: nemesis target leader requires node_file", path)
+		}
+		return nil
+	case "":
+		return fmt.Errorf("target-config %s: nemesis %s requires target", path, a.Type)
+	default:
+		idx, err := parseNodeRef(a.Target)
+		if err != nil {
+			return fmt.Errorf("target-config %s: nemesis target %q: %w", path, a.Target, err)
+		}
+		if idx < 0 || idx >= cfg.Topology.Nodes {
+			return fmt.Errorf("target-config %s: nemesis target %q is outside topology.nodes", path, a.Target)
+		}
+		return nil
+	}
 }
 
 func (y *YAMLAdapter) Name() string { return y.cfg.Name }
@@ -461,12 +957,12 @@ func (y *YAMLAdapter) vars(t *BaseTrial, n string) map[string]string {
 }
 
 func expandTemplates(s string, vars map[string]string) string {
-	keys := []string{"run_id", "binary", "home", "addr", "seed", "dir", "key", "n", "i", "port", "data_dir", "peers", "peers_via_proxy", "name"}
+	keys := []string{"run_id", "binary", "home", "addr", "seed", "dir", "key", "n", "i", "port", "data_dir", "peers", "peers_via_proxy", "name", "client_port", "client_proxy", "client_addrs"}
 	for _, k := range keys {
 		s = strings.ReplaceAll(s, "${"+k+"}", vars[k])
 	}
 	for k, v := range vars {
-		if strings.HasPrefix(k, "peer_addr_") || strings.HasPrefix(k, "node_proxy_addr_") || strings.HasPrefix(k, "port_") || strings.HasPrefix(k, "addr_") {
+		if strings.HasPrefix(k, "peer_addr_") || strings.HasPrefix(k, "node_proxy_addr_") || strings.HasPrefix(k, "client_addr_") || strings.HasPrefix(k, "port_") || strings.HasPrefix(k, "addr_") {
 			s = strings.ReplaceAll(s, "${"+k+"}", v)
 		}
 	}
@@ -635,6 +1131,13 @@ type topologyNode struct {
 	StopHow    string // "SIGTERM", "SIGKILL", or empty if not stopped by us
 	cmd        *exec.Cmd
 	waitDone   chan struct{}
+	args       []string
+	env        []string
+	gen        int
+	pauseGen   int
+	dead       bool
+	paused     bool
+	restarting bool
 }
 
 // topologyLink is one directed proxy.Link from node From to node To's peer port.
@@ -650,6 +1153,7 @@ type topologyLink struct {
 	CutTime     time.Time
 	cut         bool
 	cutFrom     map[int]struct{} // per_node_owned: sources cut on this inbound proxy
+	Kind        string           // "client" for a client-port proxy; empty for a peer proxy
 }
 
 // unknownOwner is a connection whose socket owner was not one of the topology PIDs.
@@ -683,11 +1187,35 @@ type topologyRuntime struct {
 	ProxyMode string
 	Nodes     []*topologyNode
 	Links     []*topologyLink
-	Unknown   []unknownOwner
-	Isolate   *isolateState
-	Pause     *pauseState
-	AllReady  bool
-	Stopped   bool
+	// ClientLinks are proxies in front of each node's client port when
+	// client_via_proxy is set. Peer isolate does not cut them; a nemesis can.
+	ClientLinks   []*topologyLink
+	ClientPorts   []int
+	ClientProxies []string
+	// PeerAddrs and NodeProxies are the addresses start scripts and ready
+	// probes expand. The post-quiet recheck has to see them too.
+	PeerAddrs   [][]string
+	NodeProxies []string
+	Unknown     []unknownOwner
+	Isolate     *isolateState
+	Pause       *pauseState
+	Nemesis     *nemesisRun
+	log         io.Writer
+	AllReady    bool
+	Stopped     bool
+}
+
+// nemesisRun is the schedule for one trial: the event log and the recovery clock.
+type nemesisRun struct {
+	Events        []NemesisEvent
+	Done          bool
+	ReadyOK       bool
+	Err           string
+	QuietStarted  time.Time
+	QuietFinished time.Time
+	QuietStartNS  int64
+	QuietEndNS    int64
+	CheckStarted  time.Time
 }
 
 func (rt *topologyRuntime) evidence() []map[string]any {
@@ -922,6 +1450,15 @@ var (
 	reservedPorts  = map[int]struct{}{}
 )
 
+func portRangesOverlap(a, b, n int) bool {
+	if n <= 0 {
+		return false
+	}
+	a2 := a + n - 1
+	b2 := b + n - 1
+	return a <= b2 && b <= a2
+}
+
 // freePort asks the kernel for an ephemeral port and remembers it for this
 // process. Two topologies started together therefore do not receive the same
 // port after the listener is closed.
@@ -1036,9 +1573,11 @@ func (y *YAMLAdapter) startTopology(t *BaseTrial, log *os.File) (*exec.Cmd, erro
 		return nil, err
 	}
 
-	rt := &topologyRuntime{Nodes: make([]*topologyNode, n), ProxyMode: topo.ProxyMode}
+	rt := &topologyRuntime{Nodes: make([]*topologyNode, n), ProxyMode: topo.ProxyMode, log: log}
 	peerAddrs := make([][]string, n) // peerAddrs[i][j] = addr node i uses to reach j
 	var nodeProxies []string         // per_node: inbound proxy listen for node k
+	var clientPorts []int
+	var clientProxies []string
 	if topo.Peers.ViaProxy {
 		for i := 0; i < n; i++ {
 			peerAddrs[i] = make([]string, n)
@@ -1094,6 +1633,40 @@ func (y *YAMLAdapter) startTopology(t *BaseTrial, log *os.File) (*exec.Cmd, erro
 			}
 		}
 	}
+	if topo.ClientViaProxy {
+		clientPorts = make([]int, n)
+		clientProxies = make([]string, n)
+		for i := 0; i < n; i++ {
+			p := topo.Ports.ClientBase + i
+			if topo.Ports.ClientBase == 0 {
+				fp, err := freePort()
+				if err != nil {
+					y.stopTopology(rt)
+					return nil, fmt.Errorf("topology: free client port: %w", err)
+				}
+				p = fp
+			}
+			clientPorts[i] = p
+			upstream := "127.0.0.1:" + strconv.Itoa(p)
+			link, err := proxy.New("127.0.0.1:0", upstream)
+			if err != nil {
+				y.stopTopology(rt)
+				return nil, fmt.Errorf("topology client proxy %d: %w", i, err)
+			}
+			tl := &topologyLink{From: -1, To: i, Kind: "client", Link: link}
+			rt.ClientLinks = append(rt.ClientLinks, tl)
+			if err := link.Start(); err != nil {
+				y.stopTopology(rt)
+				return nil, fmt.Errorf("topology client proxy %d start: %w", i, err)
+			}
+			tl.Listen = link.Addr().String()
+			clientProxies[i] = tl.Listen
+		}
+		rt.ClientPorts = clientPorts
+		rt.ClientProxies = clientProxies
+	}
+	rt.PeerAddrs = peerAddrs
+	rt.NodeProxies = nodeProxies
 
 	var mu sync.Mutex
 	var wg sync.WaitGroup
@@ -1118,6 +1691,7 @@ func (y *YAMLAdapter) startTopology(t *BaseTrial, log *os.File) (*exec.Cmd, erro
 			vars["data_dir"] = dataDir
 			setNodePortVars(vars, ports[i], namedPorts, i)
 			y.addPeerVars(vars, peerAddrs, nodeProxies, i)
+			y.addClientVars(vars, clientPorts, clientProxies, i)
 			args := y.expandSlice(topo.Start, vars)
 			if len(args) == 0 {
 				errs[i] = fmt.Errorf("topology.start expanded empty for node %d", i)
@@ -1132,6 +1706,8 @@ func (y *YAMLAdapter) startTopology(t *BaseTrial, log *os.File) (*exec.Cmd, erro
 				errs[i] = fmt.Errorf("topology node %d: %w", i, err)
 				return
 			}
+			trackProc(cmd)
+			done := make(chan struct{})
 			node := &topologyNode{
 				Index:     i,
 				PID:       cmd.Process.Pid,
@@ -1139,19 +1715,11 @@ func (y *YAMLAdapter) startTopology(t *BaseTrial, log *os.File) (*exec.Cmd, erro
 				DataDir:   dataDir,
 				StartTime: startTime,
 				cmd:       cmd,
-				waitDone:  make(chan struct{}),
+				waitDone:  done,
+				args:      append([]string(nil), args...),
+				env:       append([]string(nil), cmd.Env...),
 			}
-			go func() {
-				_ = cmd.Wait()
-				mu.Lock()
-				code := -1
-				if cmd.ProcessState != nil {
-					code = cmd.ProcessState.ExitCode()
-				}
-				node.ExitStatus = &code
-				mu.Unlock()
-				close(node.waitDone)
-			}()
+			go y.watchCmd(rt, node, cmd, done, node.PID)
 			mu.Lock()
 			rt.Nodes[i] = node
 			mu.Unlock()
@@ -1186,6 +1754,7 @@ func (y *YAMLAdapter) startTopology(t *BaseTrial, log *os.File) (*exec.Cmd, erro
 			vars["data_dir"] = node.DataDir
 			setNodePortVars(vars, node.Port, namedPorts, i)
 			y.addPeerVars(vars, peerAddrs, nodeProxies, i)
+			y.addClientVars(vars, clientPorts, clientProxies, i)
 			if err := y.waitTopologyReady(node, vars, readyTo); err != nil {
 				mu.Lock()
 				allReady = false
@@ -1223,6 +1792,9 @@ func (y *YAMLAdapter) startTopology(t *BaseTrial, log *os.File) (*exec.Cmd, erro
 		y.stopTopology(rt)
 		return nil, err
 	}
+	// The hold is fuss's sleep, not a target node. Calibration (-kill=false)
+	// stops it after the schedule so the trial can reach its checks.
+	t.Data()["topology_hold"] = true
 	return hold, nil
 }
 
@@ -1245,6 +1817,27 @@ func (y *YAMLAdapter) addPeerVars(vars map[string]string, peerAddrs [][]string, 
 		}
 		vars["peers_via_proxy"] = vars["peers"]
 	}
+}
+
+// addClientVars exposes the real client listen port and the proxy clients dial.
+// client_port is what the node binds. client_proxy and client_addr_j are the
+// proxy addresses when client_via_proxy is set.
+func (y *YAMLAdapter) addClientVars(vars map[string]string, ports []int, proxies []string, i int) {
+	if i < 0 || i >= len(ports) {
+		return
+	}
+	vars["client_port"] = strconv.Itoa(ports[i])
+	addrs := make([]string, len(ports))
+	for j, port := range ports {
+		addr := "127.0.0.1:" + strconv.Itoa(port)
+		if j < len(proxies) && proxies[j] != "" {
+			addr = proxies[j]
+		}
+		vars["client_addr_"+strconv.Itoa(j)] = addr
+		addrs[j] = addr
+	}
+	vars["client_proxy"] = addrs[i]
+	vars["client_addrs"] = strings.Join(addrs, ",")
 }
 
 func parseIsolateNode(s string) (int, error) {
@@ -1698,6 +2291,15 @@ func (y *YAMLAdapter) stopTopology(rt *topologyRuntime) {
 	rt.Stopped = true
 	nodes := append([]*topologyNode(nil), rt.Nodes...)
 	links := append([]*topologyLink(nil), rt.Links...)
+	links = append(links, rt.ClientLinks...)
+	var cont []*exec.Cmd
+	for _, n := range nodes {
+		if n != nil && n.paused && n.cmd != nil && n.cmd.Process != nil {
+			cont = append(cont, n.cmd)
+			n.paused = false
+			n.pauseGen++
+		}
+	}
 	pausedIdx := -1
 	resume := "end"
 	paused := false
@@ -1716,6 +2318,11 @@ func (y *YAMLAdapter) stopTopology(rt *topologyRuntime) {
 		}
 	}
 
+	for _, cmd := range cont {
+		if cmd != nil && cmd.Process != nil {
+			_ = cmd.Process.Signal(syscall.SIGCONT)
+		}
+	}
 	// A SIGSTOP'd process ignores SIGTERM until continued. resume:end sends
 	// SIGCONT first; resume:never leaves it stopped and relies on SIGKILL.
 	if paused && resume == "end" && pausedIdx >= 0 && pausedIdx < len(nodes) {
@@ -1918,10 +2525,36 @@ func (y *YAMLAdapter) CheckNamed(at AdapterTrial, killed bool, phase string) Che
 	if rt, ok := t.Data()["topology"].(*topologyRuntime); ok {
 		defer y.stopTopology(rt)
 		if !rt.AllReady {
-			return CheckResult{
+			return y.finishCheck(t, CheckResult{
 				Verdict:  "UNKNOWN",
+				Reason:   "nodes_not_ready",
 				Evidence: 1,
 				Problems: []error{fmt.Errorf("topology: a node was not ready in time")},
+			})
+		}
+		if y.nemesisActive() {
+			if rt.Nemesis != nil && rt.Nemesis.CheckStarted.IsZero() {
+				rt.Nemesis.CheckStarted = time.Now()
+			}
+			if rt.Nemesis == nil || !rt.Nemesis.Done {
+				return y.finishCheck(t, CheckResult{
+					Verdict:  "UNKNOWN",
+					Reason:   "nemesis_not_finished",
+					Evidence: 1,
+					Problems: []error{fmt.Errorf("nemesis: schedule did not finish")},
+				})
+			}
+			if !rt.Nemesis.ReadyOK {
+				msg := rt.Nemesis.Err
+				if msg == "" {
+					msg = "nodes not ready after quiet_period"
+				}
+				return y.finishCheck(t, CheckResult{
+					Verdict:  "UNKNOWN",
+					Reason:   "nodes_not_ready",
+					Evidence: 1,
+					Problems: []error{fmt.Errorf("nemesis: %s", msg)},
+				})
 			}
 		}
 		if y.cfg.Fault.Isolate.active() {
@@ -1951,10 +2584,21 @@ func (y *YAMLAdapter) CheckNamed(at AdapterTrial, killed bool, phase string) Che
 			return CheckResult{Verdict: "FAIL", Problems: []error{err}, Evidence: 1}
 		}
 	}
+	if y.historyChecks() {
+		return y.finishCheck(t, y.checkHistory(t))
+	}
 	if y.usesRulesCheck() {
-		return y.checkRules(t)
+		return y.finishCheck(t, y.checkRules(t))
+	}
+	if y.propertiesActive() {
+		return y.finishCheck(t, CheckResult{Verdict: "PASS", Evidence: 1})
 	}
 	return y.checkAcks(t)
+}
+
+func (y *YAMLAdapter) propertiesActive() bool {
+	p := y.cfg.Properties
+	return len(p.Always) > 0 || len(p.Eventually) > 0 || len(p.Sometimes) > 0
 }
 
 func (y *YAMLAdapter) usesRulesCheck() bool {
@@ -2002,44 +2646,48 @@ func (y *YAMLAdapter) runAfterSteps(t *BaseTrial, steps []yamlStep) error {
 }
 
 func (y *YAMLAdapter) checkRules(t *BaseTrial) CheckResult {
+	return y.evalRules(t, y.cfg.Check, true)
+}
+
+func (y *YAMLAdapter) evalRules(t *BaseTrial, c yamlCheck, publish bool) CheckResult {
 	vars := y.vars(t, "")
 	vals := map[string]any{}
 	evidence := 0
-	if y.cfg.Check.FileCount.Glob != "" {
-		g := expandTemplates(y.cfg.Check.FileCount.Glob, vars)
-		contains := expandTemplates(y.cfg.Check.FileCount.Contains, vars)
-		equals := expandTemplates(y.cfg.Check.FileCount.Equals, vars)
-		n := countMatchingFiles(g, contains, y.cfg.Check.FileCount.JSONField, equals)
-		name := y.cfg.Check.FileCount.As
+	if c.FileCount.Glob != "" {
+		g := expandTemplates(c.FileCount.Glob, vars)
+		contains := expandTemplates(c.FileCount.Contains, vars)
+		equals := expandTemplates(c.FileCount.Equals, vars)
+		n := countMatchingFiles(g, contains, c.FileCount.JSONField, equals)
+		name := c.FileCount.As
 		if name == "" {
 			name = "files"
 		}
 		vals[name] = n
 		evidence += n
 	}
-	if y.cfg.Check.RecordCount.Contains != "" {
-		needle := expandTemplates(y.cfg.Check.RecordCount.Contains, vars)
+	if c.RecordCount.Contains != "" {
+		needle := expandTemplates(c.RecordCount.Contains, vars)
 		n := strings.Count(t.RecordContent(), needle)
-		name := y.cfg.Check.RecordCount.As
+		name := c.RecordCount.As
 		if name == "" {
 			name = "matches"
 		}
 		vals[name] = n
 		evidence += n
 	}
-	if len(y.cfg.Check.Command.Command) > 0 {
-		args := y.expandSlice(y.cfg.Check.Command.Command, vars)
+	if len(c.Command.Command) > 0 {
+		args := y.expandSlice(c.Command.Command, vars)
 		cmd := exec.Command(args[0], args[1:]...)
 		y.applyEnv(cmd, vars)
 		out, err := cmd.CombinedOutput()
 		s := string(out)
-		name := y.cfg.Check.Command.As
+		name := c.Command.As
 		if name == "" {
 			name = "stdout"
 		}
 		vals[name] = s
-		if y.cfg.Check.Command.Contains != "" {
-			want := expandTemplates(y.cfg.Check.Command.Contains, vars)
+		if c.Command.Contains != "" {
+			want := expandTemplates(c.Command.Contains, vars)
 			vals[name+"_hits"] = strings.Count(s, want)
 			if strings.Contains(s, want) {
 				evidence++
@@ -2055,8 +2703,11 @@ func (y *YAMLAdapter) checkRules(t *BaseTrial) CheckResult {
 		evidence = 1
 	}
 	// Surface check vals (e.g. command stdout) in trial JSON evidence.check.
-	t.Data()["check_vals"] = vals
-	for _, r := range y.cfg.Check.Rules {
+	// A property rule check leaves the scenario check's vals in place.
+	if publish {
+		t.Data()["check_vals"] = vals
+	}
+	for _, r := range c.Rules {
 		if r.Else != "" && len(r.If) == 0 {
 			return CheckResult{Verdict: r.Else, Evidence: evidence}
 		}
@@ -2319,6 +2970,17 @@ func (y *YAMLAdapter) WaitBeforeKill(at AdapterTrial, seed int64) (time.Duration
 	if !ok {
 		return 0, false, fmt.Errorf("expected *BaseTrial, got %T", at)
 	}
+	if y.nemesisActive() {
+		rng, _ := t.Data()["rng"].(*rand.Rand)
+		if rng == nil {
+			rng = rand.New(rand.NewSource(seed))
+		}
+		start := time.Now()
+		if err := y.runNemesis(t, rng); err != nil {
+			return time.Since(start), true, err
+		}
+		return time.Since(start), true, nil
+	}
 	spec, ok := t.Data()["file_kill"].(yamlKillFile)
 	if !ok {
 		if y.cfg.Kill.At != "file" {
@@ -2427,6 +3089,9 @@ func (y *YAMLAdapter) Controls() []string {
 }
 
 func (y *YAMLAdapter) KillWindow() (minMS, maxMS int) {
+	if y.nemesisActive() {
+		return 0, 0
+	}
 	minMS = y.cfg.Kill.Delay.MinMS
 	maxMS = y.cfg.Kill.Delay.MaxMS
 	if maxMS <= minMS {
@@ -2435,9 +3100,912 @@ func (y *YAMLAdapter) KillWindow() (minMS, maxMS int) {
 	return minMS, maxMS
 }
 
+func (y *YAMLAdapter) nemesisActive() bool { return y.cfg.Nemesis.active() }
+
 type yamlStatus struct {
 	State string
 }
 
 func (s yamlStatus) String() string  { return s.State }
 func (s yamlStatus) IsRunning() bool { return s.State == "running" }
+
+func (y *YAMLAdapter) watchCmd(rt *topologyRuntime, n *topologyNode, cmd *exec.Cmd, done chan struct{}, pid int) {
+	_ = cmd.Wait()
+	noteProcWaited(pid)
+	code := -1
+	if cmd.ProcessState != nil {
+		code = cmd.ProcessState.ExitCode()
+	}
+	rt.mu.Lock()
+	if n != nil && n.cmd == cmd {
+		n.ExitStatus = &code
+		n.dead = true
+	}
+	rt.mu.Unlock()
+	close(done)
+}
+
+func (rt *topologyRuntime) nemesisEvents() (events []NemesisEvent, ran bool) {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	if rt.Nemesis == nil {
+		return nil, false
+	}
+	out := make([]NemesisEvent, len(rt.Nemesis.Events))
+	copy(out, rt.Nemesis.Events)
+	return out, true
+}
+
+func (rt *topologyRuntime) recordNemesis(origin time.Time, e NemesisEvent) {
+	e.TimestampNS = time.Since(origin).Nanoseconds()
+	if e.TimestampNS < 0 {
+		e.TimestampNS = 0
+	}
+	rt.mu.Lock()
+	if rt.Nemesis == nil {
+		rt.Nemesis = &nemesisRun{}
+	}
+	rt.Nemesis.Events = append(rt.Nemesis.Events, e)
+	rt.mu.Unlock()
+}
+
+// runNemesis drives the schedule from the trial RNG, then heals, restarts
+// dead nodes, waits quiet_period, and re-checks ready before the caller checks.
+func (y *YAMLAdapter) runNemesis(t *BaseTrial, rng *rand.Rand) error {
+	rt, ok := t.Data()["topology"].(*topologyRuntime)
+	if !ok || rt == nil {
+		return fmt.Errorf("nemesis: topology is not running")
+	}
+	spec := y.cfg.Nemesis
+	weights := make([]int, len(spec.Actions))
+	for i, a := range spec.Actions {
+		weights[i] = a.Weight
+	}
+	fires := nemesisFireCount(spec.duration, spec.interval)
+	picks := make([]int, fires)
+	for i := range picks {
+		picks[i] = pickWeighted(rng, weights)
+	}
+	rt.mu.Lock()
+	if rt.Nemesis == nil {
+		rt.Nemesis = &nemesisRun{}
+	}
+	rt.mu.Unlock()
+	// origin is scheduleStart for both nemesis_events.json and history.jsonl.
+	origin := time.Now()
+	t.Data()["schedule_start"] = origin
+	if watch := y.startLeaderWatch(t); watch != nil {
+		defer func() {
+			t.Data()["leader_samples"] = watch.finish()
+		}()
+	}
+	var stop func()
+	if y.workloadActive() {
+		var err error
+		stop, err = y.startWorkload(t, rt, rng, origin)
+		if err != nil {
+			return err
+		}
+		defer stop()
+	}
+	quietStart, quietEnd := scheduleNemesis(spec.warmup, spec.duration, spec.interval, spec.quiet, fires, func(i int) {
+		if i < 0 || i >= len(picks) {
+			return
+		}
+		y.fireNemesis(t, rt, spec.Actions[picks[i]], rng, origin)
+	}, func() {
+		y.nemesisRecover(t, rt, origin)
+	}, func() {
+		if stop != nil {
+			stop()
+		}
+		y.nemesisReady(t, rt)
+	})
+	startNS := quietStart.Sub(origin).Nanoseconds()
+	endNS := quietEnd.Sub(origin).Nanoseconds()
+	if startNS < 0 {
+		startNS = 0
+	}
+	if endNS < startNS {
+		endNS = startNS
+	}
+	rt.mu.Lock()
+	rt.Nemesis.QuietStarted = quietStart
+	rt.Nemesis.QuietFinished = quietEnd
+	rt.Nemesis.QuietStartNS = startNS
+	rt.Nemesis.QuietEndNS = endNS
+	rt.Nemesis.Done = true
+	rt.mu.Unlock()
+	t.Data()["quiet_start_ns"] = startNS
+	t.Data()["quiet_end_ns"] = endNS
+	return nil
+}
+
+// leaderWatch polls node_file values for leader_changed. Samples include a
+// missing file as "", so empty then a leader counts as a change, and a file
+// that never exists does not.
+type leaderWatch struct {
+	mu      sync.Mutex
+	once    sync.Once
+	samples map[string][]string
+	paths   []string
+	stop    chan struct{}
+	done    chan struct{}
+}
+
+func (y *YAMLAdapter) startLeaderWatch(t *BaseTrial) *leaderWatch {
+	var paths []string
+	seen := map[string]bool{}
+	vars := y.vars(t, "")
+	for _, p := range y.cfg.Properties.Sometimes {
+		if p.LeaderChanged == nil {
+			continue
+		}
+		path := expandTemplates(p.LeaderChanged.NodeFile, vars)
+		if path == "" || seen[path] {
+			continue
+		}
+		seen[path] = true
+		paths = append(paths, path)
+	}
+	if len(paths) == 0 {
+		return nil
+	}
+	w := &leaderWatch{
+		samples: map[string][]string{},
+		paths:   paths,
+		stop:    make(chan struct{}),
+		done:    make(chan struct{}),
+	}
+	w.sample()
+	go w.run()
+	return w
+}
+
+func (w *leaderWatch) sample() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	for _, path := range w.paths {
+		v := readLeaderValue(path)
+		seq := w.samples[path]
+		if len(seq) == 0 || seq[len(seq)-1] != v {
+			w.samples[path] = append(seq, v)
+		}
+	}
+}
+
+func readLeaderValue(path string) string {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	if i := strings.IndexAny(string(b), "\r\n"); i >= 0 {
+		return strings.TrimSpace(string(b)[:i])
+	}
+	return strings.TrimSpace(string(b))
+}
+
+func (w *leaderWatch) run() {
+	defer close(w.done)
+	tick := time.NewTicker(10 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		select {
+		case <-w.stop:
+			w.sample()
+			return
+		case <-tick.C:
+			w.sample()
+		}
+	}
+}
+
+func (w *leaderWatch) finish() map[string][]string {
+	w.once.Do(func() { close(w.stop) })
+	<-w.done
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	out := make(map[string][]string, len(w.samples))
+	for k, v := range w.samples {
+		out[k] = append([]string(nil), v...)
+	}
+	return out
+}
+
+func (y *YAMLAdapter) fireNemesis(t *BaseTrial, rt *topologyRuntime, action yamlNemesisAction, rng *rand.Rand, origin time.Time) {
+	ev := NemesisEvent{
+		Action:    action.Type,
+		Mode:      action.Mode,
+		Direction: action.Direction,
+		Flow:      action.Flow,
+		Details:   actionDetails(action, ""),
+	}
+	switch action.Type {
+	case "heal_all":
+		y.nemesisHealAll(rt)
+	case "isolate_node":
+		idx, err := y.nemesisTarget(t, action, len(rt.Nodes), rng)
+		if err != nil {
+			ev.Details = actionDetails(action, "error="+err.Error())
+			break
+		}
+		ev.Targets = []string{nodeName(idx)}
+		ev.Details = actionDetails(action, y.isolateNode(rt, idx, action, rng))
+	case "isolate_client":
+		idx, err := y.nemesisTarget(t, action, len(rt.Nodes), rng)
+		if err != nil {
+			ev.Details = actionDetails(action, "error="+err.Error())
+			break
+		}
+		ev.Targets = []string{nodeName(idx)}
+		ev.Details = actionDetails(action, y.isolateClient(rt, idx, action, rng))
+	case "partition_halves":
+		targets, details := y.partitionHalves(rt, action, rng)
+		ev.Targets = targets
+		ev.Details = actionDetails(action, details)
+	case "kill_node":
+		idx, err := y.nemesisTarget(t, action, len(rt.Nodes), rng)
+		if err != nil {
+			ev.Details = actionDetails(action, "error="+err.Error())
+			break
+		}
+		ev.Targets = []string{nodeName(idx)}
+		ev.Details = actionDetails(action, y.killNodeLater(t, rt, idx, action.restartDelay))
+	case "pause_node":
+		idx, err := y.nemesisTarget(t, action, len(rt.Nodes), rng)
+		if err != nil {
+			ev.Details = actionDetails(action, "error="+err.Error())
+			break
+		}
+		ev.Targets = []string{nodeName(idx)}
+		ev.Details = actionDetails(action, y.pauseNodeFor(rt, idx, action.pauseFor))
+	default:
+		ev.Details = actionDetails(action, "error=unknown action")
+	}
+	rt.recordNemesis(origin, ev)
+}
+
+func actionDetails(a yamlNemesisAction, extra string) string {
+	var parts []string
+	if a.Latency != "" {
+		parts = append(parts, "latency="+a.Latency)
+	}
+	if a.Jitter != "" {
+		parts = append(parts, "jitter="+a.Jitter)
+	}
+	if a.DropRate > 0 {
+		parts = append(parts, fmt.Sprintf("drop_rate=%g", a.DropRate))
+	}
+	if a.Type == "kill_node" && a.RestartDelay != "" {
+		parts = append(parts, "restart_delay="+a.RestartDelay)
+	}
+	if a.Type == "pause_node" && a.PauseDuration != "" {
+		parts = append(parts, "pause_duration="+a.PauseDuration)
+	}
+	if extra != "" {
+		parts = append(parts, extra)
+	}
+	return strings.Join(parts, " ")
+}
+
+func nodeName(i int) string { return "node_" + strconv.Itoa(i) }
+
+func (y *YAMLAdapter) nemesisTarget(t *BaseTrial, action yamlNemesisAction, n int, rng *rand.Rand) (int, error) {
+	switch strings.TrimSpace(action.Target) {
+	case "random":
+		return pickNodeIndex(rng, n), nil
+	case "leader":
+		file := action.NodeFile
+		if strings.TrimSpace(file) == "" {
+			file = y.cfg.Nemesis.NodeFile
+		}
+		path := expandTemplates(file, y.vars(t, ""))
+		return readNodeFile(path)
+	default:
+		idx, err := parseNodeRef(action.Target)
+		if err != nil {
+			return -1, err
+		}
+		if idx < 0 || idx >= n {
+			return -1, fmt.Errorf("node %d outside 0..%d", idx, n-1)
+		}
+		return idx, nil
+	}
+}
+
+func parseNodeRef(s string) (int, error) {
+	s = strings.TrimSpace(s)
+	if strings.HasPrefix(s, "node_") {
+		s = strings.TrimPrefix(s, "node_")
+	}
+	if s == "" {
+		return -1, fmt.Errorf("empty node")
+	}
+	return strconv.Atoi(s)
+}
+
+func readNodeFile(path string) (int, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return -1, fmt.Errorf("node file: %w", err)
+	}
+	line := strings.TrimSpace(string(b))
+	if i := strings.IndexAny(line, "\r\n"); i >= 0 {
+		line = strings.TrimSpace(line[:i])
+	}
+	if line == "" {
+		return -1, fmt.Errorf("node file %s is empty", path)
+	}
+	return parseNodeRef(line)
+}
+
+func faultProfile(a yamlNemesisAction) proxy.FaultProfile {
+	flow := a.Flow
+	if flow == "" {
+		flow = proxy.DirBoth
+	}
+	return proxy.FaultProfile{
+		Mode:      proxy.LinkMode(a.Mode),
+		Latency:   a.latency,
+		Jitter:    a.jitter,
+		DropRate:  a.DropRate,
+		Direction: flow,
+	}
+}
+
+func applyLink(l *proxy.Link, p proxy.FaultProfile, rng *rand.Rand) error {
+	if l == nil {
+		return nil
+	}
+	return l.Apply(p, deriveRand(rng))
+}
+
+func (y *YAMLAdapter) isolateNode(rt *topologyRuntime, idx int, action yamlNemesisAction, rng *rand.Rand) string {
+	links := rt.peerLinkSnap()
+	apply, sourceCut := classifyLinks(links, idx, action.Direction)
+	var notes []string
+	profile := faultProfile(action)
+	for _, l := range apply {
+		if err := applyLink(l.Link, profile, rng); err != nil {
+			notes = append(notes, err.Error())
+		}
+	}
+	if action.Mode == "reset" {
+		for _, l := range sourceCut {
+			l.Link.CutWhere(func(tag int, known bool) bool {
+				return known && tag == idx
+			})
+		}
+	} else if len(sourceCut) > 0 {
+		for _, l := range sourceCut {
+			if err := l.Link.ApplyWhere(func(tag int, known bool) bool {
+				return known && tag == idx
+			}, profile); err != nil {
+				notes = append(notes, err.Error())
+			}
+		}
+	}
+	if len(apply) == 0 && len(sourceCut) == 0 {
+		notes = append(notes, "no peer links")
+	}
+	return strings.Join(notes, " ")
+}
+
+func (y *YAMLAdapter) isolateClient(rt *topologyRuntime, idx int, action yamlNemesisAction, rng *rand.Rand) string {
+	links := rt.clientLinkSnap()
+	n := 0
+	var notes []string
+	profile := faultProfile(action)
+	for _, l := range links {
+		if l.To != idx {
+			continue
+		}
+		n++
+		if err := applyLink(l.Link, profile, rng); err != nil {
+			notes = append(notes, err.Error())
+		}
+	}
+	if n == 0 {
+		notes = append(notes, "no client link")
+	}
+	return strings.Join(notes, " ")
+}
+
+func (y *YAMLAdapter) partitionHalves(rt *topologyRuntime, action yamlNemesisAction, rng *rand.Rand) ([]string, string) {
+	n := len(rt.Nodes)
+	minor := pickMinority(rng, n)
+	if len(minor) == 0 {
+		return nil, "skipped single node"
+	}
+	minorSet := map[int]struct{}{}
+	for _, i := range minor {
+		minorSet[i] = struct{}{}
+	}
+	var majority []int
+	for i := 0; i < n; i++ {
+		if _, ok := minorSet[i]; !ok {
+			majority = append(majority, i)
+		}
+	}
+	slices.Sort(minor)
+	links := rt.peerLinkSnap()
+	profile := faultProfile(action)
+	var notes []string
+	applied := 0
+	for _, l := range links {
+		if !partitionLink(l, minorSet, action.Direction) {
+			continue
+		}
+		if l.From < 0 && !setHas(minorSet, l.To) {
+			match := func(tag int, known bool) bool {
+				if !known {
+					return false
+				}
+				_, ok := minorSet[tag]
+				return ok
+			}
+			if action.Mode == "reset" {
+				l.Link.CutWhere(match)
+			} else if err := l.Link.ApplyWhere(match, profile); err != nil {
+				notes = append(notes, err.Error())
+				continue
+			}
+			applied++
+			continue
+		}
+		if err := applyLink(l.Link, profile, rng); err != nil {
+			notes = append(notes, err.Error())
+			continue
+		}
+		applied++
+	}
+	detail := fmt.Sprintf("minority=%s majority=%s links=%d", nodeList(minor), nodeList(majority), applied)
+	if len(notes) > 0 {
+		detail += " " + strings.Join(notes, " ")
+	}
+	names := make([]string, 0, n)
+	for i := 0; i < n; i++ {
+		names = append(names, nodeName(i))
+	}
+	return names, detail
+}
+
+func partitionLink(l *topologyLink, minority map[int]struct{}, direction string) bool {
+	if l == nil || l.Link == nil || l.Kind == "client" {
+		return false
+	}
+	if direction == "" {
+		direction = "both"
+	}
+	fromMin := setHas(minority, l.From)
+	toMin := setHas(minority, l.To)
+	if l.From < 0 {
+		switch direction {
+		case "outbound":
+			return !toMin
+		case "inbound":
+			return toMin
+		default:
+			return true
+		}
+	}
+	cross := fromMin != toMin
+	if !cross {
+		return false
+	}
+	switch direction {
+	case "inbound":
+		return toMin
+	case "outbound":
+		return fromMin
+	default:
+		return true
+	}
+}
+
+func setHas(m map[int]struct{}, i int) bool {
+	_, ok := m[i]
+	return ok
+}
+
+func nodeList(idx []int) string {
+	if len(idx) == 0 {
+		return "-"
+	}
+	names := make([]string, len(idx))
+	for i, n := range idx {
+		names[i] = nodeName(n)
+	}
+	return strings.Join(names, ",")
+}
+
+func classifyLinks(links []*topologyLink, idx int, direction string) (apply, sourceCut []*topologyLink) {
+	if direction == "" {
+		direction = "both"
+	}
+	for _, l := range links {
+		if l == nil || l.Link == nil || l.Kind == "client" {
+			continue
+		}
+		switch direction {
+		case "inbound":
+			if l.To == idx {
+				apply = append(apply, l)
+			}
+		case "outbound":
+			if l.From == idx {
+				apply = append(apply, l)
+			} else if l.From < 0 && l.To != idx {
+				sourceCut = append(sourceCut, l)
+			}
+		default:
+			if l.From == idx || l.To == idx {
+				apply = append(apply, l)
+			} else if l.From < 0 && l.To != idx {
+				sourceCut = append(sourceCut, l)
+			}
+		}
+	}
+	return apply, sourceCut
+}
+
+func (rt *topologyRuntime) peerLinkSnap() []*topologyLink {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	out := make([]*topologyLink, 0, len(rt.Links))
+	for _, l := range rt.Links {
+		if l != nil && l.Link != nil && l.Kind != "client" {
+			out = append(out, l)
+		}
+	}
+	return out
+}
+
+func (rt *topologyRuntime) clientLinkSnap() []*topologyLink {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	out := make([]*topologyLink, 0, len(rt.ClientLinks))
+	for _, l := range rt.ClientLinks {
+		if l != nil && l.Link != nil {
+			out = append(out, l)
+		}
+	}
+	return out
+}
+
+func (y *YAMLAdapter) nemesisHealAll(rt *topologyRuntime) {
+	links := append(rt.peerLinkSnap(), rt.clientLinkSnap()...)
+	healthy := proxy.FaultProfile{Mode: proxy.ModeHealthy, Direction: proxy.DirBoth}
+	for _, l := range links {
+		_ = l.Link.Apply(healthy, nil)
+		rt.mu.Lock()
+		l.cut = false
+		l.cutFrom = nil
+		rt.mu.Unlock()
+	}
+}
+
+func (y *YAMLAdapter) nemesisRecover(t *BaseTrial, rt *topologyRuntime, origin time.Time) {
+	y.nemesisHealAll(rt)
+	y.nemesisUnpauseAll(rt)
+	notes := y.nemesisRestartDead(t, rt)
+	detail := "recovery"
+	if notes != "" {
+		detail += " " + notes
+	}
+	rt.recordNemesis(origin, NemesisEvent{Action: "heal_all", Details: detail})
+}
+
+func (y *YAMLAdapter) nemesisUnpauseAll(rt *topologyRuntime) {
+	rt.mu.Lock()
+	var cmds []*exec.Cmd
+	for _, n := range rt.Nodes {
+		if n == nil || !n.paused {
+			continue
+		}
+		n.pauseGen++
+		n.paused = false
+		if n.cmd != nil && n.cmd.Process != nil {
+			cmds = append(cmds, n.cmd)
+		}
+	}
+	rt.mu.Unlock()
+	for _, cmd := range cmds {
+		_ = cmd.Process.Signal(syscall.SIGCONT)
+	}
+}
+
+func (y *YAMLAdapter) nemesisRestartDead(t *BaseTrial, rt *topologyRuntime) string {
+	var notes []string
+	for i := range rt.Nodes {
+		if !y.nodeNeedsRestart(rt, i) {
+			continue
+		}
+		if err := y.restartNode(rt, i, 0, true); err != nil {
+			notes = append(notes, fmt.Sprintf("%s: %s", nodeName(i), err.Error()))
+		}
+	}
+	return strings.Join(notes, " ")
+}
+
+func (y *YAMLAdapter) nodeNeedsRestart(rt *topologyRuntime, i int) bool {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	if i < 0 || i >= len(rt.Nodes) || rt.Nodes[i] == nil {
+		return false
+	}
+	n := rt.Nodes[i]
+	if n.restarting {
+		return false
+	}
+	if n.paused && pidLive(n.PID) {
+		return false
+	}
+	return n.dead || n.ExitStatus != nil || !pidLive(n.PID)
+}
+
+func pidLive(pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+	return syscall.Kill(pid, 0) == nil
+}
+
+func (y *YAMLAdapter) killNodeLater(t *BaseTrial, rt *topologyRuntime, idx int, delay time.Duration) string {
+	gen, err := y.killNode(rt, idx)
+	if err != nil {
+		return "error=" + err.Error()
+	}
+	if delay <= 0 {
+		if err := y.restartNode(rt, idx, gen, false); err != nil {
+			return "error=" + err.Error()
+		}
+		return "restarted"
+	}
+	time.AfterFunc(delay, func() {
+		_ = y.restartNode(rt, idx, gen, false)
+	})
+	return "restart_in=" + delay.String()
+}
+
+func (y *YAMLAdapter) killNode(rt *topologyRuntime, idx int) (int, error) {
+	rt.mu.Lock()
+	if rt.Stopped {
+		rt.mu.Unlock()
+		return 0, fmt.Errorf("topology stopped")
+	}
+	if idx < 0 || idx >= len(rt.Nodes) || rt.Nodes[idx] == nil {
+		rt.mu.Unlock()
+		return 0, fmt.Errorf("no node %d", idx)
+	}
+	n := rt.Nodes[idx]
+	n.gen++
+	gen := n.gen
+	n.dead = true
+	n.paused = false
+	n.pauseGen++
+	n.StopHow = "SIGKILL"
+	cmd := n.cmd
+	done := n.waitDone
+	rt.mu.Unlock()
+	if cmd == nil || cmd.Process == nil {
+		return gen, fmt.Errorf("node %d has no process", idx)
+	}
+	_ = cmd.Process.Signal(syscall.SIGKILL)
+	if done != nil {
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			return gen, fmt.Errorf("node %d did not exit after SIGKILL", idx)
+		}
+	}
+	return gen, nil
+}
+
+func (y *YAMLAdapter) restartNode(rt *topologyRuntime, idx, expectGen int, force bool) error {
+	rt.mu.Lock()
+	if rt.Stopped || idx < 0 || idx >= len(rt.Nodes) || rt.Nodes[idx] == nil {
+		rt.mu.Unlock()
+		return nil
+	}
+	n := rt.Nodes[idx]
+	if n.restarting {
+		rt.mu.Unlock()
+		return nil
+	}
+	if !force && n.gen != expectGen {
+		rt.mu.Unlock()
+		return nil
+	}
+	alive := n.PID > 0 && !n.dead && n.ExitStatus == nil && pidLive(n.PID)
+	if alive {
+		rt.mu.Unlock()
+		return nil
+	}
+	n.restarting = true
+	n.gen++
+	args := append([]string(nil), n.args...)
+	env := append([]string(nil), n.env...)
+	dataDir := n.DataDir
+	port := n.Port
+	rt.mu.Unlock()
+	return y.spawnClaimed(rt, idx, args, env, dataDir, port)
+}
+
+func (y *YAMLAdapter) spawnClaimed(rt *topologyRuntime, idx int, args, env []string, dataDir string, port int) error {
+	clearRestarting := func() {
+		rt.mu.Lock()
+		if idx >= 0 && idx < len(rt.Nodes) && rt.Nodes[idx] != nil {
+			rt.Nodes[idx].restarting = false
+		}
+		rt.mu.Unlock()
+	}
+	if len(args) == 0 {
+		clearRestarting()
+		return fmt.Errorf("node %d: no start args", idx)
+	}
+	cmd := exec.Command(args[0], args[1:]...)
+	if len(env) > 0 {
+		cmd.Env = append([]string(nil), env...)
+	}
+	if rt.log != nil {
+		cmd.Stdout = rt.log
+		cmd.Stderr = rt.log
+	}
+	if err := cmd.Start(); err != nil {
+		rt.mu.Lock()
+		if rt.Nodes[idx] != nil {
+			rt.Nodes[idx].dead = true
+			rt.Nodes[idx].restarting = false
+		}
+		rt.mu.Unlock()
+		return err
+	}
+	rt.mu.Lock()
+	stopped := rt.Stopped
+	rt.mu.Unlock()
+	if stopped {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		noteProcWaited(cmd.Process.Pid)
+		clearRestarting()
+		return nil
+	}
+	noteRestartedProc(cmd)
+	pid := cmd.Process.Pid
+	done := make(chan struct{})
+	rt.mu.Lock()
+	n := rt.Nodes[idx]
+	n.cmd = cmd
+	n.PID = pid
+	n.Port = port
+	n.DataDir = dataDir
+	n.StartTime = time.Now()
+	n.ExitStatus = nil
+	n.dead = false
+	n.paused = false
+	n.Ready = false
+	n.StopHow = ""
+	n.waitDone = done
+	n.args = args
+	n.env = env
+	n.restarting = false
+	rt.mu.Unlock()
+	go y.watchCmd(rt, n, cmd, done, pid)
+	return nil
+}
+
+func (y *YAMLAdapter) pauseNodeFor(rt *topologyRuntime, idx int, d time.Duration) string {
+	rt.mu.Lock()
+	if rt.Stopped || idx < 0 || idx >= len(rt.Nodes) || rt.Nodes[idx] == nil {
+		rt.mu.Unlock()
+		return "error=no node"
+	}
+	n := rt.Nodes[idx]
+	cmd := n.cmd
+	if cmd == nil || cmd.Process == nil {
+		rt.mu.Unlock()
+		return "error=no process"
+	}
+	n.pauseGen++
+	gen := n.pauseGen
+	n.paused = true
+	rt.mu.Unlock()
+	if err := cmd.Process.Signal(syscall.SIGSTOP); err != nil {
+		rt.mu.Lock()
+		if n.pauseGen == gen {
+			n.paused = false
+		}
+		rt.mu.Unlock()
+		return "error=" + err.Error()
+	}
+	time.AfterFunc(d, func() {
+		y.contNode(rt, idx, gen)
+	})
+	return ""
+}
+
+func (y *YAMLAdapter) contNode(rt *topologyRuntime, idx, gen int) {
+	rt.mu.Lock()
+	if idx < 0 || idx >= len(rt.Nodes) || rt.Nodes[idx] == nil {
+		rt.mu.Unlock()
+		return
+	}
+	n := rt.Nodes[idx]
+	if n.pauseGen != gen || !n.paused {
+		rt.mu.Unlock()
+		return
+	}
+	cmd := n.cmd
+	n.paused = false
+	rt.mu.Unlock()
+	if cmd != nil && cmd.Process != nil {
+		_ = cmd.Process.Signal(syscall.SIGCONT)
+	}
+}
+
+func (y *YAMLAdapter) nemesisReady(t *BaseTrial, rt *topologyRuntime) {
+	timeout := parseYAMLDuration(y.cfg.Topology.Ready.Timeout, 5*time.Second)
+	deadline := time.Now().Add(timeout)
+	ok := true
+	var failed []string
+	for i := range rt.Nodes {
+		if y.waitNodeReadyAlive(t, rt, i, deadline) {
+			continue
+		}
+		ok = false
+		failed = append(failed, nodeName(i))
+	}
+	rt.mu.Lock()
+	if rt.Nemesis == nil {
+		rt.Nemesis = &nemesisRun{}
+	}
+	rt.Nemesis.ReadyOK = ok
+	if !ok {
+		rt.Nemesis.Err = "nodes not ready after quiet_period: " + strings.Join(failed, ",")
+	}
+	rt.mu.Unlock()
+}
+
+func (y *YAMLAdapter) waitNodeReadyAlive(t *BaseTrial, rt *topologyRuntime, i int, deadline time.Time) bool {
+	for {
+		rt.mu.Lock()
+		var n *topologyNode
+		if i >= 0 && i < len(rt.Nodes) {
+			n = rt.Nodes[i]
+		}
+		var pid int
+		var dataDir string
+		var port int
+		paused := false
+		if n != nil {
+			pid = n.PID
+			dataDir = n.DataDir
+			port = n.Port
+			paused = n.paused
+		}
+		rt.mu.Unlock()
+		alive, zombie := inspectProc(pid)
+		if n != nil && alive && !zombie && !paused {
+			rt.mu.Lock()
+			clientPorts := append([]int(nil), rt.ClientPorts...)
+			clientProxies := append([]string(nil), rt.ClientProxies...)
+			peerAddrs := rt.PeerAddrs
+			nodeProxies := rt.NodeProxies
+			rt.mu.Unlock()
+			vars := y.vars(t, "")
+			vars["i"] = strconv.Itoa(i)
+			vars["data_dir"] = dataDir
+			vars["port"] = strconv.Itoa(port)
+			y.addClientVars(vars, clientPorts, clientProxies, i)
+			y.addPeerVars(vars, peerAddrs, nodeProxies, i)
+			if y.topologyReadyOnce(vars) {
+				return true
+			}
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}

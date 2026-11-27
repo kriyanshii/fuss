@@ -1,0 +1,104 @@
+# hraftd (otoolep/hraftd @ 97a01648): 3-node Raft KV, local HTTP reads.
+# -raddr is the Raft bind, which is also the address -join registers.
+# Followers re-register ${node_proxy_addr_i} through POST /join so the
+# leader dials the peer proxy. Node 0 stays on its bind address.
+# Not run in CI.
+name: hraftd
+binary:
+  default: hraftd
+  extra: ["./examples/hraftd/hraftd"]
+topology:
+  nodes: 3
+  client_via_proxy: true
+  data_dir: "${dir}/node${i}"
+  ports:
+    base: 0
+    client_base: 0
+  proxy_mode: per_node_owned
+  peers:
+    port_name: peer
+    via_proxy: true
+  start:
+    - /bin/sh
+    - -c
+    - |
+      set -e
+      if [ "${i}" != "0" ]; then
+        tries=0
+        while [ "$tries" -lt 40 ]; do
+          if curl -sf "http://${client_addr_0}/status" | grep -q '"leader":{"id":"node_0"'; then
+            break
+          fi
+          tries=$((tries + 1))
+          sleep 0.25
+        done
+        curl -sf "http://${client_addr_0}/status" | grep -q '"leader":{"id":"node_0"'
+        exec "${binary}" -id "node_${i}" -haddr "127.0.0.1:${client_port}" -raddr "127.0.0.1:${port}" -join "${client_addr_0}" "${data_dir}"
+      fi
+      exec "${binary}" -id "node_${i}" -haddr "127.0.0.1:${client_port}" -raddr "127.0.0.1:${port}" "${data_dir}"
+  ready:
+    command:
+      - /bin/sh
+      - -c
+      - |
+        set -e
+        if [ "${i}" != "0" ]; then
+          curl -sf -XPOST "http://${client_addr_0}/join" \
+            -H 'Content-Type: application/json' \
+            -d "{\"id\":\"node_${i}\",\"addr\":\"${node_proxy_addr_${i}}\"}"
+          curl -sf "http://${client_addr_0}/status" | grep -F "\"address\":\"${node_proxy_addr_${i}}\""
+        fi
+        curl -sf "http://127.0.0.1:${client_port}/key/__ready"
+    contains: __ready
+    timeout: 20s
+  stop_grace: 2s
+nemesis:
+  warmup: 3s
+  duration: 25s
+  interval: 3s
+  quiet_period: 5s
+  actions:
+    - type: isolate_node
+      target: random
+      mode: blackhole
+      weight: 3
+    - type: partition_halves
+      mode: reset
+      weight: 2
+    - type: kill_node
+      target: random
+      restart_delay: 2s
+      weight: 2
+    - type: heal_all
+      weight: 2
+workload:
+  driver: http_kv
+  workers: 4
+  rate: 20
+  keyspace: 3
+  timeout: 1500ms
+  targets: "${client_addrs}"
+  put:
+    method: POST
+    url: "http://${target}/key"
+    headers:
+      Content-Type: application/json
+    body: '{"${key}":"${value}"}'
+  get:
+    method: GET
+    url: "http://${target}/key/${key}"
+    value_from: "${key}"
+properties:
+  always:
+    - porcupine:
+        timeout: 10s
+    - set: {}
+  eventually:
+    - eventually_available:
+        n: 5
+  sometimes:
+    - fault_during_inflight: {}
+      min_hits: 1
+    - fault_action_fired:
+        action: isolate_node
+      min_hits: 1

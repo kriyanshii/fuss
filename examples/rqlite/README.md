@@ -66,6 +66,14 @@ be judged `LOST WRITE`. A control with no planted file must be judged
 `UNKNOWN` with `reason=result_absent`. Fuss runs those controls before any
 seed.
 
+## http_kv
+
+`rqlite-http.yaml` uses `http_kv` against `POST /db/execute?redirect` and `GET /db/query?level=strong`. The value is `results.0.values.0.0`. The nemesis is a reset isolate of node 2 or a kill of node 1, two draws. Seed 1 on this machine, rqlited v10.7.4, drew `kill_node` twice. Fuss `-json` verdict was `PASS`. `fault_during_inflight` hits were 1. Bundle: `notes/runs/rqlite-http-seed1`.
+
+```sh
+./fuss -target-config=examples/rqlite/rqlite-http.yaml -n=1 -seed=1 -json
+```
+
 Save the run and replay it with the same bundle format as repkv:
 
 ```sh

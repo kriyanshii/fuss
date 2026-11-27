@@ -9,7 +9,10 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"syscall"
 	"time"
+
+	"fuss/history"
 )
 
 // stepTimeout is about 5x the slowest calibrated run (2.55s).
@@ -33,6 +36,8 @@ func main() {
 	adapterName := flag.String("adapter", "", `target adapter: "dagu" (default), "rqlite", "fake", or examples/<name>/<name>.yaml`)
 	targetConfig := flag.String("target-config", "", "path to a YAML target config")
 	saveBundle := flag.String("save-bundle", "", "after one seed, write a replay bundle (scenario, revision, checksum, ack, cut, read) to this directory")
+	saveFailedBundle := flag.String("save-failed-bundle", "", "for each non-PASS seed, write a replay bundle under <dir>/seed-<seed>/")
+	exportEDN := flag.String("export-edn", "", "after one seed, write a Jepsen history.edn for the trial")
 	replayBundlePath := flag.String("replay-bundle", "", "replay a saved bundle and print the acknowledgement, applied partition, and read")
 
 	seed := flag.Int64("seed", 1, "first seed; the same seed replays the same run")
@@ -50,19 +55,21 @@ func main() {
 	measureStatus := flag.Bool("measure-status", true, "with -measure, also poll Dagu's status file (false shows Fuss's observer effect)")
 	flag.Parse()
 
+	if err := validateBundleFlags(*saveBundle, *saveFailedBundle, *replayBundlePath, *n); err != nil {
+		fatal(err)
+	}
 	if *replayBundlePath != "" {
 		if *targetConfig != "" || *adapterName != "" {
 			fatal(fmt.Errorf("-replay-bundle loads the scenario from the bundle"))
 		}
-		if *saveBundle != "" {
-			fatal(fmt.Errorf("-save-bundle and -replay-bundle cannot be set together"))
-		}
 		os.Exit(replaySavedBundle(*replayBundlePath, *jsonFlag))
 	}
-	if *saveBundle != "" && *n != 1 {
-		fatal(fmt.Errorf("-save-bundle records one seed; -n must be 1"))
+	if *exportEDN != "" && *n != 1 {
+		fatal(fmt.Errorf("-export-edn records one seed; -n must be 1"))
 	}
 	bundleRun.saveDir = *saveBundle
+	bundleRun.failedDir = *saveFailedBundle
+	exportEDNPath = *exportEDN
 
 	if *targetConfig != "" && *adapterName != "" {
 		fatal(fmt.Errorf("-target-config and -adapter cannot be set together"))
@@ -255,7 +262,26 @@ func main() {
 	}
 }
 
+// validateBundleFlags rejects combinations that would write or replay
+// more than one bundle shape. -save-bundle stays limited to a single seed.
+func validateBundleFlags(save, failed, replay string, n int) error {
+	if replay != "" && save != "" {
+		return fmt.Errorf("-save-bundle and -replay-bundle cannot be set together")
+	}
+	if replay != "" && failed != "" {
+		return fmt.Errorf("-save-failed-bundle and -replay-bundle cannot be set together")
+	}
+	if save != "" && failed != "" {
+		return fmt.Errorf("-save-failed-bundle and -save-bundle cannot be set together")
+	}
+	if save != "" && n != 1 {
+		return fmt.Errorf("-save-bundle records one seed; -n must be 1")
+	}
+	return nil
+}
+
 func fatal(err error) {
+	reapTrackedProcs()
 	fmt.Fprintln(os.Stderr, "fuss:", err)
 	os.Exit(exitSetup)
 }
@@ -322,30 +348,44 @@ func runAdapter(adapter Adapter, targetFlag string, seed int64, n int, doKill bo
 	}
 
 	scenarioPath := ""
+	var tallies []propertyTally
+	calibration := !doKill
 	if y, ok := adapter.(*YAMLAdapter); ok {
 		scenarioPath = y.path
+		tallies = y.propertyTallies()
 	}
 	if bundleRun.saveDir != "" && scenarioPath == "" {
 		fatal(fmt.Errorf("-save-bundle needs a YAML target"))
+	}
+	if bundleRun.failedDir != "" && scenarioPath == "" {
+		fatal(fmt.Errorf("-save-failed-bundle needs a YAML target"))
 	}
 
 	// Run trials
 	failed := 0
 	acks := 0
+	var failedBundles []string
 	for s := seed; s < seed+int64(n); s++ {
 		result, err := runAdapterTrial(adapter, s, bin, doKill)
 		if err != nil {
 			fatal(err)
 		}
+		failedDest := failedBundleSeedDir(bundleRun.failedDir, s, result.verdict)
 		var facts replayFacts
-		if bundleRun.saveDir != "" || bundleRun.want != nil {
+		if bundleRun.saveDir != "" || bundleRun.want != nil || exportEDNPath != "" || failedDest != "" {
 			facts = collectReplayFacts(result, bin)
 			if bundleRun.want != nil {
 				got := facts
 				bundleRun.got = &got
 			}
 		}
+		if exportEDNPath != "" {
+			if err := writeEDNFile(exportEDNPath, facts); err != nil {
+				fatal(err)
+			}
+		}
 		acks += result.acks
+		observeProperties(tallies, result.properties)
 		if result.verdict != "PASS" {
 			failed++
 		}
@@ -404,17 +444,53 @@ func runAdapter(adapter Adapter, targetFlag string, seed int64, n int, doKill bo
 				fatal(err)
 			}
 		}
+		if failedDest != "" {
+			if err := missingReplayAck(facts); err != nil {
+				fatal(err)
+			}
+			if err := writeReplayBundle(failedDest, scenarioPath, bin, adapter.Name(), s, facts); err != nil {
+				fatal(err)
+			}
+			if err := copyTrialLog(failedDest, result.dir); err != nil {
+				fatal(err)
+			}
+			failedBundles = append(failedBundles, failedDest)
+		}
 	}
 
 	say("%d/%d PASS\n", n-failed, n)
-	emit(map[string]any{
+	if len(tallies) > 0 {
+		sayln(formatPropertySummary(tallies, calibration))
+	}
+	for _, p := range failedBundles {
+		sayln("failed bundle:", p)
+	}
+	summary := map[string]any{
 		"type":  "summary",
 		"mode":  adapter.Name(),
 		"seeds": n,
 		"pass":  n - failed,
 		"fail":  failed,
 		"acks":  acks,
-	})
+	}
+	if props := propertySummaries(tallies, calibration); len(props) > 0 {
+		summary["properties"] = props
+	}
+	if len(failedBundles) > 0 {
+		summary["failed_bundles"] = failedBundles
+	}
+	emit(summary)
+	for _, tally := range tallies {
+		if _, skipped := tally.passed(calibration); skipped {
+			fmt.Fprintf(os.Stderr, "SOMETIMES %s skipped (calibration, -kill=false) hits=%d min_hits=%d trials=%d\n", tally.Name, tally.Hits, tally.minHits(), tally.Trials)
+		}
+	}
+	if unmet := unmetSometimes(tallies, calibration); len(unmet) > 0 {
+		for _, u := range unmet {
+			fmt.Fprintf(os.Stderr, "UNMET_SOMETIMES %s hits=%d min_hits=%d trials=%d\n", u.Name, u.Hits, u.minHits(), u.Trials)
+		}
+		return exitFail
+	}
 
 	if bundleRun.want != nil {
 		printReplayReport(bundleRun.want, bundleRun.got, bundleRun.pinNode)
@@ -435,20 +511,69 @@ func runAdapter(adapter Adapter, targetFlag string, seed int64, n int, doKill bo
 }
 
 type adapterTrialResult struct {
-	dir      string
-	verdict  string
-	phase    string
-	killed   bool
-	delay    time.Duration
-	took     time.Duration
-	exit     int
-	status   string
-	problems []error
-	acks     int
-	topology []map[string]any
-	isolate  map[string]any
-	pause    map[string]any
-	check    map[string]any
+	dir           string
+	verdict       string
+	phase         string
+	killed        bool
+	delay         time.Duration
+	took          time.Duration
+	exit          int
+	status        string
+	problems      []error
+	acks          int
+	topology      []map[string]any
+	isolate       map[string]any
+	pause         map[string]any
+	check         map[string]any
+	reason        string
+	nemesis       []NemesisEvent
+	nemesisRan    bool
+	history       []history.OpRecord
+	hasHistory    bool
+	porcupineHTML []byte
+	properties    []PropertyOutcome
+}
+
+// trialRecord is one -json trial line. reason sits next to verdict.
+// Socket details stay under evidence.isolate.unknown_owners.
+func trialRecord(mode string, seed int64, result *adapterTrialResult) map[string]any {
+	ev := map[string]any{
+		"delay_ms": ms(result.delay),
+		"killed":   result.killed,
+		"status":   result.status,
+		"exit":     result.exit,
+		"took_ms":  ms(result.took),
+		"acks":     result.acks,
+	}
+	if len(result.topology) > 0 {
+		ev["topology"] = result.topology
+	}
+	if result.isolate != nil {
+		ev["isolate"] = result.isolate
+	}
+	if result.pause != nil {
+		ev["pause"] = result.pause
+	}
+	if result.check != nil {
+		ev["check"] = result.check
+	}
+	rec := map[string]any{
+		"type":     "trial",
+		"mode":     mode,
+		"seed":     seed,
+		"label":    result.phase,
+		"verdict":  result.verdict,
+		"dir":      result.dir,
+		"dir_kept": result.verdict != "PASS",
+		"evidence": ev,
+	}
+	if result.reason != "" {
+		rec["reason"] = result.reason
+	}
+	if len(result.properties) > 0 {
+		rec["properties"] = result.properties
+	}
+	return rec
 }
 
 func runAdapterTrial(adapter Adapter, seed int64, binaryPath string, doKill bool) (*adapterTrialResult, error) {
@@ -473,7 +598,12 @@ func runAdapterTrial(adapter Adapter, seed int64, binaryPath string, doKill bool
 	defer log.Close()
 
 	// Pick delay. YAML may set a window; otherwise 0-3000ms as before.
+	// The same generator is the trial RNG. A nemesis schedule draws from it
+	// and does not also draw a kill delay (KillWindow returns 0,0).
 	rng := rand.New(rand.NewSource(seed))
+	if bt, ok := at.(*BaseTrial); ok {
+		bt.Data()["rng"] = rng
+	}
 	minMS, maxMS := 0, 3000
 	if w, ok := adapter.(interface{ KillWindow() (int, int) }); ok {
 		minMS, maxMS = w.KillWindow()
@@ -508,7 +638,9 @@ func runAdapterTrial(adapter Adapter, seed int64, binaryPath string, doKill bool
 		}
 	}
 
-	// Apply kill
+	// Apply kill. A topology hold is fuss's own sleep. After a nemesis or
+	// file wait, calibration still has to reach CheckNamed, so the sleep
+	// is signalled without counting as a killed target.
 	if doKill {
 		if !fileWaited {
 			time.Sleep(result.delay)
@@ -516,6 +648,10 @@ func runAdapterTrial(adapter Adapter, seed int64, binaryPath string, doKill bool
 		result.phase = determinePhase(at)
 		if err := kill(cmd); err == nil {
 			result.killed = true
+		}
+	} else if fileWaited {
+		if hold, _ := at.Data()["topology_hold"].(bool); hold && cmd.Process != nil {
+			_ = cmd.Process.Signal(syscall.SIGTERM)
 		}
 	}
 
@@ -539,6 +675,7 @@ func runAdapterTrial(adapter Adapter, seed int64, binaryPath string, doKill bool
 		result.problems = cr.Problems
 		result.acks = cr.Evidence
 		result.verdict = verdictFromCheck(cr)
+		result.reason = cr.Reason
 	} else {
 		result.problems = adapter.Check(at, result.killed, result.phase)
 		if len(result.problems) > 0 {
@@ -551,9 +688,32 @@ func runAdapterTrial(adapter Adapter, seed int64, binaryPath string, doKill bool
 		result.topology = rt.evidence()
 		result.isolate = rt.isolateEvidence()
 		result.pause = rt.pauseEvidence()
+		result.nemesis, result.nemesisRan = rt.nemesisEvents()
+	}
+	if result.nemesisRan {
+		if err := procAudit(); err != nil {
+			reapTrackedProcs()
+			result.problems = append(result.problems, err)
+			if result.verdict == "PASS" {
+				result.verdict = "UNKNOWN"
+				result.reason = "process_leftover"
+			}
+		}
 	}
 	if cv, ok := at.Data()["check_vals"].(map[string]any); ok && len(cv) > 0 {
 		result.check = cv
+	}
+	if props, ok := at.Data()["properties"].([]PropertyOutcome); ok {
+		result.properties = append([]PropertyOutcome(nil), props...)
+	}
+	if bt, ok := at.(*BaseTrial); ok {
+		if log, ok := bt.Data()["history"].(*history.Log); ok && log != nil {
+			result.history = log.Snapshot()
+			result.hasHistory = true
+		}
+		if html, ok := bt.Data()["porcupine_html"].([]byte); ok && len(html) > 0 {
+			result.porcupineHTML = append([]byte(nil), html...)
+		}
 	}
 
 	return result, nil

@@ -1,0 +1,84 @@
+# etcd v3.7.4: same cluster and blackhole as etcd-serializable.yaml.
+# Reads omit serializable, so the gateway does a linearizable range.
+# Not run in CI.
+name: etcd-linearizable
+binary:
+  default: etcd
+  extra: ["./examples/etcd/etcd"]
+topology:
+  nodes: 3
+  client_via_proxy: true
+  data_dir: "${dir}/node${i}"
+  ports:
+    base: 0
+  proxy_mode: per_node_owned
+  peers:
+    port_name: peer
+    via_proxy: true
+  start:
+    - /bin/sh
+    - -c
+    - |
+      set -e
+      ELECTION=1000
+      if [ "${i}" = "2" ]; then ELECTION=10000; fi
+      exec ${binary} \
+        --name "node_${i}" \
+        --data-dir "${data_dir}/etcd" \
+        --listen-client-urls "http://127.0.0.1:${client_port}" \
+        --advertise-client-urls "http://127.0.0.1:${client_port}" \
+        --listen-peer-urls "http://127.0.0.1:${port}" \
+        --initial-advertise-peer-urls "http://${node_proxy_addr_${i}}" \
+        --initial-cluster "node_0=http://${node_proxy_addr_0},node_1=http://${node_proxy_addr_1},node_2=http://${node_proxy_addr_2}" \
+        --initial-cluster-state new \
+        --initial-cluster-token "fuss-${seed}" \
+        --election-timeout "$ELECTION"
+  ready:
+    command:
+      - /bin/sh
+      - -c
+      - curl -sf "http://127.0.0.1:${client_port}/livez"
+    contains: ok
+    timeout: 20s
+  stop_grace: 2s
+nemesis:
+  warmup: 2s
+  duration: 5s
+  interval: 5s
+  quiet_period: 3s
+  actions:
+    - type: isolate_node
+      target: "2"
+      mode: blackhole
+      direction: both
+workload:
+  driver: http_kv
+  workers: 4
+  rate: 40
+  keyspace: 1
+  timeout: 400ms
+  targets: "${client_addrs}"
+  put:
+    method: POST
+    url: "http://${target}/v3/kv/put"
+    headers:
+      Content-Type: application/json
+    body: '{"key":"${key_b64}","value":"${value_b64}"}'
+  get:
+    method: POST
+    url: "http://${target}/v3/kv/range"
+    headers:
+      Content-Type: application/json
+    body: '{"key":"${key_b64}"}'
+    value_from: kvs.0.value
+    value_encoding: base64
+check:
+  porcupine:
+    timeout: 20s
+  set: {}
+  eventually_available:
+    n: 1
+properties:
+  sometimes:
+    - name: fault_during_inflight
+      fault_during_inflight: {}

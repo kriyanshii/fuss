@@ -32,7 +32,7 @@ fault:
       glob: "${dir}/cut_now"
       contains: NOW
       poll: 10ms
-      timeout: 8s
+      timeout: 15s
 kill:
   at: file
   file:

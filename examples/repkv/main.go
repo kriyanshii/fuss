@@ -1,6 +1,6 @@
-// repkv is a tiny three-node replicated KV for Fuss isolate scenarios.
+// repkv is a tiny three-node replicated KV for Fuss scenarios.
 // Each node has a client HTTP port (PUT/GET /k/...) and a peer TCP port.
-// Peer traffic is meant to go through Fuss proxies; client ports stay direct.
+// Peer traffic is meant to go through Fuss proxies. Client ports can too.
 package main
 
 import (
@@ -23,6 +23,7 @@ const electionTimeout = 250 * time.Millisecond
 
 func main() {
 	drive := flag.Bool("drive", false, "PUT then fire isolate trigger")
+	armCut := flag.Bool("arm-cut", false, "fire the isolate trigger once the leader is up, without a client write")
 	inflight := flag.Bool("inflight", false, "replicate, cut the leader, and let the client time out before any response")
 	verify := flag.Bool("verify", false, "GET key from new leader among nodes 1..n-1")
 	id := flag.Int("id", 0, "node index")
@@ -114,6 +115,8 @@ func main() {
 		os.Exit(runSchedule(*dir, *n, *key, *cut, *gate, *schedule))
 	case *inflight:
 		os.Exit(runInflight(*dir, *n, *key, *cut, *gate))
+	case *armCut:
+		os.Exit(runArmCut(*dir, *n, *cut))
 	case *drive:
 		os.Exit(runDrive(*dir, *n, *key, *record, *cut, *gate, *mode))
 	default:
@@ -131,6 +134,7 @@ type node struct {
 	gate    string
 	peers   []string // index -> dial addr; peers[id] == ""
 	mu      sync.Mutex
+	writeMu sync.Mutex // one leader put at a time, so followers cannot reorder them
 	store   map[string]string
 	leader  int
 	lastHB  time.Time
@@ -240,14 +244,11 @@ func (n *node) handleK(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusOK)
 			return
 		}
-		// correct: ack only after at least one follower confirms; we ask all.
-		if !n.replicateAll(key, val) {
+		// correct: ack only after every follower has stored this value.
+		if !n.commit(key, val) {
 			http.Error(w, "replicate failed", http.StatusServiceUnavailable)
 			return
 		}
-		n.mu.Lock()
-		n.store[key] = val
-		n.mu.Unlock()
 		w.WriteHeader(http.StatusOK)
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
@@ -261,39 +262,99 @@ func (n *node) replicateEvery(key, val string) bool {
 			continue
 		}
 		need++
-		if sendRepl(addr, key, val) {
+		if sendRepl(addr, n.id, key, val) {
 			okN++
 		}
 	}
 	return need > 0 && okN == need
 }
 
+// commit replicates val to every follower, then stores it locally.
+// A partial replicate is rolled back so a failed ack cannot leak onto one peer.
+func (n *node) commit(key, val string) bool {
+	n.writeMu.Lock()
+	defer n.writeMu.Unlock()
+	if !n.replicateAll(key, val) {
+		return false
+	}
+	n.mu.Lock()
+	n.store[key] = val
+	n.mu.Unlock()
+	return true
+}
+
 func (n *node) replicateAll(key, val string) bool {
-	okN := 0
+	n.mu.Lock()
+	prev, had := n.store[key]
+	lead := n.id
+	n.mu.Unlock()
+	var applied []string
+	need := 0
 	for j, addr := range n.peers {
 		if j == n.id || addr == "" {
 			continue
 		}
-		if sendRepl(addr, key, val) {
-			okN++
+		need++
+		if sendRepl(addr, lead, key, val) {
+			applied = append(applied, addr)
 		}
 	}
-	return okN >= 1
+	if len(applied) == need {
+		return true
+	}
+	for _, addr := range applied {
+		if had {
+			sendRepl(addr, lead, key, prev)
+		} else {
+			sendDel(addr, lead, key)
+		}
+	}
+	return false
 }
 
-func sendRepl(addr, key, val string) bool {
+func sendRepl(addr string, leader int, key, val string) bool {
+	// A follower can miss the first dial, or reject REPL until the next
+	// heartbeat restores the leader id. One miss must not fail the commit:
+	// the driver only opens the cut after this write is acknowledged.
+	for attempt := 0; attempt < 4; attempt++ {
+		if attempt > 0 {
+			time.Sleep(40 * time.Millisecond)
+		}
+		if sendReplOnce(addr, leader, key, val) {
+			return true
+		}
+	}
+	return false
+}
+
+func sendReplOnce(addr string, leader int, key, val string) bool {
 	c, err := net.DialTimeout("tcp", addr, 200*time.Millisecond)
 	if err != nil {
 		return false
 	}
 	defer c.Close()
 	_ = c.SetDeadline(time.Now().Add(500 * time.Millisecond))
-	_, err = fmt.Fprintf(c, "REPL %s %s\n", key, val)
+	_, err = fmt.Fprintf(c, "REPL %d %s %s\n", leader, key, val)
 	if err != nil {
 		return false
 	}
 	line, err := bufio.NewReader(c).ReadString('\n')
 	return err == nil && strings.TrimSpace(line) == "REPL_OK"
+}
+
+func sendDel(addr string, leader int, key string) bool {
+	c, err := net.DialTimeout("tcp", addr, 200*time.Millisecond)
+	if err != nil {
+		return false
+	}
+	defer c.Close()
+	_ = c.SetDeadline(time.Now().Add(500 * time.Millisecond))
+	_, err = fmt.Fprintf(c, "DEL %d %s\n", leader, key)
+	if err != nil {
+		return false
+	}
+	line, err := bufio.NewReader(c).ReadString('\n')
+	return err == nil && strings.TrimSpace(line) == "DEL_OK"
 }
 
 func acceptPeers(ln net.Listener, n *node) {
@@ -330,14 +391,45 @@ func handlePeer(c net.Conn, n *node) {
 		}
 		_, _ = io.WriteString(c, "OK\n")
 	case "REPL":
+		if len(parts) < 4 {
+			return
+		}
+		lead, convErr := strconv.Atoi(parts[1])
+		if convErr != nil {
+			return
+		}
+		key, val := parts[2], strings.Join(parts[3:], " ")
+		n.mu.Lock()
+		cur := n.leader
+		if cur == lead {
+			n.store[key] = val
+		}
+		n.mu.Unlock()
+		if cur != lead {
+			_, _ = io.WriteString(c, "REPL_NO\n")
+			return
+		}
+		_, _ = io.WriteString(c, "REPL_OK\n")
+	case "DEL":
 		if len(parts) < 3 {
 			return
 		}
-		key, val := parts[1], strings.Join(parts[2:], " ")
+		lead, convErr := strconv.Atoi(parts[1])
+		if convErr != nil {
+			return
+		}
+		key := parts[2]
 		n.mu.Lock()
-		n.store[key] = val
+		cur := n.leader
+		if cur == lead {
+			delete(n.store, key)
+		}
 		n.mu.Unlock()
-		_, _ = io.WriteString(c, "REPL_OK\n")
+		if cur != lead {
+			_, _ = io.WriteString(c, "DEL_NO\n")
+			return
+		}
+		_, _ = io.WriteString(c, "DEL_OK\n")
 	case "PING":
 		_, _ = io.WriteString(c, "PONG\n")
 	case "WHO":
@@ -447,7 +539,9 @@ func (n *node) gateLoop() {
 		n.pending = map[string]string{}
 		n.mu.Unlock()
 		for k, v := range pending {
+			n.writeMu.Lock()
 			_ = n.replicateAll(k, v)
+			n.writeMu.Unlock()
 		}
 	}
 }
@@ -634,6 +728,29 @@ func waitFile(path string, timeout time.Duration) error {
 	}
 }
 
+// runArmCut opens the isolate as soon as node 0 is leader. The read-error
+// scenario only needs that cut: a failed replicate must not skip cut_now,
+// or the trial ends UNKNOWN with no partition.
+func runArmCut(dir string, n int, cut string) int {
+	defer func() {
+		_ = os.WriteFile(filepath.Join(dir, "drive_done"), []byte("DONE\n"), 0o644)
+	}()
+	clients, ok := waitClients(dir, n, 5*time.Second)
+	if !ok {
+		return 1
+	}
+	if !waitLeader(clients[0], 3*time.Second) {
+		fmt.Fprintln(os.Stderr, "arm-cut: node 0 not leader")
+		return 1
+	}
+	if err := os.WriteFile(cut, []byte("NOW\n"), 0o644); err != nil {
+		fmt.Fprintf(os.Stderr, "arm-cut: %v\n", err)
+		return 1
+	}
+	_ = waitIsolateApplied(dir, "node_0", 8*time.Second)
+	return 0
+}
+
 func runDrive(dir string, n int, key, record, cut, gate, mode string) int {
 	// Always release the trial. A stuck dial must not hold the kill file
 	// until Fuss treats the run as a broken setup.
@@ -685,17 +802,37 @@ func runDrive(dir string, n int, key, record, cut, gate, mode string) int {
 	}
 
 	rec := openRecorder()
-	req, _ := http.NewRequest(http.MethodPut, "http://"+clients[0]+"/k/"+key, strings.NewReader("v"))
-	rec.start("w1", "write", key, "v", "")
-	resp, err := put.Do(req)
-	status := 0
-	if resp != nil {
-		status = resp.StatusCode
-		resp.Body.Close()
+	// Retry a refused replicate. Under load one follower dial can miss, and
+	// the cut file is written only after the ack. Giving up on the first
+	// miss ends the trial with no partition.
+	var status int
+	var err error
+	deadline = time.Now().Add(5 * time.Second)
+	for {
+		req, reqErr := http.NewRequest(http.MethodPut, "http://"+clients[0]+"/k/"+key, strings.NewReader("v"))
+		if reqErr != nil {
+			err = reqErr
+			break
+		}
+		var resp *http.Response
+		resp, err = put.Do(req)
+		status = 0
+		if resp != nil {
+			status = resp.StatusCode
+			resp.Body.Close()
+		}
+		if err == nil && status == 200 {
+			break
+		}
+		if time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(40 * time.Millisecond)
 	}
+	rec.start("w1", "write", key, "v", "")
 	rec.end("w1", "write", observeHTTP(err, status), "", errText(err), false)
 	if err != nil || status != 200 {
-		fmt.Fprintf(os.Stderr, "drive: PUT failed: %v\n", err)
+		fmt.Fprintf(os.Stderr, "drive: PUT failed: %v status %d\n", err, status)
 		return 1
 	}
 	if record != "" {
@@ -844,6 +981,13 @@ func runVerify(dir string, n int, key, cutNode, readFault string, porcupineOn bo
 		fmt.Println("UNKNOWN reason=cut_not_applied")
 		return 0
 	}
+	if readFault == "refused" {
+		// The refused dial is the observation. It does not need the new
+		// leader, and it must not be a privileged port: a drop rule there
+		// waits out the client timeout instead of refusing.
+		fmt.Println(refusedReadLine())
+		return 0
+	}
 	clients := make([]string, n)
 	for i := 0; i < n; i++ {
 		b, err := os.ReadFile(filepath.Join(dir, fmt.Sprintf("node%d", i), "client"))
@@ -875,10 +1019,6 @@ func runVerify(dir string, n int, key, cutNode, readFault string, porcupineOn bo
 	client := &http.Client{Timeout: 2 * time.Second}
 	url := "http://" + clients[newLead] + "/k/" + key
 	from := fmt.Sprintf("node_%d", newLead)
-	if readFault == "refused" {
-		url = "http://127.0.0.1:1/k/" + key
-		from = "node_refused"
-	}
 	rec := openRecorder()
 	rec.start("r1", "read", key, "", from)
 	resp, err := client.Get(url)
@@ -907,6 +1047,23 @@ func runVerify(dir string, n int, key, cutNode, readFault string, porcupineOn bo
 	kind, reason := classifyRead(status, body, err, "v")
 	fmt.Println(verifyLine(kind, reason, newLead, key))
 	return 0
+}
+
+// refusedReadLine is a dial of a port that just stopped listening.
+// A transport failure is UNKNOWN reason=read_error, never a lost write.
+func refusedReadLine() string {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return "UNKNOWN reason=read_error"
+	}
+	addr := ln.Addr().String()
+	_ = ln.Close()
+	c, err := net.DialTimeout("tcp", addr, 200*time.Millisecond)
+	if err != nil {
+		return "UNKNOWN reason=read_error"
+	}
+	_ = c.Close()
+	return "UNKNOWN reason=read_unexpected"
 }
 
 func leaderID(client string) (int, error) {

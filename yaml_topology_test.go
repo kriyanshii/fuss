@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
@@ -13,6 +14,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"fuss/proxy"
 )
 
 func buildTopologyHold(t *testing.T) string {
@@ -1362,4 +1365,165 @@ func readPortFile(t *testing.T, path string) string {
 		t.Fatal(err)
 	}
 	return string(b)
+}
+
+func TestClientViaProxyPartitionsOneNode(t *testing.T) {
+	buildTopologyHold(t)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "client.yaml")
+	body := []byte(`
+name: client-proxy
+binary:
+  default: hold
+  extra: ["./testdata/yaml/topology/hold"]
+topology:
+  nodes: 2
+  data_dir: "${dir}/node${i}"
+  client_via_proxy: true
+  ports:
+    base: 0
+  start:
+    - /bin/sh
+    - -c
+    - 'echo ${client_proxy} > ${data_dir}/client_proxy; exec ${binary} ${data_dir}'
+  ready:
+    file: "${data_dir}/ready"
+    contains: READY
+    timeout: 2s
+  stop_grace: 200ms
+`)
+	if err := os.WriteFile(path, body, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	a, err := LoadYAMLTarget(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bin, _, err := a.ResolveBinary("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	trialDir := t.TempDir()
+	at, err := a.Init(1, trialDir, bin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	log, err := os.Create(filepath.Join(trialDir, "log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer log.Close()
+	hold, err := a.Start(at, log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rt := at.Data()["topology"].(*topologyRuntime)
+	t.Cleanup(func() {
+		a.stopTopology(rt)
+		if hold.Process != nil {
+			_ = hold.Process.Kill()
+			_ = hold.Wait()
+		}
+	})
+	if len(rt.ClientLinks) != 2 || len(rt.ClientProxies) != 2 || len(rt.ClientPorts) != 2 {
+		t.Fatalf("client links=%d proxies=%d ports=%d", len(rt.ClientLinks), len(rt.ClientProxies), len(rt.ClientPorts))
+	}
+	if len(rt.Links) != 0 {
+		t.Fatalf("peer links=%d, client_via_proxy should not create them", len(rt.Links))
+	}
+	for i, l := range rt.ClientLinks {
+		if l.Kind != "client" || l.To != i || l.Listen != rt.ClientProxies[i] {
+			t.Fatalf("link %d %+v", i, l)
+		}
+		wrote, err := os.ReadFile(filepath.Join(trialDir, "node"+strconv.Itoa(i), "client_proxy"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.TrimSpace(string(wrote)) != rt.ClientProxies[i] {
+			t.Fatalf("node %d wrote %q want %s", i, wrote, rt.ClientProxies[i])
+		}
+	}
+
+	var listeners []net.Listener
+	for _, port := range rt.ClientPorts {
+		ln, err := net.Listen("tcp", "127.0.0.1:"+strconv.Itoa(port))
+		if err != nil {
+			t.Fatal(err)
+		}
+		listeners = append(listeners, ln)
+		go func(ln net.Listener) {
+			for {
+				c, err := ln.Accept()
+				if err != nil {
+					return
+				}
+				go func(c net.Conn) {
+					defer c.Close()
+					_, _ = io.Copy(c, c)
+				}(c)
+			}
+		}(ln)
+	}
+	t.Cleanup(func() {
+		for _, ln := range listeners {
+			_ = ln.Close()
+		}
+	})
+
+	echo := func(addr, payload string) {
+		t.Helper()
+		c, err := net.DialTimeout("tcp", addr, time.Second)
+		if err != nil {
+			t.Fatalf("dial %s: %v", addr, err)
+		}
+		defer c.Close()
+		_ = c.SetDeadline(time.Now().Add(2 * time.Second))
+		if _, err := c.Write([]byte(payload)); err != nil {
+			t.Fatal(err)
+		}
+		buf := make([]byte, len(payload))
+		if _, err := io.ReadFull(c, buf); err != nil {
+			t.Fatalf("read %s: %v", addr, err)
+		}
+		if string(buf) != payload {
+			t.Fatalf("got %q want %q", buf, payload)
+		}
+	}
+	echo(rt.ClientProxies[0], "node-0")
+	echo(rt.ClientProxies[1], "node-1")
+
+	rt.ClientLinks[0].Link.Cut()
+	c, err := net.DialTimeout("tcp", rt.ClientProxies[0], time.Second)
+	if err == nil {
+		defer c.Close()
+		_ = c.SetReadDeadline(time.Now().Add(time.Second))
+		buf := make([]byte, 4)
+		if _, rerr := c.Read(buf); rerr == nil {
+			t.Fatal("cut client proxy still returned payload")
+		}
+	}
+	echo(rt.ClientProxies[1], "still-1")
+
+	rt.ClientLinks[0].Link.Heal()
+	if err := rt.ClientLinks[0].Link.Apply(proxy.FaultProfile{Mode: proxy.ModeBlackhole, Direction: proxy.DirBoth}, nil); err != nil {
+		t.Fatal(err)
+	}
+	hung, err := net.DialTimeout("tcp", rt.ClientProxies[0], time.Second)
+	if err != nil {
+		t.Fatalf("dial blackholed client proxy: %v", err)
+	}
+	defer hung.Close()
+	if _, err := hung.Write([]byte("hang")); err != nil {
+		t.Fatal(err)
+	}
+	_ = hung.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+	start := time.Now()
+	buf := make([]byte, 4)
+	_, rerr := hung.Read(buf)
+	elapsed := time.Since(start)
+	ne, ok := rerr.(net.Error)
+	if rerr == nil || !ok || !ne.Timeout() || elapsed < 150*time.Millisecond {
+		t.Fatalf("blackhole read err=%v after %s", rerr, elapsed)
+	}
+	echo(rt.ClientProxies[1], "still-open")
 }

@@ -184,6 +184,42 @@ func TestYAMLCountsRules(t *testing.T) {
 	}
 }
 
+func TestHraftdYAMLLoads(t *testing.T) {
+	a, err := LoadYAMLTarget("examples/hraftd/hraftd.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.cfg.Topology.Nodes != 3 || !a.cfg.Topology.ClientViaProxy || !a.cfg.Topology.Peers.ViaProxy {
+		t.Fatalf("topology %+v", a.cfg.Topology)
+	}
+	if a.cfg.Workload.Driver != "http_kv" || a.cfg.Workload.Get.ValueFrom != "${key}" {
+		t.Fatalf("workload %+v", a.cfg.Workload)
+	}
+	if a.cfg.Workload.Workers != 4 || a.cfg.Workload.Keyspace != 3 || a.cfg.Workload.timeout != 1500*time.Millisecond {
+		t.Fatalf("workload pace workers=%d keyspace=%d timeout=%s", a.cfg.Workload.Workers, a.cfg.Workload.Keyspace, a.cfg.Workload.timeout)
+	}
+	p := a.cfg.Properties
+	if len(p.Always) != 2 || p.Always[0].Name != "porcupine" || p.Always[0].Porcupine.timeout != 10*time.Second || p.Always[1].Name != "set" {
+		t.Fatalf("always %+v", p.Always)
+	}
+	if len(p.Eventually) != 1 || p.Eventually[0].Name != "eventually_available" || p.Eventually[0].Eventually.N != 5 {
+		t.Fatalf("eventually %+v", p.Eventually)
+	}
+	if len(p.Sometimes) != 2 || p.Sometimes[0].Name != "fault_during_inflight" || p.Sometimes[0].MinHits != 1 {
+		t.Fatalf("sometimes0 %+v", p.Sometimes)
+	}
+	if p.Sometimes[1].Name != "fault_action_fired_isolate_node" || p.Sometimes[1].MinHits != 1 || p.Sometimes[1].FaultActionFired.Action != "isolate_node" {
+		t.Fatalf("sometimes1 %+v", p.Sometimes[1])
+	}
+	weights := map[string]int{}
+	for _, act := range a.cfg.Nemesis.Actions {
+		weights[act.Type] = act.Weight
+	}
+	if weights["isolate_node"] != 3 || weights["partition_halves"] != 2 || weights["kill_node"] != 2 || weights["heal_all"] != 2 {
+		t.Fatalf("weights %+v", weights)
+	}
+}
+
 func TestRqliteResultControls(t *testing.T) {
 	a, err := LoadYAMLTarget("examples/rqlite/rqlite.yaml")
 	if err != nil {
@@ -268,6 +304,42 @@ steps:
 	}
 	if _, err := LoadYAMLTarget(cfg); err == nil {
 		t.Fatal("expected load error for delay without unit")
+	}
+}
+
+func TestExpandClientProxyVars(t *testing.T) {
+	got := expandTemplates("${client_port} ${client_proxy} ${client_addr_1} ${client_addrs}", map[string]string{
+		"client_port":   "9",
+		"client_proxy":  "127.0.0.1:10",
+		"client_addr_1": "127.0.0.1:11",
+		"client_addrs":  "127.0.0.1:10,127.0.0.1:11",
+	})
+	want := "9 127.0.0.1:10 127.0.0.1:11 127.0.0.1:10,127.0.0.1:11"
+	if got != want {
+		t.Fatalf("expandTemplates = %q, want %q", got, want)
+	}
+}
+
+func TestClientPortRangeOverlap(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "overlap.yaml")
+	body := []byte(`
+name: overlap
+binary:
+  default: hold
+topology:
+  nodes: 2
+  ports:
+    base: 20000
+    client_base: 20001
+  client_via_proxy: true
+  start: ["${binary}", "${data_dir}"]
+`)
+	if err := os.WriteFile(path, body, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadYAMLTarget(path); err == nil {
+		t.Fatal("expected overlapping client_base to be rejected")
 	}
 }
 

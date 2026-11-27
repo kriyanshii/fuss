@@ -1,0 +1,62 @@
+name: repkv-bug
+binary:
+  default: repkv
+  extra: ["./examples/repkv/repkv"]
+topology:
+  nodes: 3
+  client_via_proxy: true
+  data_dir: "${dir}/node${i}"
+  ports:
+    base: 0
+  peers:
+    port_name: raft
+    via_proxy: true
+  start:
+    - ${binary}
+    - -id
+    - ${i}
+    - -data-dir
+    - ${data_dir}
+    - -peer-listen
+    - 127.0.0.1:${port}
+    - -peer-addrs
+    - ${peer_addr_0},${peer_addr_1},${peer_addr_2}
+    - -client
+    - 127.0.0.1:${client_port}
+    - -mode
+    - bug
+  ready:
+    file: "${data_dir}/ready"
+    contains: READY
+    timeout: 5s
+  stop_grace: 500ms
+nemesis:
+  warmup: 350ms
+  duration: 400ms
+  interval: 400ms
+  quiet_period: 450ms
+  actions:
+    - type: isolate_node
+      target: "0"
+      mode: reset
+      direction: both
+workload:
+  driver: http_kv
+  workers: 3
+  rate: 30
+  keyspace: 1
+  timeout: 500ms
+  targets: "${client_addrs}"
+  put:
+    method: PUT
+    url: "http://${target}/k/${key}"
+    body: "${value}"
+  get:
+    method: GET
+    url: "http://${target}/k/${key}"
+check:
+  porcupine:
+    timeout: 8s
+  set: {}
+  eventually_available:
+    n: 1

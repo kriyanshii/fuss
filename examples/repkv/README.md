@@ -1,18 +1,24 @@
 # repkv
 
-Tiny three-node replicated KV for Fuss isolate scenarios. Stdlib only.
+Tiny three-node replicated KV for Fuss scenarios. Stdlib only.
 
 - Client HTTP: `PUT /k/{key}`, `GET /k/{key}`, `GET /leader`
 - Peer TCP through Fuss proxies when `topology.peers.via_proxy` is set
-- `-mode=correct`: leader acks a PUT only after a follower confirms replication
-- `-mode=bug`: leader acks immediately; replication waits for a gate file
+- `-mode=correct`: the leader acks a PUT only after every follower has stored it
+- `-mode=bug`: the leader acks a PUT immediately and does not replicate it
+
+`repkv.yaml` and `repkv-bug.yaml` are the isolate scenarios CI runs: one acknowledged write, a cut of `node_0`, then a read from a surviving leader. `repkv-http.yaml` and `repkv-http-bug.yaml` drive the same binaries with the core `http_kv` workload, one isolate nemesis, and the core `porcupine` and `eventually_available` checkers.
 
 ```sh
 go build -o examples/repkv/repkv ./examples/repkv
 go build -o fuss .
 ./fuss -target-config=examples/repkv/repkv.yaml -n=10 -seed=1 -json
 ./fuss -target-config=examples/repkv/repkv-bug.yaml -n=10 -seed=1 -json
+./fuss -target-config=examples/repkv/repkv-http.yaml -n=1 -seed=1 -json -save-bundle=/tmp/repkv-ok
+./fuss -target-config=examples/repkv/repkv-http-bug.yaml -n=1 -seed=1 -json -save-bundle=/tmp/repkv-bug
 ```
+
+The isolate correct mode exits 0 with `PASS`. The isolate bug mode exits 1 with `LOST WRITE`. The http bug bundle contains `history.jsonl`, `nemesis_events.json`, `history.edn`, and `porcupine.html`.
 
 ## Replay
 

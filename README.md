@@ -2,6 +2,48 @@
 
 Test a real distributed system against a documented guarantee. Define the cluster, fault, and check in one scenario file, then replay the run.
 
+## Zero-root, CI-native fault injection
+
+fuss tests unmodified distributed system binaries under reproducible network and process faults on a laptop or in standard CI—with no root, no iptables, no Docker-in-Docker, and no JVM/Clojure setup.
+
+It does not replace a full-stack deterministic hypervisor like [Antithesis](https://antithesis.com/) (target goroutines, clocks, and disk I/O remain non-deterministic), nor does it replace multi-host [Jepsen](https://github.com/jepsen-io/jepsen) clusters. Instead, fuss gives you a single static Go binary for seeded, reproducible black-box fault injection with built-in [Porcupine](https://github.com/anishathalye/porcupine) linearizability checking and failure bundles.
+
+### What fuss provides
+
+- **Zero-root L4 chaos proxy** (`proxy/`): Routes peer-to-peer and client-to-node (`client_via_proxy: true`) TCP traffic in userspace using PID-attributed sockets (`per_node_owned`). Supports reset (close + refuse), blackhole (discard bytes so peers hit read deadlines, closing dirty sockets on Heal()), and degraded (seeded one-way latency, jitter, and chunk drops) with independent direction (`both`, `inbound`, `outbound`) and byte flow (`both`, `a_to_b`, `b_to_a`).
+- **Composable YAML nemesis:** Runs a seeded schedule (warmup → weighted `isolate_node`, `isolate_client`, `partition_halves`, `kill_node` + restart, `pause_node`, `heal_all` → mandatory `heal_all` + `quiet_period` + ready re-probe) while concurrent `http_kv` or `exec_op` workers hammer the cluster.
+- **Unified histories and [Porcupine](https://github.com/anishathalye/porcupine) traces:** Records client operations (`ok`, `fail`, and open-ended `info` timeouts) in `history.jsonl` and Jepsen-compatible `history.edn` on the same monotonic `scheduleStart` clock as `nemesis_events.json`. Any `NONLINEARIZABLE` or checker-timeout run automatically emits `porcupine.html`.
+- **Property telemetry (ALWAYS / EVENTUALLY / SOMETIMES):** Enforces safety (`porcupine`, `set`) and post-recovery liveness (`eventually_available`), and fails `-n > 1` runs (`UNMET_SOMETIMES`) if targeted fault windows like `fault_during_inflight` or `fault_action_fired` hit 0 times.
+- **CI-ready failure bundles:** `-save-failed-bundle <dir>` captures `history.jsonl`, `history.edn`, `nemesis_events.json`, `porcupine.html`, `target.log`, `scenario.yaml`, and `bundle.json` under `<dir>/seed-<seed>/` for any non-PASS trial, ready for `-replay-bundle`. `-save-bundle` still records one seed, so `-n` must be 1.
+
+### Verified runs on real systems
+
+| Target | Scenario | Faults exercised | Fuss verdict | What it showed |
+| --- | --- | --- | --- | --- |
+| [etcd v3.7.4](https://github.com/etcd-io/etcd) | `etcd-serializable.yaml` | blackhole and reset (`client_via_proxy`) | `NONLINEARIZABLE` (`porcupine.html`) | Documented stale reads on a partitioned minority under a serializable range |
+| [etcd v3.7.4](https://github.com/etcd-io/etcd) | `etcd-linearizable.yaml` | blackhole and reset (`client_via_proxy`) | `PASS` | Linearizable reads block or time out (`info`) rather than returning stale data |
+| [otoolep/hraftd](https://github.com/otoolep/hraftd) | `hraftd.yaml` (`-n 5`) | blackhole, `partition_halves`, `kill_node` | 3× `NONLINEARIZABLE`, 2× `UNKNOWN` (`nodes_not_ready`) | Uncoordinated local GET stale reads, and a follower `-join` restart that is not ready when node 0 is down |
+| [rqlite v10.7.4](https://github.com/rqlite/rqlite) | `rqlite-http.yaml` | `kill_node` (`fault_during_inflight` hit) | `PASS` | The seed recovered and the HTTP history stayed linearizable |
+
+These rows are the runs already recorded on this machine. The etcd serializable `NONLINEARIZABLE` is the documented stale range, not a claim that etcd broke linearizable reads. The hraftd counts are one `-n 5` from seed 1, not a 10-replay of one state. The rqlite row is seed 1: `kill_node` fired, and `isolate_node` was not drawn.
+
+### Quick example
+
+```bash
+# Run 5 seeded trials and save bundles only for failing seeds
+./fuss -target-config examples/hraftd/hraftd.yaml -n 5 -seed 1 -save-failed-bundle ./runs/hraftd
+
+# Inspect any failing seed's Porcupine timeline
+open ./runs/hraftd/seed-1/porcupine.html
+
+# Replay a saved bundle
+./fuss -replay-bundle ./runs/hraftd/seed-1
+```
+
+Window of the seed-1 hraftd trace (`notes/runs/hraftd-seed1/porcupine.html`). Fuss verdict `NONLINEARIZABLE`. The red mark is Porcupine's first illegal linearization point.
+
+![hraftd seed 1 Porcupine trace, first illegal linearization point](doc/hraftd-seed1-porcupine.png)
+
 ## Three nodes
 
 repkv is a small replicated key-value store in this repository. Correct mode acknowledges a write only after a follower has it. Bug mode acknowledges first and replicates later.

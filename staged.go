@@ -99,6 +99,8 @@ func stagedVerdict(st runStatus, items, starts int) string {
 // (RULEBOOK section 4). A control must FAIL: it returns nil only if the
 // staged run is judged STRANDED.
 func strandedControl() error {
+	// Drop nemesis restarts left behind by an aborted trial before this control.
+	guardControlProcs()
 	fsys, err := fs.Sub(strandedFixture, "testdata/stranded")
 	if err != nil {
 		return err

@@ -1,9 +1,9 @@
-// Package proxy is a spike TCP forwarder with Cut/Heal for fault-injection experiments.
+// Package proxy is a userspace TCP forwarder with seeded fault injection.
 package proxy
 
 import (
 	"fmt"
-	"io"
+	"math/rand"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -21,6 +21,8 @@ type Stats struct {
 }
 
 // Link listens on a local address and forwards TCP to one upstream, both ways.
+// Cut and Heal are ModeReset and ModeHealthy. Apply sets a FaultProfile on
+// one or both byte directions without changing the listen address.
 type Link struct {
 	listen   string
 	upstream string
@@ -34,6 +36,14 @@ type Link struct {
 	tagger func(net.Addr) (tag int, known bool)
 	// refuse reports connections to reject after a partial cut. Nil refuses none.
 	refuse func(tag int, known bool) bool
+	// overlay faults one source tag on a shared inbound proxy. Nil faults none.
+	overlay *tagOverlay
+
+	// toA is client to upstream. toB is upstream to client.
+	toA  FaultProfile
+	toB  FaultProfile
+	rng  *rand.Rand
+	wake [2]chan struct{}
 
 	accepted        atomic.Int64
 	closedByCut     atomic.Int64
@@ -48,9 +58,21 @@ type Link struct {
 }
 
 // connMeta is the label on one accepted client connection.
+// dirtyA and dirtyB record that this connection discarded payload on
+// client-to-upstream or upstream-to-client while ModeBlackhole was active.
+// Apply closes the socket once that direction leaves ModeBlackhole so a
+// later heal cannot splice the TCP stream.
 type connMeta struct {
-	tag   int
-	known bool
+	tag    int
+	known  bool
+	dirtyA bool
+	dirtyB bool
+}
+
+// tagOverlay is a fault that applies only to connections whose tag matches.
+type tagOverlay struct {
+	match   func(tag int, known bool) bool
+	profile FaultProfile
 }
 
 // tagStats counts one source tag. A shared inbound proxy has one Link and
@@ -73,6 +95,9 @@ func New(listen, upstream string) (*Link, error) {
 		listen:   listen,
 		upstream: upstream,
 		conns:    make(map[net.Conn]connMeta),
+		toA:      FaultProfile{Mode: ModeHealthy, Direction: DirAToB},
+		toB:      FaultProfile{Mode: ModeHealthy, Direction: DirBToA},
+		wake:     [2]chan struct{}{make(chan struct{}), make(chan struct{})},
 	}
 	l.lastCut.Store(time.Time{})
 	l.lastHeal.Store(time.Time{})
@@ -120,6 +145,7 @@ func (l *Link) Close() error {
 	ln := l.ln
 	l.ln = nil
 	conns := takeConns(l)
+	l.notifyDirLocked(DirBoth)
 	l.mu.Unlock()
 
 	if ln != nil {
@@ -133,26 +159,15 @@ func (l *Link) Close() error {
 }
 
 // Cut closes every open connection immediately and refuses new ones until Heal.
+// It is ModeReset on both directions.
 func (l *Link) Cut() {
-	l.mu.Lock()
-	l.cut = true
-	l.lastCut.Store(time.Now())
-	conns, tags := takeAll(l)
-	l.mu.Unlock()
-
-	l.noteClosed(len(conns), tags)
-	for _, c := range conns {
-		_ = c.Close()
-	}
+	_ = l.Apply(FaultProfile{Mode: ModeReset, Direction: DirBoth}, nil)
 }
 
 // Heal resumes accepting and forwarding after a Cut or CutWhere.
+// It clears both directions back to ModeHealthy.
 func (l *Link) Heal() {
-	l.mu.Lock()
-	l.cut = false
-	l.refuse = nil
-	l.lastHeal.Store(time.Now())
-	l.mu.Unlock()
+	_ = l.Apply(FaultProfile{Mode: ModeHealthy, Direction: DirBoth}, nil)
 }
 
 // SetTagger labels each accepted connection before it is forwarded.
@@ -397,7 +412,7 @@ func (l *Link) handle(client net.Conn) {
 	// If Cut or CutWhere landed while dialing, drop without forwarding.
 	l.mu.Lock()
 	_, tracked := l.conns[client]
-	drop := l.cut || l.closed || !tracked
+	drop := l.closed || !tracked || (l.toA.Mode == ModeReset && l.toB.Mode == ModeReset)
 	l.mu.Unlock()
 	if drop {
 		return
@@ -405,11 +420,11 @@ func (l *Link) handle(client net.Conn) {
 
 	errc := make(chan struct{}, 2)
 	go func() {
-		_, _ = io.Copy(up, client)
+		l.relay(up, client, 0) // client -> upstream
 		errc <- struct{}{}
 	}()
 	go func() {
-		_, _ = io.Copy(client, up)
+		l.relay(client, up, 1) // upstream -> client
 		errc <- struct{}{}
 	}()
 	<-errc

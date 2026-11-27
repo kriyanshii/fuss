@@ -1,5 +1,6 @@
-# Same three-node cut as repkv.yaml. The check dials a closed port after the
-# surviving leader is known, so a failed read stays UNKNOWN.
+# Same three-node cut as repkv.yaml. The check dials a closed port, so a
+# transport failure stays UNKNOWN instead of a lost write. The cut is armed
+# once the leader is up; it does not wait for a replicated write.
 name: repkv-read-error
 binary:
   default: repkv
@@ -19,7 +20,7 @@ topology:
       ${binary} -id ${i} -data-dir ${data_dir} -peer-listen 127.0.0.1:${port} -peer-addrs '${peer_addr_0},${peer_addr_1},${peer_addr_2}' -client 127.0.0.1:0 -mode correct -gate ${dir}/replicate &
       pid=$!
       if [ "${i}" = "0" ]; then
-        ${binary} -drive -dir ${dir} -n 3 -key ${seed}-0 -record ${dir}/runs.txt -cut ${dir}/cut_now -gate ${dir}/replicate -mode correct &
+        ${binary} -arm-cut -dir ${dir} -n 3 -cut ${dir}/cut_now &
       fi
       wait $pid
   ready:

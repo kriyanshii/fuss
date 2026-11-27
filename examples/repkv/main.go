@@ -23,6 +23,7 @@ const electionTimeout = 250 * time.Millisecond
 
 func main() {
 	drive := flag.Bool("drive", false, "PUT then fire isolate trigger")
+	armCut := flag.Bool("arm-cut", false, "fire the isolate trigger once the leader is up, without a client write")
 	inflight := flag.Bool("inflight", false, "replicate, cut the leader, and let the client time out before any response")
 	verify := flag.Bool("verify", false, "GET key from new leader among nodes 1..n-1")
 	id := flag.Int("id", 0, "node index")
@@ -114,6 +115,8 @@ func main() {
 		os.Exit(runSchedule(*dir, *n, *key, *cut, *gate, *schedule))
 	case *inflight:
 		os.Exit(runInflight(*dir, *n, *key, *cut, *gate))
+	case *armCut:
+		os.Exit(runArmCut(*dir, *n, *cut))
 	case *drive:
 		os.Exit(runDrive(*dir, *n, *key, *record, *cut, *gate, *mode))
 	default:
@@ -725,6 +728,29 @@ func waitFile(path string, timeout time.Duration) error {
 	}
 }
 
+// runArmCut opens the isolate as soon as node 0 is leader. The read-error
+// scenario only needs that cut: a failed replicate must not skip cut_now,
+// or the trial ends UNKNOWN with no partition.
+func runArmCut(dir string, n int, cut string) int {
+	defer func() {
+		_ = os.WriteFile(filepath.Join(dir, "drive_done"), []byte("DONE\n"), 0o644)
+	}()
+	clients, ok := waitClients(dir, n, 5*time.Second)
+	if !ok {
+		return 1
+	}
+	if !waitLeader(clients[0], 3*time.Second) {
+		fmt.Fprintln(os.Stderr, "arm-cut: node 0 not leader")
+		return 1
+	}
+	if err := os.WriteFile(cut, []byte("NOW\n"), 0o644); err != nil {
+		fmt.Fprintf(os.Stderr, "arm-cut: %v\n", err)
+		return 1
+	}
+	_ = waitIsolateApplied(dir, "node_0", 8*time.Second)
+	return 0
+}
+
 func runDrive(dir string, n int, key, record, cut, gate, mode string) int {
 	// Always release the trial. A stuck dial must not hold the kill file
 	// until Fuss treats the run as a broken setup.
@@ -955,6 +981,13 @@ func runVerify(dir string, n int, key, cutNode, readFault string, porcupineOn bo
 		fmt.Println("UNKNOWN reason=cut_not_applied")
 		return 0
 	}
+	if readFault == "refused" {
+		// The refused dial is the observation. It does not need the new
+		// leader, and it must not be a privileged port: a drop rule there
+		// waits out the client timeout instead of refusing.
+		fmt.Println(refusedReadLine())
+		return 0
+	}
 	clients := make([]string, n)
 	for i := 0; i < n; i++ {
 		b, err := os.ReadFile(filepath.Join(dir, fmt.Sprintf("node%d", i), "client"))
@@ -986,10 +1019,6 @@ func runVerify(dir string, n int, key, cutNode, readFault string, porcupineOn bo
 	client := &http.Client{Timeout: 2 * time.Second}
 	url := "http://" + clients[newLead] + "/k/" + key
 	from := fmt.Sprintf("node_%d", newLead)
-	if readFault == "refused" {
-		url = "http://127.0.0.1:1/k/" + key
-		from = "node_refused"
-	}
 	rec := openRecorder()
 	rec.start("r1", "read", key, "", from)
 	resp, err := client.Get(url)
@@ -1018,6 +1047,23 @@ func runVerify(dir string, n int, key, cutNode, readFault string, porcupineOn bo
 	kind, reason := classifyRead(status, body, err, "v")
 	fmt.Println(verifyLine(kind, reason, newLead, key))
 	return 0
+}
+
+// refusedReadLine is a dial of a port that just stopped listening.
+// A transport failure is UNKNOWN reason=read_error, never a lost write.
+func refusedReadLine() string {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return "UNKNOWN reason=read_error"
+	}
+	addr := ln.Addr().String()
+	_ = ln.Close()
+	c, err := net.DialTimeout("tcp", addr, 200*time.Millisecond)
+	if err != nil {
+		return "UNKNOWN reason=read_error"
+	}
+	_ = c.Close()
+	return "UNKNOWN reason=read_unexpected"
 }
 
 func leaderID(client string) (int, error) {

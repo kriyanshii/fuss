@@ -4,7 +4,6 @@ binary:
   extra: ["./examples/repkv/repkv"]
 topology:
   nodes: 3
-  client_via_proxy: true
   data_dir: "${dir}/node${i}"
   ports:
     base: 0
@@ -12,51 +11,48 @@ topology:
     port_name: raft
     via_proxy: true
   start:
-    - ${binary}
-    - -id
-    - ${i}
-    - -data-dir
-    - ${data_dir}
-    - -peer-listen
-    - 127.0.0.1:${port}
-    - -peer-addrs
-    - ${peer_addr_0},${peer_addr_1},${peer_addr_2}
-    - -client
-    - 127.0.0.1:${client_port}
-    - -mode
-    - correct
+    - /bin/sh
+    - -c
+    - |
+      ${binary} -id ${i} -data-dir ${data_dir} -peer-listen 127.0.0.1:${port} -peer-addrs '${peer_addr_0},${peer_addr_1},${peer_addr_2}' -client 127.0.0.1:0 -mode correct -gate ${dir}/replicate &
+      pid=$!
+      if [ "${i}" = "0" ]; then
+        ${binary} -drive -dir ${dir} -n 3 -key ${seed}-0 -record ${dir}/runs.txt -cut ${dir}/cut_now -gate ${dir}/replicate -mode correct &
+      fi
+      wait $pid
   ready:
     file: "${data_dir}/ready"
     contains: READY
     timeout: 5s
   stop_grace: 500ms
-nemesis:
-  warmup: 350ms
-  duration: 400ms
-  interval: 400ms
-  quiet_period: 450ms
-  actions:
-    - type: isolate_node
-      target: "0"
-      mode: reset
-      direction: both
-workload:
-  driver: http_kv
-  workers: 3
-  rate: 30
-  keyspace: 1
-  timeout: 500ms
-  targets: "${client_addrs}"
-  put:
-    method: PUT
-    url: "http://${target}/k/${key}"
-    body: "${value}"
-  get:
-    method: GET
-    url: "http://${target}/k/${key}"
+fault:
+  isolate: node_0
+  after:
+    file:
+      glob: "${dir}/cut_now"
+      contains: NOW
+      poll: 10ms
+      timeout: 8s
+kill:
+  at: file
+  file:
+    glob: "${dir}/drive_done"
+    contains: DONE
+    poll: 10ms
+    timeout: 20s
 check:
-  porcupine:
-    timeout: 8s
-  set: {}
-  eventually_available:
-    n: 1
+  command:
+    command: ["${binary}", "-verify", "-dir", "${dir}", "-n", "3", "-key", "${seed}-0"]
+    as: out
+  rules:
+    - if: { out_contains: "LOST WRITE read_from=node_1 leader=self after_cut=yes value_missing=yes" }
+      verdict: "LOST WRITE"
+    - if: { out_contains: "LOST WRITE read_from=node_2 leader=self after_cut=yes value_missing=yes" }
+      verdict: "LOST WRITE"
+    - if: { out_contains: "PASS read_from=node_1 leader=self after_cut=yes" }
+      verdict: PASS
+    - if: { out_contains: "PASS read_from=node_2 leader=self after_cut=yes" }
+      verdict: PASS
+    - if: { out_contains: "UNKNOWN" }
+      verdict: UNKNOWN
+    - else: FAIL

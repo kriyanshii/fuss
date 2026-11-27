@@ -29,8 +29,8 @@ func TestRepkvHistoryBundle(t *testing.T) {
 
 	correctDir := t.TempDir()
 	bugDir := t.TempDir()
-	correctCode := runRepkvScenario(t, "examples/repkv/repkv.yaml", correctDir)
-	bugCode := runRepkvScenario(t, "examples/repkv/repkv-bug.yaml", bugDir)
+	correctCode := runRepkvScenario(t, "examples/repkv/repkv-http.yaml", correctDir)
+	bugCode := runRepkvScenario(t, "examples/repkv/repkv-http-bug.yaml", bugDir)
 
 	if correctCode != exitPass {
 		t.Errorf("correct mode exit %d, want 0\n%s", correctCode, readTail(filepath.Join(correctDir, "history.jsonl")))

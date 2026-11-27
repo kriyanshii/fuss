@@ -1769,6 +1769,9 @@ func (y *YAMLAdapter) startTopology(t *BaseTrial, log *os.File) (*exec.Cmd, erro
 	readyWG.Wait()
 	rt.AllReady = allReady
 	t.Data()["topology"] = rt
+	// Set before the trigger watchers start. They read this map, and a later
+	// write would race with that read.
+	t.Data()["topology_hold"] = true
 
 	if y.cfg.Fault.Isolate.active() {
 		rt.Isolate = &isolateState{
@@ -1794,7 +1797,6 @@ func (y *YAMLAdapter) startTopology(t *BaseTrial, log *os.File) (*exec.Cmd, erro
 	}
 	// The hold is fuss's sleep, not a target node. Calibration (-kill=false)
 	// stops it after the schedule so the trial can reach its checks.
-	t.Data()["topology_hold"] = true
 	return hold, nil
 }
 

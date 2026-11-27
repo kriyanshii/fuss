@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -132,21 +133,14 @@ func fussRevision() string {
 
 func probeVersion(bin string) string {
 	for _, arg := range []string{"-version", "--version"} {
-		cmd := exec.Command(bin, arg)
-		var buf bytes.Buffer
-		cmd.Stdout = &buf
-		cmd.Stderr = &buf
-		timer := time.AfterFunc(2*time.Second, func() {
-			if cmd.Process != nil {
-				_ = cmd.Process.Kill()
-			}
-		})
-		err := cmd.Run()
-		timer.Stop()
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		cmd := exec.CommandContext(ctx, bin, arg)
+		out, err := cmd.Output()
+		cancel()
 		if err != nil {
 			continue
 		}
-		line := strings.TrimSpace(buf.String())
+		line := strings.TrimSpace(string(out))
 		if i := strings.IndexByte(line, '\n'); i >= 0 {
 			line = strings.TrimSpace(line[:i])
 		}

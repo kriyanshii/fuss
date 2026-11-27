@@ -69,7 +69,7 @@ func TestSaveFailedBundleSkipsPassWritesFail(t *testing.T) {
 	passDir := t.TempDir()
 	jsonOut = false
 	bundleRun = bundleCLI{failedDir: passDir}
-	pass, err := LoadYAMLTarget("examples/repkv/repkv.yaml")
+	pass, err := LoadYAMLTarget("examples/repkv/repkv-http.yaml")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -87,7 +87,7 @@ func TestSaveFailedBundleSkipsPassWritesFail(t *testing.T) {
 	bugDir := t.TempDir()
 	jsonOut = true
 	bundleRun = bundleCLI{failedDir: bugDir}
-	bug, err := LoadYAMLTarget("examples/repkv/repkv-bug.yaml")
+	bug, err := LoadYAMLTarget("examples/repkv/repkv-http-bug.yaml")
 	if err != nil {
 		t.Fatal(err)
 	}

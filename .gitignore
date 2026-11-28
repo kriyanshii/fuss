@@ -15,3 +15,7 @@ PROJECT_CONTEXT.md
 /examples/hraftd/hraftd
 /examples/consul/consul
 /examples/nats-kv/nats-server
+
+# Per-run blind predictions. Files already tracked stay tracked.
+/notes/*-prediction.md
+/notes/*-prediction-*.md

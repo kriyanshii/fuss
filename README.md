@@ -270,9 +270,7 @@ as an older example. The old rqlite Go adapter (`rqlite_adapter.go`,
 `-adapter=rqlite`) does nothing useful now that `examples/rqlite/rqlite.yaml`
 exists; use the YAML fixture.
 
-`notes/` holds predictions written down before each run, kept next to what the
-run actually showed, and the issue draft as it was before filing (the filed
-issue is the current version).
+`notes/friction.md` records what real targets forced. `doc/war-stories.md` is the short account of the etcd splice and the repkv dirty read. A prediction written before a run stays local (`notes/*-prediction.md` is gitignored) unless an example README already links to one in the tree. `notes/issue-stranded-queued.md` is the issue draft as it was before filing.
 
 ## Limits
 

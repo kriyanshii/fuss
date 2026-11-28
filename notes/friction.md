@@ -45,3 +45,23 @@ Binary: `examples/hraftd/hraftd`. Config: `examples/hraftd/hraftd.yaml`.
 `notes/hraftd-prediction.md` expected a mix and said it was wrong if every trial was `UNKNOWN`. The first five were all `UNKNOWN`. That prediction was wrong. `notes/hraftd-prediction-2.md` expected the mix above. It matches.
 
 Seed 5's node 1 `exit_status` was `1`. **Reading:** `target.log` shows Raft dialing the bind port and getting `connection refused` while that process is down. `-join` still targets node 0, so a follower restart while node 0 is down exits before `exec`.
+
+## nats-server v2.15.3, JetStream KV, `exec_op`
+
+Binaries: `/usr/local/bin/nats-server` v2.15.3, `/usr/local/bin/nats` 0.5.2. Config: `examples/nats-kv/nats-kv.yaml`. Machine: darwin arm64. `fuss: nats-kv = /usr/local/bin/nats-server (from PATH)`.
+
+1. **The quiet recheck dropped `${port_monitor}`.** The first five seeds, seed 1, `-save-failed-bundle /tmp/nats-runs`, all printed `"verdict":"UNKNOWN"`, label `before-start`. The trial JSON has no `reason` field. Evidence `acks` was 1 on each, which is the placeholder `CheckNamed` stores on an early return, not an operation count. Restarted nodes were `ready: false`; one node on each seed stayed `ready: true`. Summary: `acks` 5, `fail` 5, `pass` 0. `porcupine` hits 4, `passed` false. `set` and `eventually_available` hit 5. The three `sometimes` properties hit 5. Only `/tmp/nats-runs/seed-3/porcupine.html` was written. `notes/nats-kv-prediction.md` expected no `UNKNOWN`. That prediction was wrong on the verdict. It was right that `info_ops_observed` would hit.
+
+2. **Named ports are now on the runtime.** `waitNodeReadyAlive` calls `setNodePortVars` with the ports the start command saw. `TestQuietRecheckKeepsNamedPorts` checks `${port_monitor}`. The second five seeds, seed 1, `/tmp/nats-runs-2`: seed 1 `PASS`, seed 2 `PASS`, seed 3 `NONLINEARIZABLE`, seed 4 `PASS`, seed 5 `NONLINEARIZABLE`. Summary: `acks` 531, `fail` 2, `pass` 3, `failed_bundles` seed-3 and seed-5. `porcupine` hits 3, `passed` false. `set`, `eventually_available`, `fault_during_inflight`, `info_ops_observed`, and `fault_action_fired_isolate_node` each hits 5, `passed` true. `notes/nats-kv-recheck-prediction.md` expected no `UNKNOWN`. It matches. Seed 3 evidence `acks` 198. Seed 5 evidence `acks` 330. **Reading:** those match the `ok` lines in each `history.jsonl` (seed 3: 69 put, 129 get; seed 5: 142 put, 188 get). The `PASS` trials printed `acks` 1. That is the placeholder `finishCheck` returns when every property passes and the base result was `Evidence: 1`. It is not the operation count. The same trials still list a restarted node `ready: false`, same bookkeeping as rqlite: `killNode` clears `Ready`, and a passing probe does not set it back.
+
+`client_advertise` is set to the client proxy. **Reading:** seed 1's generated `nats.conf` (first run) had cluster `listen` on the real port and `advertise` on the peer proxy, and the log had `JetStream cluster new metadata leader` before the first `kill_node`. The server creates another `jetstream` directory under `store_dir`.
+
+## openraft `raft-kv-memstore`, `http_kv`
+
+Source inspected: `github.com/databendlabs/openraft` commit `0b464b9da0e53fdd887cfef24b8235fcfbb0ee5c`, `examples/raft-kv-memstore`. Config: `examples/openraft-kv/openraft-kv.yaml`. No Fuss `-json` verdict. `cargo`, `rustc`, and `rustup` are not on PATH (`/Users/kriyanshi/.cargo/env` is missing), so `raft-key-value` was not built and the five-seed run was not started.
+
+`--api-addr` and `--raft-addr` are each the bind address and the address stored in membership. There is no advertise flag. Peer `isolate_node` / `partition_halves` are not in the nemesis. Client HTTP goes through `client_via_proxy`.
+
+Every admin, write, and read handler returns HTTP 200 with a serde `Result` (`{"Ok":...}` or `{"Err":...}`). `http_kv` `error_from` only matches a non-empty scalar. The YAML points it at `Err.ForwardToLeader.reason`. `Err.QuorumNotEnough` (the `cluster` string) and `Err.LogEntryDiscarded` do not match that path, so those 200 bodies stay `ok`. A missing `Ok.value.value` on a get is an absent read, which is the right mapping for `{"Ok":{"value":null}}`.
+
+The log and the map are in memory. `kill_node` restarts an empty process. `ready.sh` writes `$dir/bootstrapped` after the first `/change-membership` and does not call `/init` again.

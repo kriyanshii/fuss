@@ -463,7 +463,8 @@ func (y *YAMLAdapter) execArgs(op string, vars map[string]string) []string {
 
 // httpCall is one http_kv request. ValueFrom is a dotted JSON path
 // (kvs.0.value). ValueEncoding base64 decodes that string. ErrorFrom is a
-// path that makes a 2xx body a refusal when it is a non-empty string.
+// path that makes a 2xx body a refusal when the value there is present and
+// not null or an empty string, including a JSON object.
 // Redirects are followed with the original method and body, including 301.
 type httpCall struct {
 	Method        string
@@ -509,10 +510,8 @@ func applyHTTPCall(ctx context.Context, client *http.Client, call httpCall, op s
 			return history.StatusInfo, "", false
 		}
 		parsed = true
-		if call.ErrorFrom != "" {
-			if msg, ok := lookupJSON(doc, call.ErrorFrom); ok && msg != "" {
-				return history.StatusFail, "", false
-			}
+		if call.ErrorFrom != "" && errorFromPresent(doc, call.ErrorFrom) {
+			return history.StatusFail, "", false
 		}
 	}
 	if op != history.OpGet || status != history.StatusOK {
@@ -604,6 +603,38 @@ func resolveRedirect(current, location string) (string, error) {
 		return "", err
 	}
 	return base.ResolveReference(ref).String(), nil
+}
+
+// errorFromPresent reports whether path names a refusal. A missing path, JSON
+// null, or empty string is not one. Any other JSON value is, including an object.
+func errorFromPresent(v any, path string) bool {
+	cur := v
+	for _, p := range strings.Split(path, ".") {
+		if p == "" {
+			return false
+		}
+		if i, err := strconv.Atoi(p); err == nil {
+			arr, ok := cur.([]any)
+			if !ok || i < 0 || i >= len(arr) || arr[i] == nil {
+				return false
+			}
+			cur = arr[i]
+			continue
+		}
+		obj, ok := cur.(map[string]any)
+		if !ok {
+			return false
+		}
+		next, ok := obj[p]
+		if !ok || next == nil {
+			return false
+		}
+		cur = next
+	}
+	if s, ok := cur.(string); ok {
+		return s != ""
+	}
+	return true
 }
 
 func lookupJSON(v any, path string) (string, bool) {

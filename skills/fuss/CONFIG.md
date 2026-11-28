@@ -171,8 +171,9 @@ string map, expanded the same way as `body`. `value_from` and `error_from`
 are expanded the same way, then read as a dotted JSON path (`kvs.0.value`
 indexes an array, `${key}` is that op's key). On a 2xx get, a missing path
 is an absent value, not a failed call. `value_encoding: base64` decodes the
-string at that path and requires `value_from`. A non-empty string at
-`error_from` is a refusal (`fail`) even when the status is 2xx.
+string at that path and requires `value_from`. A value at `error_from`
+is a refusal (`fail`) even when the status is 2xx, including a JSON object.
+A missing path, JSON null, or empty string is not.
 
 Example:
 

@@ -24,8 +24,10 @@ It does not replace a full-stack deterministic hypervisor like [Antithesis](http
 | [etcd v3.7.4](https://github.com/etcd-io/etcd) | `etcd-linearizable.yaml` | blackhole and reset (`client_via_proxy`) | `PASS` | Linearizable reads block or time out (`info`) rather than returning stale data |
 | [otoolep/hraftd](https://github.com/otoolep/hraftd) | `hraftd.yaml` (`-n 5`) | blackhole, `partition_halves`, `kill_node` | 3× `NONLINEARIZABLE`, 2× `UNKNOWN` (`nodes_not_ready`) | Uncoordinated local GET stale reads, and a follower `-join` restart that is not ready when node 0 is down |
 | [rqlite v10.7.4](https://github.com/rqlite/rqlite) | `rqlite-http.yaml` | `kill_node` (`fault_during_inflight` hit) | `PASS` | The seed recovered and the HTTP history stayed linearizable |
+| [nats-server v2.15.3](https://github.com/nats-io/nats-server) JetStream KV | `nats-kv.yaml` (`-n 5`) | `isolate_node` blackhole, `partition_halves` reset, `kill_node` | seeds 1, 2, 4 `PASS`; seeds 3, 5 `NONLINEARIZABLE` | `AllowDirect` on. `porcupine` hits 3, `passed` false |
+| [nats-server v2.15.3](https://github.com/nats-io/nats-server) JetStream KV | `nats-kv-no-direct.yaml` (`-n 5`) | same | seeds 1, 3, 4, 5 `PASS`; seed 2 `UNAVAILABLE` | `allow_direct` false. `porcupine` hits 5, `passed` true. `eventually_available` hits 4, `passed` false |
 
-These rows are the runs already recorded on this machine. The etcd serializable `NONLINEARIZABLE` is the documented stale range, not a claim that etcd broke linearizable reads. The hraftd counts are one `-n 5` from seed 1, not a 10-replay of one state. The rqlite row is seed 1: `kill_node` fired, and `isolate_node` was not drawn.
+These rows are the runs already recorded on this machine. The etcd serializable `NONLINEARIZABLE` is the documented stale range, not a claim that etcd broke linearizable reads. The hraftd counts are one `-n 5` from seed 1, not a 10-replay of one state. The rqlite row is seed 1: `kill_node` fired, and `isolate_node` was not drawn. The nats rows are two `-n 5` runs from seed 1 after the quiet recheck kept `${port_monitor}`.
 
 ### Quick example
 

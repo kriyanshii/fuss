@@ -26,7 +26,9 @@ The start command is `examples/consul/start-node.sh`. Before `exec`, it writes `
 | `retry_join` | `127.0.0.1` plus each node's Serf LAN port. `retry_interval` is `1s` (the default is 30s). |
 | `bootstrap_expect` | 3 |
 
-Consul's agent config uses `ports.server` for both `RPCBindAddr` and `RPCAdvertiseAddr`. There is no documented advertise port that differs from the bind port. Members therefore dial `127.0.0.1:${port_server}`, which is the upstream, not the proxy listen address. `isolate_node` and `partition_halves` act on the peer proxies. They do not cut a Raft dial that never enters the proxy. Serf is direct on purpose. `kill_node` still stops that process.
+Consul's agent config uses `ports.server` for both `RPCBindAddr` and `RPCAdvertiseAddr`. There is no documented advertise port that differs from the bind port. Members therefore dial `127.0.0.1:${port_server}`, which is the upstream, not the proxy listen address. Serf is direct on purpose: it speaks TCP and UDP, and the proxy is TCP only.
+
+The nemesis is only what sits on Consul's path: `isolate_client` (`blackhole` and `reset`) on the HTTP client proxies, `kill_node` (`restart_delay: 2s`), `pause_node` (`pause_duration: 2s`), and `heal_all`. `isolate_node` and `partition_halves` are not in these files. They act on the peer proxies and do not cut a Raft dial that never enters the proxy. `properties.sometimes` watches `fault_action_fired` for `kill_node`.
 
 Ready is `GET /v1/status/leader` on the real HTTP port. The body is `""` until a leader exists, then a quoted `127.0.0.1:port`. The probe requires `127.0.0.1`.
 
@@ -45,5 +47,5 @@ Ready is `GET /v1/status/leader` on the real HTTP port. The body is `""` until a
 ## Limits
 
 - The start script writes `agent.json` under the trial data directory. It does not write Raft or Serf state itself.
-- Raft advertise and bind share `ports.server`, so peer-proxy faults do not sit on the Raft path. See the table above.
+- Raft advertise and bind share `ports.server`. The YAMLs use `isolate_client`, `kill_node`, and `pause_node` only. See the table above.
 - No primary-source claim that a stale read must be nonlinearizable, or that a consistent read must survive this nemesis. Porcupine scores the recorded history. Quote Fuss's `-json` verdict.

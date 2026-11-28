@@ -251,14 +251,22 @@ func TestConsulYAMLLoads(t *testing.T) {
 		if n.warmup != 4*time.Second || n.duration != 25*time.Second || n.interval != 3*time.Second || n.quiet != 5*time.Second {
 			t.Fatalf("%s nemesis warmup %s duration %s interval %s quiet %s", a.cfg.Name, n.warmup, n.duration, n.interval, n.quiet)
 		}
-		weights := map[string]int{}
-		modes := map[string]string{}
-		for _, act := range n.Actions {
-			weights[act.Type] = act.Weight
-			modes[act.Type] = act.Mode
+		if len(n.Actions) != 5 {
+			t.Fatalf("%s actions %+v", a.cfg.Name, n.Actions)
 		}
-		if weights["isolate_node"] != 3 || modes["isolate_node"] != "blackhole" || weights["partition_halves"] != 2 || modes["partition_halves"] != "reset" || weights["kill_node"] != 2 || weights["heal_all"] != 2 {
-			t.Fatalf("%s weights %+v modes %+v", a.cfg.Name, weights, modes)
+		got := make([]string, len(n.Actions))
+		for i, act := range n.Actions {
+			got[i] = fmt.Sprintf("%s mode=%s weight=%d restart=%s pause=%s", act.Type, act.Mode, act.Weight, act.RestartDelay, act.PauseDuration)
+		}
+		want := []string{
+			"isolate_client mode=blackhole weight=3 restart= pause=",
+			"isolate_client mode=reset weight=2 restart= pause=",
+			"kill_node mode= weight=2 restart=2s pause=",
+			"pause_node mode= weight=2 restart= pause=2s",
+			"heal_all mode= weight=2 restart= pause=",
+		}
+		if strings.Join(got, "\n") != strings.Join(want, "\n") {
+			t.Fatalf("%s actions\n%s", a.cfg.Name, strings.Join(got, "\n"))
 		}
 		p := a.cfg.Properties
 		if len(p.Always) != 2 || p.Always[0].Name != "porcupine" || p.Always[0].Porcupine.timeout != 10*time.Second || p.Always[1].Name != "set" {
@@ -267,7 +275,7 @@ func TestConsulYAMLLoads(t *testing.T) {
 		if len(p.Eventually) != 1 || p.Eventually[0].Eventually == nil || p.Eventually[0].Eventually.N != 5 {
 			t.Fatalf("%s eventually %+v", a.cfg.Name, p.Eventually)
 		}
-		if len(p.Sometimes) != 3 || p.Sometimes[0].Name != "fault_during_inflight" || p.Sometimes[1].Name != "info_ops_observed" || p.Sometimes[2].Name != "fault_action_fired_isolate_node" || p.Sometimes[2].FaultActionFired.Action != "isolate_node" {
+		if len(p.Sometimes) != 3 || p.Sometimes[0].Name != "fault_during_inflight" || p.Sometimes[1].Name != "info_ops_observed" || p.Sometimes[2].Name != "fault_action_fired_kill_node" || p.Sometimes[2].FaultActionFired.Action != "kill_node" {
 			t.Fatalf("%s sometimes %+v", a.cfg.Name, p.Sometimes)
 		}
 	}
@@ -276,6 +284,97 @@ func TestConsulYAMLLoads(t *testing.T) {
 	}
 	if stale.cfg.Workload.Get.URL != "http://${target}/v1/kv/${key}?stale&raw" {
 		t.Fatalf("stale get %s", stale.cfg.Workload.Get.URL)
+	}
+}
+
+func TestNatsKVYAMLLoads(t *testing.T) {
+	a, err := LoadYAMLTarget("examples/nats-kv/nats-kv.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	topo := a.cfg.Topology
+	if topo.Nodes != 3 || !topo.ClientViaProxy || !topo.Peers.ViaProxy || topo.Peers.PortName != "cluster" {
+		t.Fatalf("topology %+v", topo)
+	}
+	if topo.ProxyMode != "per_node_owned" {
+		t.Fatalf("proxy_mode %s", topo.ProxyMode)
+	}
+	if len(topo.Ports.Names) != 2 || topo.Ports.Names[0] != "cluster" || topo.Ports.Names[1] != "monitor" {
+		t.Fatalf("names %+v", topo.Ports.Names)
+	}
+	w := a.cfg.Workload
+	if w.Driver != "exec_op" || w.Workers != 4 || w.Keyspace != 3 || w.timeout != 2*time.Second {
+		t.Fatalf("workload %+v timeout %s", w, w.timeout)
+	}
+	if w.Targets != "${client_addrs}" {
+		t.Fatalf("targets %s", w.Targets)
+	}
+	put := strings.Join(w.Exec.Put, " ")
+	get := strings.Join(w.Exec.Get, " ")
+	if !strings.Contains(put, "examples/nats-kv/kv-op.sh") || !strings.Contains(put, "put") || !strings.Contains(put, "${key}") {
+		t.Fatalf("put %v", w.Exec.Put)
+	}
+	if !strings.Contains(get, "examples/nats-kv/kv-op.sh") || !strings.Contains(get, "get") || !strings.Contains(get, "${key}") {
+		t.Fatalf("get %v", w.Exec.Get)
+	}
+	n := a.cfg.Nemesis
+	if n.warmup != 4*time.Second || n.duration != 25*time.Second || n.interval != 3*time.Second || n.quiet != 5*time.Second {
+		t.Fatalf("nemesis warmup %s duration %s interval %s quiet %s", n.warmup, n.duration, n.interval, n.quiet)
+	}
+	weights := map[string]int{}
+	modes := map[string]string{}
+	for _, act := range n.Actions {
+		weights[act.Type] = act.Weight
+		modes[act.Type] = act.Mode
+	}
+	if weights["isolate_node"] != 3 || modes["isolate_node"] != "blackhole" || weights["partition_halves"] != 2 || modes["partition_halves"] != "reset" || weights["kill_node"] != 2 || weights["heal_all"] != 2 {
+		t.Fatalf("weights %+v modes %+v", weights, modes)
+	}
+	p := a.cfg.Properties
+	if len(p.Always) != 2 || p.Always[0].Name != "porcupine" || p.Always[0].Porcupine.timeout != 10*time.Second || p.Always[1].Name != "set" {
+		t.Fatalf("always %+v", p.Always)
+	}
+	if len(p.Eventually) != 1 || p.Eventually[0].Eventually == nil || p.Eventually[0].Eventually.N != 5 {
+		t.Fatalf("eventually %+v", p.Eventually)
+	}
+	if len(p.Sometimes) != 3 || p.Sometimes[0].Name != "fault_during_inflight" || p.Sometimes[1].Name != "info_ops_observed" || p.Sometimes[2].Name != "fault_action_fired_isolate_node" || p.Sometimes[2].FaultActionFired.Action != "isolate_node" {
+		t.Fatalf("sometimes %+v", p.Sometimes)
+	}
+}
+
+func TestNatsKVNoDirectYAMLLoads(t *testing.T) {
+	base, err := LoadYAMLTarget("examples/nats-kv/nats-kv.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, err := LoadYAMLTarget("examples/nats-kv/nats-kv-no-direct.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.cfg.Name != "nats-kv-no-direct" {
+		t.Fatalf("name %s", a.cfg.Name)
+	}
+	ready := strings.Join(a.cfg.Topology.Ready.Command, " ")
+	if !strings.Contains(ready, "examples/nats-kv/ready.sh") || !strings.HasSuffix(strings.TrimSpace(ready), "no-direct") {
+		t.Fatalf("ready %v", a.cfg.Topology.Ready.Command)
+	}
+	if strings.Join(base.cfg.Topology.Ready.Command, " ") == ready {
+		t.Fatal("no-direct ready command matches the default scenario")
+	}
+	if a.cfg.Workload.Driver != base.cfg.Workload.Driver || a.cfg.Workload.Workers != base.cfg.Workload.Workers || a.cfg.Workload.Keyspace != base.cfg.Workload.Keyspace || a.cfg.Workload.Targets != base.cfg.Workload.Targets {
+		t.Fatalf("workload %+v", a.cfg.Workload)
+	}
+	if len(a.cfg.Nemesis.Actions) != len(base.cfg.Nemesis.Actions) {
+		t.Fatalf("actions %d", len(a.cfg.Nemesis.Actions))
+	}
+	for i := range a.cfg.Nemesis.Actions {
+		got, want := a.cfg.Nemesis.Actions[i], base.cfg.Nemesis.Actions[i]
+		if got.Type != want.Type || got.Mode != want.Mode || got.Weight != want.Weight || got.RestartDelay != want.RestartDelay {
+			t.Fatalf("action %d %+v want %+v", i, got, want)
+		}
+	}
+	if len(a.cfg.Properties.Sometimes) != 3 || a.cfg.Properties.Sometimes[2].FaultActionFired.Action != "isolate_node" {
+		t.Fatalf("sometimes %+v", a.cfg.Properties.Sometimes)
 	}
 }
 

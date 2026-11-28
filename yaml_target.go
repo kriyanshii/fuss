@@ -1196,13 +1196,16 @@ type topologyRuntime struct {
 	// probes expand. The post-quiet recheck has to see them too.
 	PeerAddrs   [][]string
 	NodeProxies []string
-	Unknown     []unknownOwner
-	Isolate     *isolateState
-	Pause       *pauseState
-	Nemesis     *nemesisRun
-	log         io.Writer
-	AllReady    bool
-	Stopped     bool
+	// NamedPorts is port_<name> for each node. The quiet recheck expands
+	// ready commands with the same names the start command saw.
+	NamedPorts map[string][]int
+	Unknown    []unknownOwner
+	Isolate    *isolateState
+	Pause      *pauseState
+	Nemesis    *nemesisRun
+	log        io.Writer
+	AllReady   bool
+	Stopped    bool
 }
 
 // nemesisRun is the schedule for one trial: the event log and the recovery clock.
@@ -1573,7 +1576,7 @@ func (y *YAMLAdapter) startTopology(t *BaseTrial, log *os.File) (*exec.Cmd, erro
 		return nil, err
 	}
 
-	rt := &topologyRuntime{Nodes: make([]*topologyNode, n), ProxyMode: topo.ProxyMode, log: log}
+	rt := &topologyRuntime{Nodes: make([]*topologyNode, n), ProxyMode: topo.ProxyMode, log: log, NamedPorts: namedPorts}
 	peerAddrs := make([][]string, n) // peerAddrs[i][j] = addr node i uses to reach j
 	var nodeProxies []string         // per_node: inbound proxy listen for node k
 	var clientPorts []int
@@ -3994,11 +3997,13 @@ func (y *YAMLAdapter) waitNodeReadyAlive(t *BaseTrial, rt *topologyRuntime, i in
 			clientProxies := append([]string(nil), rt.ClientProxies...)
 			peerAddrs := rt.PeerAddrs
 			nodeProxies := rt.NodeProxies
+			named := rt.NamedPorts
 			rt.mu.Unlock()
 			vars := y.vars(t, "")
 			vars["i"] = strconv.Itoa(i)
 			vars["data_dir"] = dataDir
 			vars["port"] = strconv.Itoa(port)
+			setNodePortVars(vars, port, named, i)
 			y.addClientVars(vars, clientPorts, clientProxies, i)
 			y.addPeerVars(vars, peerAddrs, nodeProxies, i)
 			if y.topologyReadyOnce(vars) {

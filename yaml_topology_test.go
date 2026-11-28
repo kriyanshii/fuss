@@ -1527,3 +1527,22 @@ topology:
 	}
 	echo(rt.ClientProxies[1], "still-open")
 }
+
+func TestQuietRecheckKeepsNamedPorts(t *testing.T) {
+	a := &YAMLAdapter{cfg: yamlTarget{
+		Topology: yamlTopology{
+			Ready: yamlTopoReady{
+				Command:  []string{"/bin/sh", "-c", `printf '%s\n' "${port_monitor}"`},
+				Contains: "4242",
+			},
+		},
+	}}
+	rt := &topologyRuntime{
+		Nodes:       []*topologyNode{{PID: os.Getpid(), Port: 1, DataDir: t.TempDir()}},
+		ClientPorts: []int{9},
+		NamedPorts:  map[string][]int{"monitor": {4242}},
+	}
+	if !a.waitNodeReadyAlive(NewBaseTrial(1, t.TempDir(), "", "quiet"), rt, 0, time.Now().Add(time.Second)) {
+		t.Fatal("quiet recheck did not expand ${port_monitor}")
+	}
+}

@@ -14,3 +14,4 @@ PROJECT_CONTEXT.md
 /examples/etcd/etcdctl
 /examples/hraftd/hraftd
 /examples/consul/consul
+/examples/nats-kv/nats-server

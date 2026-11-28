@@ -1,0 +1,102 @@
+# Same cluster, workload, and nemesis as nats-kv.yaml.
+# Ready passes no-direct. Node 0 updates KV_fuss_kv with allow_direct false
+# on $JS.API.STREAM.UPDATE.KV_fuss_kv. nats kv add 0.5.2 has no allow-direct
+# flag, and stream edit --no-allow-direct still prompts without a TTY.
+# Not run in CI.
+name: nats-kv-no-direct
+binary:
+  default: nats-server
+  extra: ["./examples/nats-kv/nats-server"]
+topology:
+  nodes: 3
+  client_via_proxy: true
+  data_dir: "${dir}/node${i}"
+  ports:
+    base: 0
+    client_base: 0
+    names: [cluster, monitor]
+  proxy_mode: per_node_owned
+  peers:
+    port_name: cluster
+    via_proxy: true
+  start:
+    - /bin/sh
+    - examples/nats-kv/start-node.sh
+    - "${i}"
+    - "${data_dir}"
+    - "${binary}"
+    - "${port_cluster}"
+    - "${port_monitor}"
+    - "${client_port}"
+    - "${node_proxy_addr_${i}}"
+    - "${client_proxy}"
+    - "${peer_addr_0}"
+    - "${peer_addr_1}"
+    - "${peer_addr_2}"
+  ready:
+    command:
+      - /bin/sh
+      - examples/nats-kv/ready.sh
+      - "${i}"
+      - "${client_port}"
+      - "${port_monitor}"
+      - no-direct
+    contains: READY
+    timeout: 30s
+  stop_grace: 2s
+nemesis:
+  warmup: 4s
+  duration: 25s
+  interval: 3s
+  quiet_period: 5s
+  actions:
+    - type: isolate_node
+      target: random
+      mode: blackhole
+      weight: 3
+    - type: partition_halves
+      mode: reset
+      weight: 2
+    - type: kill_node
+      target: random
+      restart_delay: 2s
+      weight: 2
+    - type: heal_all
+      weight: 2
+workload:
+  driver: exec_op
+  workers: 4
+  rate: 20
+  keyspace: 3
+  timeout: 2000ms
+  targets: "${client_addrs}"
+  exec:
+    put:
+      - /bin/sh
+      - examples/nats-kv/kv-op.sh
+      - put
+      - "${target}"
+      - "${key}"
+      - "${value}"
+    get:
+      - /bin/sh
+      - examples/nats-kv/kv-op.sh
+      - get
+      - "${target}"
+      - "${key}"
+properties:
+  always:
+    - porcupine:
+        timeout: 10s
+    - set: {}
+  eventually:
+    - eventually_available:
+        n: 5
+  sometimes:
+    - fault_during_inflight: {}
+      min_hits: 1
+    - info_ops_observed: {}
+      min_hits: 1
+    - fault_action_fired:
+        action: isolate_node
+      min_hits: 1

@@ -287,6 +287,75 @@ func TestConsulYAMLLoads(t *testing.T) {
 	}
 }
 
+func TestOpenraftKVYAMLLoads(t *testing.T) {
+	a, err := LoadYAMLTarget("examples/openraft-kv/openraft-kv.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	topo := a.cfg.Topology
+	if topo.Nodes != 3 || !topo.ClientViaProxy || topo.Peers.ViaProxy {
+		t.Fatalf("topology %+v", topo)
+	}
+	if topo.Ports.ClientBase != 0 || len(topo.Ports.Names) != 1 || topo.Ports.Names[0] != "raft" {
+		t.Fatalf("ports %+v", topo.Ports)
+	}
+	if !strings.Contains(strings.Join(topo.Start, " "), "examples/openraft-kv/start-node.sh") {
+		t.Fatalf("start %v", topo.Start)
+	}
+	if !strings.Contains(strings.Join(topo.Ready.Command, " "), "examples/openraft-kv/ready.sh") || topo.Ready.Contains != "READY" {
+		t.Fatalf("ready %+v", topo.Ready)
+	}
+	w := a.cfg.Workload
+	if w.Driver != "http_kv" || w.Workers != 4 || w.Keyspace != 3 || w.timeout != 1500*time.Millisecond {
+		t.Fatalf("workload %+v timeout %s", w, w.timeout)
+	}
+	if w.Targets != "${client_addrs}" || w.Put.Method != "POST" || w.Get.Method != "POST" {
+		t.Fatalf("calls put=%+v get=%+v", w.Put, w.Get)
+	}
+	if w.Put.URL != "http://${target}/write" || w.Put.ErrorFrom != "Err" {
+		t.Fatalf("put %+v", w.Put)
+	}
+	if w.Get.URL != "http://${target}/linearizable_read" || w.Get.ValueFrom != "Ok.value.value" || w.Get.ErrorFrom != "Err" {
+		t.Fatalf("get %+v", w.Get)
+	}
+	n := a.cfg.Nemesis
+	if n.warmup != 3*time.Second || n.duration != 25*time.Second || n.interval != 3*time.Second || n.quiet != 5*time.Second {
+		t.Fatalf("nemesis warmup %s duration %s interval %s quiet %s", n.warmup, n.duration, n.interval, n.quiet)
+	}
+	if len(n.Actions) != 5 {
+		t.Fatalf("actions %+v", n.Actions)
+	}
+	got := make([]string, len(n.Actions))
+	for i, act := range n.Actions {
+		got[i] = fmt.Sprintf("%s mode=%s weight=%d restart=%s pause=%s", act.Type, act.Mode, act.Weight, act.RestartDelay, act.PauseDuration)
+	}
+	want := []string{
+		"isolate_client mode=blackhole weight=3 restart= pause=",
+		"isolate_client mode=reset weight=2 restart= pause=",
+		"kill_node mode= weight=2 restart=2s pause=",
+		"pause_node mode= weight=2 restart= pause=2s",
+		"heal_all mode= weight=2 restart= pause=",
+	}
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("actions\n%s", strings.Join(got, "\n"))
+	}
+	for _, act := range n.Actions {
+		if act.Type == "isolate_node" || act.Type == "partition_halves" {
+			t.Fatalf("peer fault %s", act.Type)
+		}
+	}
+	p := a.cfg.Properties
+	if len(p.Always) != 2 || p.Always[0].Name != "porcupine" || p.Always[0].Porcupine.timeout != 10*time.Second || p.Always[1].Name != "set" {
+		t.Fatalf("always %+v", p.Always)
+	}
+	if len(p.Eventually) != 1 || p.Eventually[0].Eventually == nil || p.Eventually[0].Eventually.N != 5 {
+		t.Fatalf("eventually %+v", p.Eventually)
+	}
+	if len(p.Sometimes) != 3 || p.Sometimes[0].Name != "fault_during_inflight" || p.Sometimes[1].Name != "info_ops_observed" || p.Sometimes[2].Name != "fault_action_fired_kill_node" || p.Sometimes[2].FaultActionFired.Action != "kill_node" {
+		t.Fatalf("sometimes %+v", p.Sometimes)
+	}
+}
+
 func TestNatsKVYAMLLoads(t *testing.T) {
 	a, err := LoadYAMLTarget("examples/nats-kv/nats-kv.yaml")
 	if err != nil {

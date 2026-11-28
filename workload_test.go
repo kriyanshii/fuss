@@ -104,6 +104,11 @@ func TestHTTPJSONValueAndRedirect(t *testing.T) {
 			http.Error(w, "unexpected "+string(b), http.StatusBadRequest)
 		}
 	})
+	mux.HandleFunc("/openraft", func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(b)
+	})
 	mux.HandleFunc("/leader", func(w http.ResponseWriter, r *http.Request) {
 		b, _ := io.ReadAll(r.Body)
 		saw = r.Method + " " + string(b)
@@ -146,6 +151,34 @@ func TestHTTPJSONValueAndRedirect(t *testing.T) {
 	}, history.OpPut)
 	if status != history.StatusFail {
 		t.Fatalf("error_from: %s", status)
+	}
+	for _, body := range []string{
+		`{"Err":{"QuorumNotEnough":{"cluster":"voters","got":[]}}}`,
+		`{"Err":{"LogEntryDiscarded":{"reason":"NotLeader"}}}`,
+		`{"Err":{"ForwardToLeader":{"reason":"NotLeader"}}}`,
+	} {
+		status, _, _ = applyHTTPCall(context.Background(), client, httpCall{
+			Method:    http.MethodPost,
+			URL:       srv.URL + "/openraft",
+			Body:      body,
+			Headers:   map[string]string{"Content-Type": "application/json"},
+			ErrorFrom: "Err",
+		}, history.OpPut)
+		if status != history.StatusFail {
+			t.Fatalf("error_from object %s: %s", body, status)
+		}
+	}
+	for _, body := range []string{`{"Ok":{"value":null}}`, `{"Err":null}`, `{"Err":""}`} {
+		status, _, _ = applyHTTPCall(context.Background(), client, httpCall{
+			Method:    http.MethodPost,
+			URL:       srv.URL + "/openraft",
+			Body:      body,
+			Headers:   map[string]string{"Content-Type": "application/json"},
+			ErrorFrom: "Err",
+		}, history.OpPut)
+		if status != history.StatusOK {
+			t.Fatalf("error_from not a refusal %s: %s", body, status)
+		}
 	}
 	status, _, _ = applyHTTPCall(context.Background(), client, httpCall{
 		Method: http.MethodPost,

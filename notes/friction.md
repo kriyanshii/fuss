@@ -62,6 +62,6 @@ Source inspected: `github.com/databendlabs/openraft` commit `0b464b9da0e53fdd887
 
 `--api-addr` and `--raft-addr` are each the bind address and the address stored in membership. There is no advertise flag. Peer `isolate_node` / `partition_halves` are not in the nemesis. Client HTTP goes through `client_via_proxy`.
 
-Every admin, write, and read handler returns HTTP 200 with a serde `Result` (`{"Ok":...}` or `{"Err":...}`). `http_kv` `error_from` only matches a non-empty scalar. The YAML points it at `Err.ForwardToLeader.reason`. `Err.QuorumNotEnough` (the `cluster` string) and `Err.LogEntryDiscarded` do not match that path, so those 200 bodies stay `ok`. A missing `Ok.value.value` on a get is an absent read, which is the right mapping for `{"Ok":{"value":null}}`.
+Every admin, write, and read handler returns HTTP 200 with a serde `Result` (`{"Ok":...}` or `{"Err":...}`). A non-empty scalar was the only `error_from` match, so `Err.QuorumNotEnough` and `Err.LogEntryDiscarded` stayed `ok` when the path was `Err.ForwardToLeader.reason`. `error_from: Err` now treats any non-null JSON value as `fail`, including those objects. A missing path, JSON null, or empty string does not. A missing `Ok.value.value` on a get is an absent read, which is the right mapping for `{"Ok":{"value":null}}`.
 
 The log and the map are in memory. `kill_node` restarts an empty process. `ready.sh` writes `$dir/bootstrapped` after the first `/change-membership` and does not call `/init` again.

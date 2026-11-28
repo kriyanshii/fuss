@@ -251,14 +251,22 @@ func TestConsulYAMLLoads(t *testing.T) {
 		if n.warmup != 4*time.Second || n.duration != 25*time.Second || n.interval != 3*time.Second || n.quiet != 5*time.Second {
 			t.Fatalf("%s nemesis warmup %s duration %s interval %s quiet %s", a.cfg.Name, n.warmup, n.duration, n.interval, n.quiet)
 		}
-		weights := map[string]int{}
-		modes := map[string]string{}
-		for _, act := range n.Actions {
-			weights[act.Type] = act.Weight
-			modes[act.Type] = act.Mode
+		if len(n.Actions) != 5 {
+			t.Fatalf("%s actions %+v", a.cfg.Name, n.Actions)
 		}
-		if weights["isolate_node"] != 3 || modes["isolate_node"] != "blackhole" || weights["partition_halves"] != 2 || modes["partition_halves"] != "reset" || weights["kill_node"] != 2 || weights["heal_all"] != 2 {
-			t.Fatalf("%s weights %+v modes %+v", a.cfg.Name, weights, modes)
+		got := make([]string, len(n.Actions))
+		for i, act := range n.Actions {
+			got[i] = fmt.Sprintf("%s mode=%s weight=%d restart=%s pause=%s", act.Type, act.Mode, act.Weight, act.RestartDelay, act.PauseDuration)
+		}
+		want := []string{
+			"isolate_client mode=blackhole weight=3 restart= pause=",
+			"isolate_client mode=reset weight=2 restart= pause=",
+			"kill_node mode= weight=2 restart=2s pause=",
+			"pause_node mode= weight=2 restart= pause=2s",
+			"heal_all mode= weight=2 restart= pause=",
+		}
+		if strings.Join(got, "\n") != strings.Join(want, "\n") {
+			t.Fatalf("%s actions\n%s", a.cfg.Name, strings.Join(got, "\n"))
 		}
 		p := a.cfg.Properties
 		if len(p.Always) != 2 || p.Always[0].Name != "porcupine" || p.Always[0].Porcupine.timeout != 10*time.Second || p.Always[1].Name != "set" {
@@ -267,7 +275,7 @@ func TestConsulYAMLLoads(t *testing.T) {
 		if len(p.Eventually) != 1 || p.Eventually[0].Eventually == nil || p.Eventually[0].Eventually.N != 5 {
 			t.Fatalf("%s eventually %+v", a.cfg.Name, p.Eventually)
 		}
-		if len(p.Sometimes) != 3 || p.Sometimes[0].Name != "fault_during_inflight" || p.Sometimes[1].Name != "info_ops_observed" || p.Sometimes[2].Name != "fault_action_fired_isolate_node" || p.Sometimes[2].FaultActionFired.Action != "isolate_node" {
+		if len(p.Sometimes) != 3 || p.Sometimes[0].Name != "fault_during_inflight" || p.Sometimes[1].Name != "info_ops_observed" || p.Sometimes[2].Name != "fault_action_fired_kill_node" || p.Sometimes[2].FaultActionFired.Action != "kill_node" {
 			t.Fatalf("%s sometimes %+v", a.cfg.Name, p.Sometimes)
 		}
 	}

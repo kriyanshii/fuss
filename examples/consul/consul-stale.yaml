@@ -1,5 +1,6 @@
-# Consul server cluster. GET /v1/kv uses ?stale (any server, including a
-# partitioned minority). Same topology as consul-consistent.yaml.
+# client-proxy + kill/pause only (Consul Raft RPCs bypass peer proxy)
+# Consul server cluster. GET /v1/kv uses ?stale (any server).
+# Same topology and nemesis as consul-consistent.yaml.
 # Not run in CI.
 name: consul-stale
 binary:
@@ -41,16 +42,21 @@ nemesis:
   interval: 3s
   quiet_period: 5s
   actions:
-    - type: isolate_node
+    - type: isolate_client
       target: random
       mode: blackhole
       weight: 3
-    - type: partition_halves
+    - type: isolate_client
+      target: random
       mode: reset
       weight: 2
     - type: kill_node
       target: random
       restart_delay: 2s
+      weight: 2
+    - type: pause_node
+      target: random
+      pause_duration: 2s
       weight: 2
     - type: heal_all
       weight: 2
@@ -84,5 +90,5 @@ properties:
     - info_ops_observed: {}
       min_hits: 1
     - fault_action_fired:
-        action: isolate_node
+        action: kill_node
       min_hits: 1
